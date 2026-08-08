@@ -1,0 +1,62 @@
+# Large binary copied from aihpc_val/tools/nvlmapper/dist_amd64 (NVLMAPPER / run_nvlmapper.sh)
+bin/scripts/nvlmapper
+
+# ---- Python / tooling ----
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+dist/
+build/*
+!build/README.md
+.local/
+.env
+
+# ---- App runtime (regenerated; cluster-specific) ----
+var/cache/
+var/workflows/runs/
+
+# ---- Token vault (NEVER commit — encrypted NVFTP tokens + master key material) ----
+var/secrets/
+**/*.vault.json
+**/*.vault.flock
+**/.vault_master_key
+**/.rack_web_secret_key
+
+# ---- Demo report logs (extracted from reports.tar.gz) ----
+demo-reports/
+
+# Default rack / multirack comment store (override with RACK_COMMENTS_FILE)
+rack_comments.json
+
+# ---- Local export bundles (see README / handoff zips) ----
+nvis-rack-status-cluster-export-*.zip
+rack-web-cluster-export-*.zip
+
+# ---- Saved Docker image bundles (build-docker.sh save) ----
+nvis-rack-status-*.tar
+nvis-rack-status-*.tar.gz
+nvis-rack-status-*.tar.sha256
+nvis-rack-status-*.tar.gz.sha256
+
+# ---- Frontend (React SPA) ----
+frontend/node_modules/
+frontend/dist/
+static/spa/
+
+# ---- OS / editor ----
+.DS_Store
+*.zip
+Thumbs.db
+.idea/
+*.swp
+*.swo
+*~
+.coverage
+frontend/coverage/

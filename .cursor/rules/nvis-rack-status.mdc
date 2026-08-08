@@ -1,0 +1,74 @@
+---
+description: NVIS Rack Status project architecture, UI framework, and key conventions
+alwaysApply: true
+---
+
+# NVIS Rack Status
+
+Flask backend + React 19 SPA (Vite + NVIDIA Kaizen UI + MUI), Dockerized with SSH-back host execution for BCM/MAAS clusters.
+
+## UI Framework
+
+- **Primary**: NVIDIA Kaizen UI (`@nvidia/foundations-react-core`) — **always prefer KUI over MUI** for new code. See `kui-components.mdc` for the full component catalog and migration table.
+- **KUI Reference**: https://webassets.nvidia.com/kaizen-ui-foundations/docs/llms.txt — full component list, guidelines, CSS variables. Per-component docs: `https://webassets.nvidia.com/kaizen-ui-foundations/docs/components/<Component>.txt`
+- **Secondary**: MUI — retained only for complex existing widgets with no easy KUI migration (RackTable, sidebar Drawer, AppBar/Toolbar shell). New features should use KUI equivalents.
+- **Icons**: Lucide React (`lucide-react`) exclusively. No `@mui/icons-material`.
+- **Theming**: KUI `ThemeProvider` is outer wrapper (`global`); MUI `ThemeProvider` synced via `ThemeBridge` in `src/context/ThemeContext.tsx`. Use `useThemeMode()` for dark/light toggle.
+- **KUI CSS**: `base.css` + `components.css` from Kaizen CDN (`1.0.0`) in `index.html`. Without these, KUI components have no styles.
+- **Charts**: Chart.js via `react-chartjs-2` (`Bar`, `Line` components).
+
+## KUI Component API
+
+- **Text**: Use `kind` prop (`body/regular/sm`, `body/bold/md`, `title/lg`, `display/sm`, `mono/sm`, etc.). Use `style` for color/spacing — **not** `sx`.
+- **Tag**: `color` (green/red/yellow/blue/teal/purple/gray), `kind` (solid/outline), `readOnly`, `density` (compact/standard/spacious). Children are the label.
+- **Button**: `kind` (primary/secondary/tertiary), `size` (small/tiny/medium/large), `color` (brand/neutral/danger). **No** `density` prop on Button — use `size`.
+- **Banner**: `status` (error/warning/success/info), `kind` (inline/header/global). Children are the message. **Not** `kind="error"` — use `status="error"`.
+- **Combobox**: `items`, `multiple`, `value`, `onValueChange`, `size` (small/medium/large).
+- **Card, Flex, Skeleton**: Use `style` prop for inline styles, not MUI `sx`.
+- **Divider**: Use KUI Divider in content areas. Keep MUI Divider inside MUI shell components (Sidebar/Drawer, AppBar/Toolbar) — KUI Divider renders differently in MUI layout contexts.
+- Full docs: `https://webassets.nvidia.com/kaizen-ui-foundations/docs/components/<Component>.txt`
+
+## Architecture
+
+- **host_exec.py**: All host commands route through `run_on_host()` / `popen_on_host()`. `RACK_EXEC_MODE=local` (direct subprocess) or `ssh` (SSH tunnel to head node). Env vars prefixed `RACK_*`, `NEMO_*`, `VALIDATION_*`, `SQUEUE_*` are auto-forwarded to remote SSH sessions.
+- **platforms/**: `PlatformProvider` base class; `BCMProvider` (cmsh, module load slurm, pdsh) and `MAASProvider` (maas-cli). Selected by `RACK_PLATFORM=bcm|maas`.
+- **RACK_REMOTE_BASE_PATH**: Single env var resolves all script paths and default log dir to head node filesystem. `SCRIPTS_DIR` and `DEFAULT_LOG_DIR` derive from it.
+- **_script_exists()**: All script `is_file()` checks skip in SSH mode (scripts live on remote host).
+- **Auth**: Token mode for Docker (`RACK_WEB_AUTH_MODE=token`), PAM for local. `api_login` endpoint must be in the auth bypass list.
+- **Demo mode**: `RACK_STATUS_DEMO=1` returns synthetic data. `/api/parser-results` also returns mock chart data.
+- **Docker**: Multi-stage Dockerfile. `rack-config.env` centralizes deployment settings. `build-docker.sh` for dev/prod/build/stop/logs.
+- **Command contexts**: `RackCommandContext` and `RackCommandsStoreContext` track async job state across views.
+- **Workflow editor**: Mermaid source text is the single source of truth. React Flow canvas reads from and writes back to mermaid via `mermaidToReactFlow.ts` parser and `handleCodeAction` in `WorkflowDesigner.tsx`. Node types: automated (green rect), manual/event (blue stadium), decision (yellow diamond). The parser infers `stepType` from mermaid shape — this must be preserved during save (`handleSave`) so nodes retain their visual style on reload. Edge deletion must preserve inline node definitions (e.g., `step1 --> done(["Done"])` — removing the edge must re-insert `done(["Done"])` as a standalone line). Connections use React Flow handles: Top=target, Bottom=source, Left=target, Right=source. Edge delete buttons appear on node hover (not on the edge line).
+- **Remote cluster deployment**: Upload `bin/scripts/` to the head node at `RACK_REMOTE_BASE_PATH/bin/scripts/` via `scp`. Run locally with `RACK_EXEC_MODE=ssh` and the SSH env vars pointing to the head node.
+
+## Testing
+
+- **Backend**: pytest (`backend/tests/`). Run from repo root: `python -m pytest backend/tests/ -v`
+- **Frontend**: Vitest + Testing Library (`src/**/*.test.{ts,tsx}`). Run: `cd frontend && npm test`
+- **CI/CD**: `.gitlab-ci.yml` — lint (ruff + tsc), test (pytest + vitest), build (Docker)
+- **Lint**: `ruff check` for Python, `tsc -b --noEmit` for TypeScript. Both must pass.
+
+## Key Files
+
+The Python backend lives under `backend/`; runtime assets (`bin/`, `static/`, `var/`, `help_content.json`) stay at the repo root. Backend modules resolve those via `REPO_ROOT = APP_DIR.parent` (parent of `backend/`); keep `APP_DIR` only for `sys.path` and the `rack_web/` helper. **`version.py` must stay at the repo root** — it is release metadata read by the ci-toolkit release jobs (`grep VERSION = version.py`) and the JFrog image build, not imported by the app (which uses `RACK_WEB_VERSION`).
+
+- `backend/app.py` — Flask backend, all `/api/*` routes (~11k lines)
+- `backend/native_status.py` — Native Python rack-status builder (cmsh + sinfo + log probes)
+- `backend/host_exec.py` — SSH/local command execution with env forwarding
+- `backend/nvis_id_templates.py` — NVIS naming conventions (Firmus/CBR/Bright templates, uses `lru_cache`)
+- `backend/workflow_engine.py` — Workflow state machine, CRUD, execution engine
+- `backend/rack_locks.py` — Advisory rack lock claims, persistence, TTL, heartbeat-based release
+- `backend/platforms/` — BCM and MAAS platform providers
+- `backend/requirements.txt` — Python dependencies
+- `rack-config.env` — Docker deployment configuration
+- `frontend/src/components/RackTable.tsx` — Main dashboard table with filters, menus, charts
+- `frontend/src/components/ParserResultsDialog.tsx` — NCCL/NEMO chart dialog + Grafana embeds
+- `frontend/src/components/workflow/WorkflowDesigner.tsx` — Workflow editor: code panel + canvas + save
+- `frontend/src/components/workflow/editor/FlowDiagram.tsx` — React Flow canvas wrapper (node/edge types, connection handling, toolbar)
+- `frontend/src/components/workflow/editor/mermaidToReactFlow.ts` — Mermaid parser → React Flow nodes/edges (dagre layout)
+- `frontend/src/components/workflow/editor/CustomNode.tsx` — Node renderers (Standard + Diamond) with edge delete buttons
+- `frontend/src/components/workflow/editor/CustomEdge.tsx` — Custom edge renderer (smoothstep + label)
+- `frontend/src/views/ToolsView.tsx` — NVLoom, Clusterkit, workspace tools
+- `frontend/src/views/AnalyticsView.tsx` — Rack analytics and aggregate analysis
+- `frontend/src/context/RackCommandsStoreContext.tsx` — Centralized async command tracking
+- `frontend/src/context/ThemeContext.tsx` — KUI + MUI theme bridge

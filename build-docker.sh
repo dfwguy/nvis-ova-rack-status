@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────────────────────
+# NVIS Rack Status — build, run, and package the Docker container
+# ──────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+IMAGE="${RACK_IMAGE:-nvis-rack-status:local}"
+CONTAINER="${RACK_CONTAINER:-rack-status}"
+MODE="${1:-dev}"
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<'EOF'
+NVIS Rack Status — build, run, and package the Docker container
+
+Usage:
+  ./build-docker.sh                # dev mode (demo data, no auth, port 5050)
+  ./build-docker.sh prod           # prod mode (SSH to head node, token auth)
+  ./build-docker.sh build          # build the image only, don't run
+  ./build-docker.sh save           # build + `docker save` → dist/*.tar.gz (air-gapped artifact)
+  ./build-docker.sh load <tar>     # `docker load` an image tarball on an air-gapped host
+  ./build-docker.sh stop           # stop and remove the container
+  ./build-docker.sh logs           # tail container logs
+
+Override any setting with env vars:
+  RACK_WEB_PORT=8080 ./build-docker.sh
+  RACK_SSH_HOST=10.0.0.5 RACK_PLATFORM=maas ./build-docker.sh prod
+
+Image-bundle (save) env vars:
+  RACK_IMAGE_OUT_DIR=dist          # output directory for the .tar(.gz) + .sha256
+  RACK_IMAGE_TAG=0.1.2             # image tag (defaults to version.py VERSION)
+  RACK_IMAGE_COMPRESS=1            # 1 = gzip the tar (default), 0 = leave uncompressed
+  RACK_SAVE_IMAGE=nvis-rack-status:0.1.2   # full image ref to build/save (overrides tag)
+EOF
+  exit 0
+}
+
+# Read VERSION from version.py at the repo root (the canonical release-metadata
+# file consumed by the ci-toolkit release jobs). e.g. VERSION = "0.1.2".
+get_version() {
+  local v
+  v="$(grep -Eo '"[0-9]+\.[0-9]+\.[0-9]+[^"]*"' version.py 2>/dev/null | head -1 | tr -d '"')"
+  echo "${v:-0.0.0}"
+}
+
+# Portable sha256 helpers (sha256sum on Linux, shasum on macOS).
+sha256_write() {
+  local f="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    ( cd "$(dirname "$f")" && sha256sum "$(basename "$f")" > "$(basename "$f").sha256" )
+  else
+    ( cd "$(dirname "$f")" && shasum -a 256 "$(basename "$f")" > "$(basename "$f").sha256" )
+  fi
+}
+
+sha256_check() {
+  local sumfile="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    ( cd "$(dirname "$sumfile")" && sha256sum -c "$(basename "$sumfile")" )
+  else
+    ( cd "$(dirname "$sumfile")" && shasum -a 256 -c "$(basename "$sumfile")" )
+  fi
+}
+
+build_image() {
+  echo "==> Building image ${IMAGE} …"
+  docker build -t "$IMAGE" .
+  echo "==> Build complete."
+}
+
+# Build the image with a versioned tag and `docker save` it to a portable tarball
+# that can be transferred to an air-gapped host and `docker load`ed there.
+save_image() {
+  local version tag image_ref latest_ref out_dir tar_path compress
+  version="$(get_version)"
+  tag="${RACK_IMAGE_TAG:-$version}"
+  image_ref="${RACK_SAVE_IMAGE:-nvis-rack-status:${tag}}"
+  latest_ref="nvis-rack-status:latest"
+  out_dir="${RACK_IMAGE_OUT_DIR:-dist}"
+  compress="${RACK_IMAGE_COMPRESS:-1}"
+
+  echo "==> Building image ${image_ref} (+ ${latest_ref}) …"
+  docker build -t "$image_ref" -t "$latest_ref" .
+
+  mkdir -p "$out_dir"
+  tar_path="${out_dir}/nvis-rack-status-${tag}.tar"
+
+  echo "==> Saving image → ${tar_path} (docker save) …"
+  docker save -o "$tar_path" "$image_ref" "$latest_ref"
+
+  if [[ "$compress" != "0" ]]; then
+    echo "==> Compressing → ${tar_path}.gz …"
+    gzip -f "$tar_path"
+    tar_path="${tar_path}.gz"
+  fi
+
+  sha256_write "$tar_path"
+
+  echo
+  echo "==> Image artifact ready:"
+  ls -lh "$tar_path" "${tar_path}.sha256"
+  cat <<EOF
+
+Transfer the files below to the air-gapped host, then load and run them:
+
+  sha256sum -c $(basename "$tar_path").sha256      # verify integrity
+  docker load -i $(basename "$tar_path")           # import the image (gz auto-detected)
+  docker run -d --name rack-status -p 5000:5000 \\
+    -e RACK_STATUS_DEMO=1 -e RACK_WEB_AUTH_DISABLED=1 \\
+    -v rack-data:/app/var ${image_ref}
+
+Then open http://<host>:5000/spa/
+EOF
+}
+
+# Load a previously saved image tarball (for air-gapped hosts).
+load_image() {
+  local tar_path="${1:-${RACK_IMAGE_TAR:-}}"
+  if [[ -z "$tar_path" ]]; then
+    echo "Error: provide the image tarball path."
+    echo "  ./build-docker.sh load dist/nvis-rack-status-<version>.tar.gz"
+    exit 1
+  fi
+  if [[ ! -f "$tar_path" ]]; then
+    echo "Error: file not found: $tar_path"
+    exit 1
+  fi
+  if [[ -f "${tar_path}.sha256" ]]; then
+    echo "==> Verifying checksum …"
+    sha256_check "${tar_path}.sha256"
+  fi
+  echo "==> Loading image from ${tar_path} (docker load) …"
+  docker load -i "$tar_path"
+  echo "==> Done. Run it with e.g.:"
+  echo "    docker run -d --name ${CONTAINER} -p 5000:5000 -e RACK_STATUS_DEMO=1 -e RACK_WEB_AUTH_DISABLED=1 -v rack-data:/app/var nvis-rack-status:latest"
+}
+
+stop_container() {
+  echo "==> Stopping ${CONTAINER} …"
+  docker rm -f "$CONTAINER" 2>/dev/null || true
+}
+
+wait_ready() {
+  local port="$1"
+  echo "==> Waiting for Flask …"
+  for _ in $(seq 1 15); do
+    if curl -sf "http://localhost:${port}/api/status" >/dev/null 2>&1; then
+      echo "==> Ready: http://localhost:${port}/spa/"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "==> Container may still be starting. Logs:"
+  docker logs --tail 30 "$CONTAINER"
+  return 1
+}
+
+run_dev() {
+  local port="${RACK_WEB_PORT:-5050}"
+  stop_container
+  echo "==> Starting in DEV mode (demo data, no auth, port ${port}) …"
+  docker run -d --name "$CONTAINER" -p "${port}:5000" \
+    -e RACK_STATUS_DEMO=1 \
+    -e RACK_WEB_AUTH_DISABLED=1 \
+    -e RACK_EXEC_MODE=local \
+    -v rack-data:/app/var \
+    "$IMAGE"
+  wait_ready "$port"
+}
+
+run_prod() {
+  local port="${RACK_WEB_PORT:-5000}"
+  local ssh_host="${RACK_SSH_HOST:-}"
+  local ssh_key="${RACK_SSH_KEY_PATH:-$HOME/.ssh/id_rsa}"
+  local auth_token="${RACK_WEB_AUTH_TOKEN:-}"
+  local config="${RACK_CONFIG_FILE:-rack-config.env}"
+
+  if [[ -z "$ssh_host" ]]; then
+    echo "Error: RACK_SSH_HOST is required for prod mode."
+    echo "  RACK_SSH_HOST=10.0.0.1 ./build-docker.sh prod"
+    exit 1
+  fi
+  if [[ -z "$auth_token" ]]; then
+    echo "Error: RACK_WEB_AUTH_TOKEN is required for prod token auth."
+    echo "  RACK_WEB_AUTH_TOKEN=secret ./build-docker.sh prod"
+    exit 1
+  fi
+  if [[ ! -f "$ssh_key" ]]; then
+    echo "Warning: SSH key not found at ${ssh_key}"
+  fi
+  if [[ ! -f "$config" ]]; then
+    echo "Warning: Config file not found at ${config}, using image defaults"
+  fi
+
+  stop_container
+  echo "==> Starting in PROD mode (port ${port}, config: ${config}) …"
+  docker run -d --name "$CONTAINER" -p "${port}:5000" \
+    --env-file "$config" \
+    -e RACK_SSH_HOST="$ssh_host" \
+    -e RACK_WEB_AUTH_TOKEN="$auth_token" \
+    -v "${ssh_key}:/run/secrets/ssh_key:ro" \
+    --restart unless-stopped \
+    "$IMAGE"
+  wait_ready "$port"
+}
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+case "$MODE" in
+  dev)
+    build_image
+    run_dev
+    ;;
+  prod)
+    build_image
+    run_prod
+    ;;
+  build)
+    build_image
+    ;;
+  save)
+    save_image
+    ;;
+  load)
+    load_image "${2:-}"
+    ;;
+  stop)
+    stop_container
+    ;;
+  logs)
+    docker logs -f "$CONTAINER"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    echo "Unknown mode: $MODE"
+    usage
+    ;;
+esac
