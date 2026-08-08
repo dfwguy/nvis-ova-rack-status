@@ -32,7 +32,11 @@ const MONOSPACE_JOB_ENV_KEYS = new Set([
   "RACK_NVFTP_REMOTE_BASE",
 ]);
 
-const PASSWORD_JOB_ENV_KEYS = new Set(["RACK_PROMETHEUS_BASIC_AUTH_PASSWORD", "NVLMAPPER_PASSWORD"]);
+const PASSWORD_JOB_ENV_KEYS = new Set([
+  "RACK_PROMETHEUS_BASIC_AUTH_PASSWORD",
+  "NVLMAPPER_PASSWORD",
+  "NGC_API_KEY",
+]);
 
 interface SettingsViewProps {
   logDir: string;
@@ -574,7 +578,7 @@ function AIConfigurationPanel() {
             fullWidth
             value={endpoint}
             onChange={(e) => setEndpoint(e.target.value)}
-            placeholder="https://integrate.api.nvidia.com/v1/chat/completions"
+            placeholder="https://inference-api.nvidia.com/v1/chat/completions"
             helperText="OpenAI-compatible chat completions endpoint"
           />
 
@@ -584,7 +588,7 @@ function AIConfigurationPanel() {
             fullWidth
             value={model}
             onChange={(e) => setModel(e.target.value)}
-            placeholder="nvidia/llama-3.1-nemotron-ultra-253b-v1"
+            placeholder="nvidia/nvidia/nemotron-3-super-v3"
             helperText="Model identifier sent in the API request"
           />
 

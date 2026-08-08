@@ -8,10 +8,23 @@ export function slurmJobIdForScancel(raw: unknown): string {
 export function parseSlurmStdOutPathFromScontrolText(text: string): string {
   const m = /^\s*StdOut\s*=\s*(.+)$/im.exec(String(text || ""));
   if (!m) return "";
-  let p = String(m[1] || "").trim();
+  const p = String(m[1] || "").trim();
   if (!p || /^\(none\)$/i.test(p) || /^\/dev\/null$/i.test(p)) return "";
   return p;
 }
+
+export type SlurmSacctJob = {
+  job_id: string;
+  name: string;
+  partition: string;
+  nnodes: string;
+  nodelist: string;
+  start: string;
+  end: string;
+  elapsed: string;
+  state: string;
+  exit_code: string;
+};
 
 export type SlurmCmdJson = {
   ok?: boolean;
@@ -21,6 +34,11 @@ export type SlurmCmdJson = {
   command_display?: string;
   returncode?: number;
   job_id?: string;
+  /** /api/slurm-sacct-recent */
+  jobs?: SlurmSacctJob[];
+  /** /api/slurm-job-log-path */
+  path?: string;
+  source?: string;
 };
 
 export function formatSlurmCmdDetail(data: SlurmCmdJson): string {
@@ -35,7 +53,8 @@ export function formatSlurmCmdDetail(data: SlurmCmdJson): string {
 export async function fetchSlurmJson(url: string, init?: RequestInit): Promise<{ res: Response; data: SlurmCmdJson }> {
   const res = await fetch(url, { credentials: "same-origin", ...init });
   const raw = await res.text();
-  let data: SlurmCmdJson = {};
+  // No initialiser: the catch throws, so `data` is either parsed or we never reach the use.
+  let data: SlurmCmdJson;
   try {
     data = raw ? (JSON.parse(raw) as SlurmCmdJson) : {};
   } catch {

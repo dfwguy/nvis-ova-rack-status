@@ -33,8 +33,8 @@ _LLM_RETRY_DELAY_S = 3
 _LLM_TEMPERATURE = 0.3
 _LLM_MAX_TOKENS = 4096
 
-_DEFAULT_ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
-_DEFAULT_MODEL = "nvidia/llama-3.1-nemotron-ultra-253b-v1"
+_DEFAULT_ENDPOINT = "https://inference-api.nvidia.com/v1/chat/completions"
+_DEFAULT_MODEL = "nvidia/nvidia/nemotron-3-super-v3"
 
 _settings_lock = threading.Lock()
 
@@ -157,11 +157,33 @@ Guidelines:
 """
 
 
+def _deployment_envelope(context: dict) -> str:
+    """Authoritative platform/cluster/customer block from the catalog.
+
+    Always injected (independent of any frontend-supplied ``additional_context``) so
+    the model never reasons with the wrong hardware generation. Resolved for the
+    request's cluster when provided, else the active cluster.
+    """
+    try:
+        from catalog import context as catalog_context
+
+        cluster_id = (context.get("cluster") or context.get("cluster_id") or "").strip() or None
+        return catalog_context.build_ai_context_block(cluster_id=cluster_id)
+    except Exception:  # pragma: no cover - catalog optional
+        return ""
+
+
 def build_system_prompt(context: dict, custom_rules: str = "") -> str:
     parts = [_SYSTEM_PROMPT_BASE]
 
     page = context.get("page", "unknown")
     rack = context.get("rack")
+
+    # Authoritative deployment context FIRST so platform/customer facts cannot be omitted
+    # or contradicted by page context.
+    envelope = _deployment_envelope(context)
+    if envelope:
+        parts.append(f"\n{envelope}")
 
     # Page-aware context. The frontend normally pushes a rich, registry-derived
     # `additional_context`; when present it takes precedence. Otherwise fall back

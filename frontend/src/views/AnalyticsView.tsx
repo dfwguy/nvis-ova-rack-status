@@ -8,7 +8,8 @@ import TableContainer from "@mui/material/TableContainer";
 import TableHead from "@mui/material/TableHead";
 import TableRow from "@mui/material/TableRow";
 import CircularProgress from "@mui/material/CircularProgress";
-import { Text, Button, Banner } from "@nvidia/foundations-react-core";
+import { Text, Button, Banner, Tabs, Tag } from "@nvidia/foundations-react-core";
+import { Download } from "lucide-react";
 import Slider from "@mui/material/Slider";
 import MuiTooltip from "@mui/material/Tooltip";
 import { alpha } from "@mui/material/styles";
@@ -27,7 +28,21 @@ import {
 import { Line, Bar } from "react-chartjs-2";
 import { PageHeader } from "../components/layout/PageHeader";
 import { CONTENT_MAX_WIDTH } from "../components/layout/contentWidth";
-import type { RackRow } from "../types/api";
+import { NodeHeatmap } from "../components/analytics/NodeHeatmap";
+import { type NodeInfo } from "../components/rack/NodeSelector";
+import { parseNodesFromRack } from "../lib/parseNodesFromRack";
+import { downloadNodeReport, getBringupFleet } from "../services/bringupService";
+import { useActiveCluster } from "../context/ActiveClusterContext";
+import { usePagedRows } from "../hooks/usePagedRows";
+import { TablePager } from "../components/TablePager";
+import type { BringupFleet } from "../types/bringup";
+import type { RackRow, RackStatusResponse } from "../types/api";
+
+/** Stable empty array: a fresh `[]` per render would re-slice the pager's memo every time. */
+const EMPTY_ROWS: never[] = [];
+
+const RACK_TAB = "rack";
+const NODE_TAB = "node";
 
 ChartJS.register(
   CategoryScale,
@@ -51,7 +66,7 @@ type AnalyticsPayload = {
   /** True when body came from ``GET /api/analytics/last`` disk cache. */
   cached?: boolean;
   single_rack?: {
-    nccl_collectives: { rack: string; log_file: string; all_reduce_gbps: number | null; all_gather_gbps: number | null; alltoall_gbps: number | null }[];
+    nccl_collectives: { rack: string; log_file: string; all_reduce_gbps: number | null; all_gather_gbps: number | null; alltoall_gbps: number | null; reduce_scatter_gbps?: number | null; sendrecv_gbps?: number | null }[];
     nccl_collectives_deviation_pct: {
       metric: string;
       rack: string;
@@ -77,14 +92,24 @@ type AnalyticsPayload = {
   };
   multirack?: {
     nccl_series_by_log: { label: string; basename: string; series: { size_bytes: number; bus_bw_gbps: number }[] }[];
-    nemotron_scaling: { n_racks: number; n_logs: number; mean_tflops_per_gpu: number; mean_step_s: number }[];
+    nemotron_scaling: {
+      n_racks: number;
+      n_logs: number;
+      /** Successful runs in this bucket whose step/TFLOPs could not be averaged. */
+      n_logs_no_metrics?: number;
+      logs_no_metrics?: string[];
+      mean_tflops_per_gpu: number | null;
+      mean_step_s: number | null;
+    }[];
     nemotron_throughput_scaling?: {
       n_racks: number;
       n_logs: number;
+      n_logs_no_metrics?: number;
+      logs_no_metrics?: string[];
       num_nodes: number | null;
       num_gpus: number | null;
-      mean_step_s: number;
-      mean_tflops_per_gpu: number;
+      mean_step_s: number | null;
+      mean_tflops_per_gpu: number | null;
       mean_throughput_tokens_s: number | null;
       mean_throughput_tokens_s_per_gpu: number | null;
       time_to_train_1t_days: number | null;
@@ -93,6 +118,24 @@ type AnalyticsPayload = {
 };
 
 type NemotronScalingRow = NonNullable<AnalyticsPayload["multirack"]>["nemotron_scaling"][number];
+
+/** A metric that could not be averaged reads as an em dash — never as a blank or a misleading 0. */
+const metricOrDash = (v: number | null | undefined) => (v == null ? "—" : v);
+
+/** Log count that also reports successful runs which yielded no averageable metrics. */
+function LogCountCell({ nLogs, nNoMetrics }: { nLogs: number; nNoMetrics?: number }) {
+  const missing = nNoMetrics ?? 0;
+  return (
+    <TableCell align="right">
+      {nLogs}
+      {missing > 0 ? (
+        <Tag color="yellow" kind="outline" density="compact" readOnly style={{ marginLeft: 8 }}>
+          {`+${missing} no metrics`}
+        </Tag>
+      ) : null}
+    </TableCell>
+  );
+}
 
 const CHART_COLORS = [
   "#76B900",
@@ -133,6 +176,12 @@ const nemotronPctBarOptionsStepTime = {
 interface AnalyticsViewProps {
   logDir: string;
   rows: RackRow[];
+  /**
+   * Full status payload, for the node-level view. Optional so the rack-level analytics keep
+   * working without it — the heatmap needs the naming templates and BMC map that only the
+   * whole response carries.
+   */
+  status?: RackStatusResponse | null;
 }
 
 /** True when a stored % deviation exceeds the allowed absolute Δ (strictly outside tolerance). */
@@ -141,12 +190,79 @@ function absDeltaExceeds(v: unknown, maxAbsPct: number): boolean {
   return Math.abs(v) > maxAbsPct;
 }
 
-export function AnalyticsView({ logDir, rows }: AnalyticsViewProps) {
+export function AnalyticsView({ logDir, rows, status }: AnalyticsViewProps) {
+  const { activeCluster } = useActiveCluster();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [data, setData] = useState<AnalyticsPayload | null>(null);
   /** Highlight table rows when |Δ%| is greater than this value (NCCL + Nemotron % tables only). */
   const [perfVariationMaxAbsPct, setPerfVariationMaxAbsPct] = useState(5);
+  const [tab, setTab] = useState(RACK_TAB);
+  const [fleet, setFleet] = useState<BringupFleet | null>(null);
+  const [fleetLoading, setFleetLoading] = useState(false);
+  const [fleetError, setFleetError] = useState<string | null>(null);
+  const [reportBusy, setReportBusy] = useState(false);
+  const [reportError, setReportError] = useState("");
+
+  // Node inventory with live up/down state, derived exactly as the Nodes view does so both
+  // pages agree on what a node is called and whether it is up.
+  const heatmapNodes = useMemo<NodeInfo[]>(() => {
+    const rf0 = status?.physical_rf0 ?? {};
+    const naming = status?.naming;
+    const out: NodeInfo[] = [];
+    for (const r of rows) {
+      out.push(...parseNodesFromRack(r.rack, r.ct_down_unk, rf0, 8, naming));
+    }
+    return out;
+  }, [rows, status]);
+
+  const rackByNode = useMemo(() => {
+    const map = new Map<string, string>();
+    const rf0 = status?.physical_rf0 ?? {};
+    const naming = status?.naming;
+    for (const r of rows) {
+      for (const n of parseNodesFromRack(r.rack, r.ct_down_unk, rf0, 8, naming)) {
+        map.set(n.id, r.rack);
+      }
+    }
+    return map;
+  }, [rows, status]);
+
+  const rackOf = useCallback(
+    (nodeId: string) => {
+      const known = rackByNode.get(nodeId);
+      if (known) return known;
+      // A node the status feed has not reported (bring-up knows it, the dashboard does not):
+      // fall back to the name's own prefix so it still lands in a sensible group.
+      const cut = nodeId.lastIndexOf("-");
+      return cut > 0 ? nodeId.slice(0, cut) : nodeId;
+    },
+    [rackByNode],
+  );
+
+  const loadFleet = useCallback(async () => {
+    setFleetLoading(true);
+    setFleetError(null);
+    try {
+      setFleet(await getBringupFleet(heatmapNodes.map((n) => n.id)));
+    } catch (e) {
+      setFleetError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFleetLoading(false);
+    }
+  }, [heatmapNodes]);
+
+  const downloadReport = useCallback(async () => {
+    setReportBusy(true);
+    setReportError("");
+    try {
+      await downloadNodeReport(heatmapNodes.map((n) => n.id));
+    } catch (e) {
+      setReportError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setReportBusy(false);
+    }
+  }, [heatmapNodes]);
 
   const bodyRows = useMemo(
     () => rows.map((r) => ({ rack: r.rack, nemo: r.nemo })),
@@ -219,6 +335,12 @@ export function AnalyticsView({ logDir, rows }: AnalyticsViewProps) {
 
   const sr = data?.single_rack;
   const mr = data?.multirack;
+
+  // Both single-rack tables carry one row per rack (NCCL: per rack PER collective), so on a
+  // 112-rack floor they run to hundreds of rows. Paged rather than capped: every row is a real
+  // measurement someone may need to look up, so hiding the tail behind a "top N" would lose data.
+  const ncclDeviationPage = usePagedRows(sr?.nccl_collectives_deviation_pct ?? EMPTY_ROWS);
+  const nemotronPage = usePagedRows(sr?.nemotron ?? EMPTY_ROWS);
 
   const ncclLineData = useMemo(() => {
     if (!sr?.nccl_ar_series?.sizes_bytes?.length) return null;
@@ -322,7 +444,9 @@ export function AnalyticsView({ logDir, rows }: AnalyticsViewProps) {
       return { baselineNRacks: null as number | null, rows: [] as { s: NemotronScalingRow; tflopsEffPct: number | null; stepEffPct: number | null }[] };
     }
     const sorted = [...mr.nemotron_scaling].sort((a, b) => a.n_racks - b.n_racks);
-    const base = sorted[0];
+    // Baseline is the smallest bucket that actually measured something. A bucket present only to
+    // report runs with no metrics carries null means, and using it would null every efficiency.
+    const base = sorted.find((s) => Number(s.mean_tflops_per_gpu) > 0 && Number(s.mean_step_s) > 0) ?? sorted[0];
     const baseTf = Number(base.mean_tflops_per_gpu);
     const baseStep = Number(base.mean_step_s);
     const rows = sorted.map((s) => {
@@ -449,6 +573,56 @@ export function AnalyticsView({ logDir, rows }: AnalyticsViewProps) {
         }
       />
 
+      <Tabs
+        items={[
+          { children: "Rack Level", value: RACK_TAB },
+          { children: "Node Level", value: NODE_TAB },
+        ]}
+        value={tab}
+        // Fetch on activation rather than on mount: the fleet call reaches the cluster, so the
+        // rack-level view should not pay for it. Fetched once; the panel has its own refresh.
+        onValueChange={(next) => {
+          setTab(next);
+          if (next === NODE_TAB && !fleet && !fleetLoading) void loadFleet();
+        }}
+        // The report covers the whole cluster, so it belongs to the panel rather than to a
+        // tab: it stays reachable from either view.
+        slotEnd={
+          <Box sx={{ ml: "auto", display: "flex", alignItems: "center", gap: 1 }}>
+            {reportError && (
+              <Text kind="body/regular/sm" style={{ color: "#d32f2f" }}>
+                {reportError}
+              </Text>
+            )}
+            <Button
+              kind="secondary"
+              size="small"
+              onClick={() => void downloadReport()}
+              disabled={reportBusy}
+            >
+              <Download size={14} style={{ marginRight: 6 }} />
+              {reportBusy ? "Generating…" : "Download report"}
+            </Button>
+          </Box>
+        }
+      />
+
+      {tab === NODE_TAB && (
+        <Box sx={{ mt: 2 }}>
+          <NodeHeatmap
+            fleet={fleet}
+            nodes={heatmapNodes}
+            rackOf={rackOf}
+            loading={fleetLoading}
+            error={fleetError}
+            onRefresh={() => void loadFleet()}
+            clusterName={activeCluster?.name}
+          />
+        </Box>
+      )}
+
+      {tab === RACK_TAB && (
+      <>
       <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
         <Text kind="body/regular/md" style={{ display: "block", marginBottom: 12, color: "var(--text-color-secondary)" }}>
           Runs{" "}
@@ -522,7 +696,7 @@ export function AnalyticsView({ logDir, rows }: AnalyticsViewProps) {
                 </TableRow>
               </TableHead>
               <TableBody>
-                {(sr.nccl_collectives_deviation_pct ?? []).map((r, i) => {
+                {ncclDeviationPage.visible.map((r, i) => {
                   const rowFail = absDeltaExceeds(r.pct_vs_median, perfVariationMaxAbsPct);
                   return (
                   <TableRow
@@ -556,6 +730,7 @@ export function AnalyticsView({ logDir, rows }: AnalyticsViewProps) {
               </TableBody>
             </Table>
           </TableContainer>
+          <TablePager {...ncclDeviationPage} noun="rows" />
 
           <Text kind="body/bold/sm" style={{ display: "block", marginBottom: 4, color: "var(--text-color-secondary)" }}>
             NCCL — all_reduce bus BW vs message size (fleet median + each rack)
@@ -583,7 +758,7 @@ export function AnalyticsView({ logDir, rows }: AnalyticsViewProps) {
                 </TableRow>
               </TableHead>
               <TableBody>
-                {(sr.nemotron ?? []).map((r) => {
+                {nemotronPage.visible.map((r) => {
                   const rowFail =
                     absDeltaExceeds(r.pct_vs_mean_tflops, perfVariationMaxAbsPct) ||
                     absDeltaExceeds(r.pct_vs_mean_step_time, perfVariationMaxAbsPct);
@@ -611,6 +786,7 @@ export function AnalyticsView({ logDir, rows }: AnalyticsViewProps) {
               </TableBody>
             </Table>
           </TableContainer>
+          <TablePager {...nemotronPage} noun="racks" />
 
           <Box
             sx={{
@@ -678,9 +854,9 @@ export function AnalyticsView({ logDir, rows }: AnalyticsViewProps) {
                   {nemotronScalingTableRows.rows.map(({ s, tflopsEffPct, stepEffPct }) => (
                     <TableRow key={s.n_racks}>
                       <TableCell>{s.n_racks}</TableCell>
-                      <TableCell align="right">{s.n_logs}</TableCell>
-                      <TableCell align="right">{s.mean_tflops_per_gpu}</TableCell>
-                      <TableCell align="right">{s.mean_step_s}</TableCell>
+                      <LogCountCell nLogs={s.n_logs} nNoMetrics={s.n_logs_no_metrics} />
+                      <TableCell align="right">{metricOrDash(s.mean_tflops_per_gpu)}</TableCell>
+                      <TableCell align="right">{metricOrDash(s.mean_step_s)}</TableCell>
                       <TableCell align="right">
                         {tflopsEffPct == null ? "—" : `${tflopsEffPct.toFixed(1)}%`}
                       </TableCell>
@@ -696,7 +872,9 @@ export function AnalyticsView({ logDir, rows }: AnalyticsViewProps) {
               <Text kind="body/regular/sm" style={{ display: "block", marginTop: 8, paddingLeft: 4, paddingRight: 4, color: "var(--text-color-secondary)" }}>
                 Scaling efficiency vs the smallest Rack bucket (includes 1R single-rack logs and multirack logs): TFLOPs
                 eff. = 100 × (mean TFLOPs/GPU ÷ baseline); step eff. = 100 × (baseline mean step ÷ mean step). 100%
-                matches baseline; higher step eff. means relatively faster steps.
+                matches baseline; higher step eff. means relatively faster steps. A “no metrics” tag counts successful
+                runs whose step timings could not be averaged (too few samples survived the warmup); they are reported
+                here rather than dropped, but contribute to no mean.
               </Text>
             ) : null}
           </Box>
@@ -727,11 +905,11 @@ export function AnalyticsView({ logDir, rows }: AnalyticsViewProps) {
                   (mr.nemotron_throughput_scaling ?? []).map((row) => (
                     <TableRow key={row.n_racks}>
                       <TableCell>{row.n_racks}</TableCell>
-                      <TableCell align="right">{row.n_logs}</TableCell>
+                      <LogCountCell nLogs={row.n_logs} nNoMetrics={row.n_logs_no_metrics} />
                       <TableCell align="right">{row.num_nodes == null ? "—" : row.num_nodes}</TableCell>
                       <TableCell align="right">{row.num_gpus == null ? "—" : row.num_gpus}</TableCell>
-                      <TableCell align="right">{row.mean_step_s}</TableCell>
-                      <TableCell align="right">{row.mean_tflops_per_gpu}</TableCell>
+                      <TableCell align="right">{metricOrDash(row.mean_step_s)}</TableCell>
+                      <TableCell align="right">{metricOrDash(row.mean_tflops_per_gpu)}</TableCell>
                       <TableCell align="right">
                         {row.mean_throughput_tokens_s == null
                           ? "—"
@@ -774,6 +952,8 @@ export function AnalyticsView({ logDir, rows }: AnalyticsViewProps) {
             )}
           </Paper>
         </>
+      )}
+      </>
       )}
     </Box>
   );

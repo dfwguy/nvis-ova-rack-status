@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 _TEMPLATE_TOKEN_RE = re.compile(
-    r"\[\\d\+\]|\[(\d{2})-(\d{2})\]",
+    r"\[\\d\+\]|\[(\d{2})-(\d{2})\]|\[(?:A-Z|a-z)\]",
 )
 
 # Defaults when Settings leaves naming fields empty (cmsh spelling: p5-r03-ct12, …).
@@ -56,6 +56,383 @@ PADDED_NVIS_NVSW_ID = "p[01-99]-r[01-99]-nvsw-[01-99]"
 _CT_BRACKET_INNER_RE = re.compile(r"^[\d,\-\s]+$")
 
 SlotKind = str  # "range2" | "digits"
+
+
+# ---------------------------------------------------------------------------
+# Log basename eligibility (universal ingest)
+#
+# These predicates decide which files in the job log directory the dashboard
+# table, Open Log, parser-results and the exports are allowed to CONSIDER. They
+# say nothing about rack attribution: ``rack_id_from_log_basename()`` still
+# requires exactly one rack id in the basename, so widening here cannot
+# mis-attribute a log.
+#
+# Default mode is "open": accept any plausible result log (known extension,
+# unknown extension, or no extension at all) and reject only genuine noise.
+# Set NVIS_LOG_BASENAME_MODE=strict to restore the legacy marker allowlist.
+# ---------------------------------------------------------------------------
+
+# Canonical tool -> basename substrings. Used for strict mode, for
+# ``log_tool_from_basename()`` (so callers can rank a real benchmark log above
+# an incidental one) and to seed ``_AUX_LOG_MARKERS``.
+_LOG_TOOL_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("clusterkit", ("root-ck-", "clusterkit")),
+    ("mnubergemm", ("mnubergemm", "ubergemm")),
+    ("nvbandwidth", ("nvbandwidth", "nvbw")),
+    ("nvloom", ("nvloom",)),
+    ("hpl", ("hpl", "linpack", "hpcg")),
+    ("dcgm", ("dcgm", "dcgmi")),
+    ("nvswitch", ("nvswitch", "nvsw", "fabricmanager", "nvlink")),
+    ("imex", ("imex",)),
+    ("sysinfo", ("sysinfo", "nvidia-bug-report", "nvsm", "topo")),
+    ("healthcheck", ("healthcheck", "health-check", "health_check", "nvhealth")),
+    ("bringup", ("bringup", "bring-up")),
+    ("nemo", ("nemo", "nemotron", "megatron")),
+    ("nccl", ("nccl", "allreduce", "all_reduce", "all-reduce", "alltoall",
+              "all_to_all", "alltoallv", "allgather", "all_gather",
+              "reducescatter", "reduce_scatter", "sendrecv", "busbw")),
+    ("llmb", ("llmb", "llama", "llm-benchmark")),
+    ("nvlmapper", ("nvlmapper",)),
+    ("gpuburn", ("gpuburn", "gpu-burn", "gpu_burn", "burnin", "burn-in")),
+    ("stress", ("stress", "stressapptest", "memtest", "soak")),
+    ("gemm", ("gemm", "cublas", "matmul")),
+    ("perftest", ("ib_write", "ib_read", "ib_send", "perftest", "osu_", "mlxlink")),
+    ("storage", ("fio", "iozone", "ior", "mdtest")),
+    ("network", ("iperf", "ethtool", "lldp", "ufm")),
+    ("slurm", ("slurm-", "sacct", "sbatch", "squeue")),
+    ("benchmark", ("benchmark", "bench-", "-bench", "validation", "validate", "diag", "smoke")),
+    ("system", ("dmesg", "syslog", "console", "boot", "ipmi", "bmc", "sel-")),
+)
+
+# Backwards-compatible flat marker tuple. The original 14 markers are still the
+# first entries; everything the tool table knows about is appended.
+_AUX_LOG_MARKERS_DEFAULT: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        (
+            "root-ck-",
+            "clusterkit",
+            "mnubergemm",
+            "ubergemm",
+            "nvbandwidth",
+            "nvloom",
+            "hpl",
+            "dcgm",
+            "nvswitch",
+            "imex",
+            "sysinfo",
+            "healthcheck",
+            "health-check",
+            "bringup",
+        )
+        + tuple(m for _tool, ms in _LOG_TOOL_MARKERS for m in ms)
+    )
+)
+
+# Compression wrappers stripped before looking at the real extension
+# (``nvidia-bug-report.log.gz`` -> ``.log``).
+_LOG_COMPRESSION_EXTS: frozenset[str] = frozenset(
+    {"gz", "bz2", "xz", "zst", "zstd", "lz4", "lzma", "br"}
+)
+
+# Extensions that are unambiguously a result/report artifact.
+_LOG_RESULT_EXTS: frozenset[str] = frozenset(
+    {
+        "log", "out", "txt", "err", "json", "jsonl", "ndjson", "csv", "tsv",
+        "yaml", "yml", "xml", "md", "rpt", "report", "results", "res",
+        "stdout", "stderr", "dat", "data", "prof", "trace", "metrics", "tbl",
+        "xls", "xlsx", "nsys-rep", "qdrep", "sqlite3",
+    }
+)
+
+# Dot-components that mark a file as editor/OS/backup noise anywhere in the name
+# (``app.py.bak.20260728``, ``run.txt.swp``, ``x.tmp``).
+_LOG_NOISE_COMPONENTS: frozenset[str] = frozenset(
+    {
+        "bak", "backup", "bkp", "tmp", "temp", "swp", "swo", "swn", "swx",
+        "lock", "pid", "part", "partial", "crdownload", "download", "orig",
+        "rej", "save", "dpkg-dist", "dpkg-new", "dpkg-old", "rpmsave",
+        "rpmnew", "sock", "inprogress", "writing",
+    }
+)
+
+# Executables / archives / media / binaries: never a readable result log.
+_LOG_BINARY_EXTS: frozenset[str] = frozenset(
+    {
+        "sh", "bash", "zsh", "ksh", "csh", "fish", "py", "pyc", "pyo", "pyd",
+        "pl", "rb", "lua", "js", "ts", "tsx", "jsx", "c", "h", "cc", "cpp",
+        "hpp", "go", "rs", "java", "class", "jar", "so", "o", "a", "ko", "ko.xz",
+        "dll", "exe", "bin", "img", "iso", "efi", "rom", "fw",
+        "tar", "tgz", "tbz", "tbz2", "txz", "zip", "7z", "rar", "cpio", "ar",
+        "rpm", "deb", "whl", "egg", "apk", "dmg", "pkg",
+        "png", "jpg", "jpeg", "gif", "bmp", "svg", "ico", "webp", "tif", "tiff",
+        "pdf", "ps", "eps", "ttf", "otf", "woff", "woff2", "eot",
+        "mp3", "mp4", "mkv", "mov", "avi", "webm", "wav", "flac",
+        "db", "sqlite", "pem", "key", "crt", "cer", "pfx", "gpg", "asc", "sig",
+        "css", "scss", "html", "htm", "map", "wasm", "ttc", "core",
+    }
+)
+
+_EDITOR_NOISE_RE = re.compile(r"(?:~$|^#.*#$|^\.#)")
+
+# ``4Rack``/``36Rack`` (N >= 2) marker — mirrors ``_MULTIRACK_N_RACK_RE`` in app.py and
+# native_status.py. Used only to refuse single-rack attribution of a multi-rack sweep.
+_MULTIRACK_N_RACK_RE = re.compile(r"(?:[2-9]|[1-9]\d{1,3})rack", re.IGNORECASE)
+
+
+def _log_basename_mode() -> str:
+    """``open`` (default: accept any plausible log) or ``strict`` (legacy marker allowlist)."""
+    v = (os.environ.get("NVIS_LOG_BASENAME_MODE") or "").strip().lower()
+    return "strict" if v in ("strict", "markers", "legacy", "allowlist") else "open"
+
+
+def _env_marker_list(var: str) -> list[str]:
+    raw = (os.environ.get(var) or "").strip()
+    if not raw:
+        return []
+    return [m.strip().lower() for m in raw.replace(";", ",").split(",") if m.strip()]
+
+
+def _basename_only(name: str) -> str:
+    """Last path component of *name*, whitespace-stripped (accepts POSIX or Windows separators)."""
+    s = (name or "").strip().replace("\\", "/")
+    while s.endswith("/"):
+        s = s[:-1]
+    return s.rsplit("/", 1)[-1]
+
+
+def _split_log_ext_chain(base: str) -> tuple[str, list[str]]:
+    """Split ``foo.log.gz`` into (``foo``, ``['log', 'gz']``). Leading dot is not a separator."""
+    if not base:
+        return "", []
+    lead = ""
+    body = base
+    while body.startswith("."):
+        lead += "."
+        body = body[1:]
+    parts = body.split(".")
+    return lead + parts[0], [p.lower() for p in parts[1:]]
+
+
+def is_log_noise_basename(name: str) -> bool:
+    """True for files that are never a result log: dotfiles, editor swap/autosave, backups, temps.
+
+    Directories are not distinguishable from a basename alone; callers list files
+    only. A trailing ``/`` (or an empty / ``.`` / ``..`` name) is treated as noise.
+    """
+    raw = (name or "").strip()
+    if not raw or raw.endswith("/") or raw.endswith("\\"):
+        return True
+    base = _basename_only(raw)
+    if not base or base in (".", ".."):
+        return True
+    if base.startswith("."):
+        return True
+    if _EDITOR_NOISE_RE.search(base):
+        return True
+    _stem, exts = _split_log_ext_chain(base)
+    if any(e in _LOG_NOISE_COMPONENTS for e in exts):
+        return True
+    return False
+
+
+def _effective_log_exts(exts: list[str]) -> list[str]:
+    """Extension chain with trailing compression wrappers removed."""
+    out = list(exts)
+    while out and out[-1] in _LOG_COMPRESSION_EXTS:
+        out.pop()
+    return out
+
+
+def is_plausible_log_basename(name: str) -> bool:
+    """True when *name* could be a job/benchmark result log worth considering.
+
+    Accepts ``.log .out .txt .err .json .csv`` (and ``.gz``/``.xz``/``.zst``
+    variants), Slurm's default ``slurm-<jobid>.out``, unknown extensions and
+    extension-less names. Rejects only genuine noise (dotfiles, editor swap
+    files, ``*.bak`` / ``*.tmp`` / ``*.lock``) and binary/archive/source/media
+    extensions that can never be parsed as text.
+
+    Escape hatches: ``NVIS_EXTRA_LOG_MARKERS`` force-accepts any basename
+    containing one of its comma-separated substrings; ``NVIS_LOG_EXCLUDE_MARKERS``
+    force-rejects.
+    """
+    raw = (name or "").strip()
+    base = _basename_only(raw)
+    # Hard rejects that no escape hatch may override: empty, ``.``/``..`` and
+    # anything that names a directory (trailing separator).
+    if not base or base in (".", "..") or raw.endswith("/") or raw.endswith("\\"):
+        return False
+    low = base.lower()
+    for m in _env_marker_list("NVIS_LOG_EXCLUDE_MARKERS"):
+        if m in low:
+            return False
+    forced = any(m in low for m in _env_marker_list("NVIS_EXTRA_LOG_MARKERS"))
+    if forced:
+        return True
+    if is_log_noise_basename(base):
+        return False
+    _stem, exts = _split_log_ext_chain(base)
+    eff = _effective_log_exts(exts)
+    if not eff:
+        # No extension left: bare name, or a pure archive like ``run.gz``.
+        return True
+    ext = eff[-1]
+    if ext in _LOG_RESULT_EXTS:
+        return True
+    if ext in _LOG_BINARY_EXTS:
+        return False
+    if ext.isdigit():
+        # Rotated log (``messages.1``, ``run.out.2``): keep if what precedes it is a log ext.
+        prev = eff[-2] if len(eff) >= 2 else ""
+        return prev not in _LOG_BINARY_EXTS
+    # Unknown extension (e.g. ``run.mnub``, ``h22.results2``) -> accept.
+    return True
+
+
+def log_tool_from_basename(name: str) -> str | None:
+    """Canonical tool token for *name* (``mnubergemm``, ``nccl``, ``hpl``, …) or ``None``.
+
+    Purely advisory: callers may use it to rank a genuine benchmark log above an
+    incidental one (e.g. when picking the newest log per rack). It is NOT a gate.
+    """
+    low = _basename_only(name).lower()
+    if not low:
+        return None
+    for tool, markers in _LOG_TOOL_MARKERS:
+        if any(m in low for m in markers):
+            return tool
+    return None
+
+
+def is_known_tool_log_basename(name: str) -> bool:
+    """Legacy strict predicate: basename contains a known tool marker (or NVIS_EXTRA_LOG_MARKERS)."""
+    low = _basename_only(name).lower()
+    if not low:
+        return False
+    markers = list(_AUX_LOG_MARKERS_DEFAULT) + _env_marker_list("NVIS_EXTRA_LOG_MARKERS")
+    return any(m in low for m in markers)
+
+
+# ---------------------------------------------------------------------------
+# Log-basename classification (single source of truth)
+#
+# app.py and native_status.py each used to carry their own copy of these four
+# predicates plus a verbatim duplicate of ``_MULTIRACK_N_RACK_RE``. They classify
+# which table a log belongs to, so a drifted copy shows a rack in one view and not
+# the other. They live here because this module already owns the naming templates
+# these predicates depend on.
+#
+# ``naming`` is a parameter rather than a module lookup because callers do not share
+# one instance: native_status builds its NvisNaming from its own job-env-override
+# subset, app.py from the process env. Passing it keeps each caller's behaviour exact.
+# ---------------------------------------------------------------------------
+
+
+def nemo_nccl_in_log_basename(name: str, naming: NvisNaming | None = None) -> bool:
+    """Logs with NEMO or NCCL in the basename (multirack tab, exports, legacy shell table)."""
+    low = (name or "").lower()
+    if "nemo" in low or "nccl" in low:
+        return True
+    return (naming or get_nvis_naming()).auxiliary_single_rack_log_basename(name)
+
+
+def nemo_single_rack_log_basename(name: str, naming: NvisNaming | None = None) -> bool:
+    """Single-rack validation logs for the dashboard table / Open Log.
+
+    Also accepts standalone single-rack NCCL benchmark logs (``…-NCCL-1Rack-<rack>-…``); the
+    ``1rack`` marker is what excludes multirack NCCL sweeps (N-rack / comma naming).
+    """
+    low = (name or "").lower()
+    if "nemo" in low or "1rack" in low:
+        return True
+    return (naming or get_nvis_naming()).auxiliary_single_rack_log_basename(name)
+
+
+def stage_kind_of_log_basename(name: str) -> str | None:
+    """Which validation stage a single-rack log carries evidence for: ``nccl`` | ``nemo`` | None.
+
+    Stage 1 (NCCL) and stage 2 (NeMo) are separate Slurm jobs and therefore land in separate
+    logs. Each stage must be judged from the newest log of ITS OWN kind, otherwise whichever
+    job finished last decides both stages and the other one reads as a failure.
+    """
+    low = (name or "").lower()
+    if "-nccl-1rack-" in low:
+        return "nccl"
+    if "-nemo-1rack-" in low:
+        return "nemo"
+    return None
+
+
+def is_multirack_log_basename(name: str, naming: NvisNaming | None = None) -> bool:
+    """True for multi-rack logs: excluded from the single-rack table, listed in the multirack tab."""
+    n = naming or get_nvis_naming()
+    if not nemo_nccl_in_log_basename(name, n):
+        return False
+    if _MULTIRACK_N_RACK_RE.search(name or ""):
+        return True
+    low = (name or "").lower()
+    # run-nemo-xrack.sh: root-NEMO-p5-r[…]-ct[…],p5-r[…]-ct[…]-<n>N-<jid>.txt
+    if (low.startswith("root-nemo-") or low.startswith("root-nccl-")) and (
+        n.multirack_comma_after_rack_re().search(low)
+    ):
+        return True
+    return len(n.find_rack_ids_in_string(name)) >= 2
+
+
+def multirack_n_rack_marker(name: str) -> str | None:
+    """The ``4Rack`` / ``36Rack`` marker in *name*, or ``None``.
+
+    Exposed so callers do not reach for the module-private regex and end up copying it.
+    """
+    m = _MULTIRACK_N_RACK_RE.search(name or "")
+    return m.group(0) if m else None
+
+
+def job_id_from_log_basename(name: str) -> str | None:
+    """Slurm job id from a validation log basename, or ``None``.
+
+    Llama stdout is checked first: ``…NEMO-LLAMA3_8B-1N-<host>-<jid>.txt`` has no ``N-<jid>``
+    tail, and a hostname ending in ``N`` would otherwise make the generic pattern ambiguous.
+    """
+    base = _basename_only(name)
+    m = re.search(r"NEMO-LLAMA3_8B-1N-.+-(\d+)\.txt$", base, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"N-(\d+)\.txt$", base, re.IGNORECASE)
+    if m2:
+        return m2.group(1)
+    # Other tools (MNUBERGEMM, nvbandwidth, …): plain trailing -<jid>.txt. This branch existed only
+    # in the shell jobid_from_fname, so the two disagreed on exactly those names.
+    m3 = re.search(r"-(\d+)\.txt$", base, re.IGNORECASE)
+    if m3:
+        return m3.group(1)
+    # MPI launcher stdout: nccl-mpi_<rack>+<rack>_<jid>.out — underscore separator, .out extension.
+    m4 = re.search(r"[_-](\d+)\.out$", base, re.IGNORECASE)
+    return m4.group(1) if m4 else None
+
+
+def node_count_from_log_basename(name: str) -> int | None:
+    """Node count from a ``-<N>N-`` / ``-<N>N.txt`` basename field, or ``None``.
+
+    Load-bearing: it is how an 18-node acceptance run is told from a 1-node smoke test that
+    otherwise shares the same filename shape.
+    """
+    base = _basename_only(name)
+    m = re.search(r"-(\d+)N-\d", base, re.IGNORECASE) or re.search(
+        r"-(\d+)N\.txt$", base, re.IGNORECASE
+    )
+    if not m:
+        return None
+    try:
+        return int(m.group(1), 10)
+    except ValueError:
+        return None
+
+
+def node_count_suffix_from_basename(name: str) -> str:
+    """`` (36N)`` for display when the basename carries a node count, else ``""``."""
+    n = node_count_from_log_basename(name)
+    return f" ({n}N)" if n is not None else ""
 
 
 @dataclass(frozen=True)
@@ -94,6 +471,10 @@ def parse_template(template: str) -> ParsedTemplate:
                 segments.append(("lit", lit))
         if m.group(0) == r"[\d+]":
             segments.append(("slot", str(slot_i), "digits"))
+        elif m.group(1) is None:
+            # Single-letter slot (``[A-Z]`` / ``[a-z]``) for sites with row-letter
+            # racks (e.g. ``bos01-a05`` vs ``bos01-b05``). Matched case-insensitively.
+            segments.append(("slot", str(slot_i), "alpha"))
         else:
             lo, hi = m.group(1), m.group(2)
             if int(lo) > int(hi):
@@ -170,13 +551,38 @@ def _build_from_template(parsed: ParsedTemplate, slot_values: list[str]) -> str:
     return "".join(out)
 
 
+def _rebuild_through_slot(parsed: ParsedTemplate, values: list[str], up_to: int) -> str:
+    """Rebuild the template literal/slot string up to and including slot ``up_to``.
+
+    Trailing separators (``-_/:.``) are stripped so the resulting grouping key is
+    stable (e.g. ``bos01-a`` rather than ``bos01-a-``). Returns ``""`` when
+    ``up_to`` is negative (i.e. the requested level does not exist).
+    """
+    if up_to < 0:
+        return ""
+    out: list[str] = []
+    slot_i = 0
+    for seg in parsed.segments:
+        if seg[0] == "lit":
+            out.append(seg[1])
+        else:
+            if slot_i > up_to:
+                break
+            idx = int(seg[1])
+            out.append(values[idx] if idx < len(values) else "")
+            slot_i += 1
+            if slot_i > up_to:
+                break
+    return re.sub(r"[-_/:.]+$", "", "".join(out))
+
+
 def _format_slot_groups(parsed: ParsedTemplate, groups: Iterable[str]) -> list[str]:
     """Map regex capture groups to canonical slot strings (zero-pad only for ``range2`` slots)."""
     out: list[str] = []
     slot_i = 0
     for g in groups:
         kind = parsed.slot_kind(slot_i)
-        if kind == "digits":
+        if kind in ("digits", "alpha"):
             out.append(g)
         else:
             out.append(g.zfill(2))
@@ -187,6 +593,8 @@ def _format_slot_groups(parsed: ParsedTemplate, groups: Iterable[str]) -> list[s
 def _slot_regex_pat(kind: SlotKind, *, loose: bool) -> str:
     if kind == "digits":
         return r"(\d+)"
+    if kind == "alpha":
+        return r"([A-Za-z])"
     return r"(\d{1,2})" if loose else r"(\d{2})"
 
 
@@ -240,6 +648,25 @@ class HostnameMatch:
     hostname: str
     rack_id: str
     tray: str
+
+
+@dataclass(frozen=True)
+class RackParts:
+    """A rack id decomposed into its datacenter hierarchy (section -> row -> rack).
+
+    Levels are derived from the trailing slots of ``NVIS_RACK_ID``: the last slot
+    is the rack, the second-to-last the row, the third-to-last the section. Sites
+    with fewer slots simply collapse the higher levels (Boston ``bos01-[A-Z][01-99]``
+    -> row letter + rack; Bright ``p[\\d+]-r[\\d+]`` -> pod-as-row + rack).
+    """
+
+    rack_id: str
+    section_key: str
+    section_label: str
+    row_key: str
+    row_label: str
+    rack_label: str
+    sort_key: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -393,7 +820,8 @@ class NvisNaming:
         m = self.rack_scan_re.fullmatch(rid.strip())
         if not m:
             return (10**9,) * (self.rack_template.slot_count + 1) + (hash(rid) % 10**6,)
-        return tuple(int(g, 10) for g in m.groups()) + (0,)
+        # Letter slots (``[A-Z]``) sort by their character ordinal so row ``a`` precedes ``b``.
+        return tuple(int(g, 10) if g.isdigit() else ord(g.lower()) for g in m.groups()) + (0,)
 
     def is_r00_rack(self, rid: str) -> bool:
         c = self.canonical_rack_id(rid)
@@ -402,7 +830,93 @@ class NvisNaming:
         m = self.rack_re.fullmatch(c)
         if not m or not m.groups():
             return False
-        return int(m.groups()[-1], 10) == 0
+        last = m.groups()[-1]
+        return last.isdigit() and int(last, 10) == 0
+
+    def rack_parts(self, rid: str) -> RackParts | None:
+        """Decompose a rack id into section/row/rack parts using the rack template.
+
+        This is the single authoritative decomposition consumed by the dashboard
+        hierarchy (floor view, etc.) so the SPA never re-implements template
+        parsing. Returns ``None`` when *rid* does not match ``NVIS_RACK_ID``.
+        """
+        canon = self.canonical_rack_id(rid)
+        if not canon:
+            return None
+        m = self.rack_scan_re.fullmatch(canon)
+        if not m:
+            return None
+        values = _format_slot_groups(self.rack_template, list(m.groups()))
+        n = len(values)
+        rack_label = values[-1] if n >= 1 else canon
+        row_label = values[-2] if n >= 2 else ""
+        row_key = _rebuild_through_slot(self.rack_template, values, n - 2) if n >= 2 else canon
+        section_key = _rebuild_through_slot(self.rack_template, values, n - 3) if n >= 3 else ""
+        section_label = section_key or ("Cluster" if n >= 2 else canon)
+        return RackParts(
+            rack_id=canon,
+            section_key=section_key,
+            section_label=section_label,
+            row_key=row_key,
+            row_label=row_label,
+            rack_label=rack_label,
+            sort_key=self.rack_sort_key(canon),
+        )
+
+    def build_hierarchy(self, rack_ids: Iterable[str]) -> dict:
+        """Group rack ids into a ``section -> row -> rack`` tree (JSON-serializable).
+
+        The single source of truth for datacenter layout: any surface that needs
+        rows/sections consumes this instead of parsing rack ids itself. Racks that
+        don't match ``NVIS_RACK_ID`` are returned under ``unmatched`` (never
+        silently dropped). ``levels`` lists which grouping levels are meaningful
+        for the active naming (``section`` is omitted for 2-slot templates such as
+        Boston's ``bos01-[A-Z][01-99]``).
+        """
+        sections: dict[str, dict] = {}
+        rows: dict[tuple[str, str], dict] = {}
+        unmatched: list[str] = []
+        has_section = False
+        has_row = False
+        for rid in rack_ids:
+            parts = self.rack_parts(rid)
+            if parts is None:
+                unmatched.append(rid)
+                continue
+            if parts.section_key:
+                has_section = True
+            if parts.row_key != parts.rack_id:
+                has_row = True
+            sec = sections.get(parts.section_key)
+            if sec is None:
+                sec = {"key": parts.section_key, "label": parts.section_label, "rows": []}
+                sections[parts.section_key] = sec
+            rkey = (parts.section_key, parts.row_key)
+            row = rows.get(rkey)
+            if row is None:
+                row = {"key": parts.row_key, "label": parts.row_label, "racks": []}
+                rows[rkey] = row
+                sec["rows"].append(row)
+            row["racks"].append({"rack": parts.rack_id, "label": parts.rack_label})
+
+        def _row_key(row: dict) -> tuple[int, ...]:
+            return self.rack_sort_key(row["racks"][0]["rack"]) if row["racks"] else (10**9,)
+
+        for row in rows.values():
+            row["racks"].sort(key=lambda r: self.rack_sort_key(r["rack"]))
+        for sec in sections.values():
+            sec["rows"].sort(key=_row_key)
+        ordered = sorted(
+            sections.values(),
+            key=lambda s: _row_key(s["rows"][0]) if s["rows"] else (10**9,),
+        )
+        levels: list[str] = []
+        if has_section:
+            levels.append("section")
+        if has_row:
+            levels.append("row")
+        levels.append("rack")
+        return {"levels": levels, "sections": ordered, "unmatched": unmatched}
 
     def build_tray_hostname(self, rack_id: str, tray: str) -> str:
         """Full CT hostname from canonical rack id and tray token."""
@@ -549,14 +1063,41 @@ class NvisNaming:
         # Bright: …1Rack-p05-r01-ct[…]-…  CBR: …1Rack-CBR01-…-CN0102[11-18]-… (``[`` right after rack id)
         return re.compile(rf"1Rack-({inner})(?:-|\[)", re.IGNORECASE)
 
+    # Tool markers that identify a single-rack validation log by basename. Kept as a field for
+    # backwards compatibility (and used by ``NVIS_LOG_BASENAME_MODE=strict``); in the default
+    # "open" mode eligibility no longer depends on this list — see
+    # ``is_plausible_log_basename()``. Extend at runtime with
+    # NVIS_EXTRA_LOG_MARKERS="foo,bar" (comma-separated, case-insensitive).
+    _AUX_LOG_MARKERS: tuple[str, ...] = _AUX_LOG_MARKERS_DEFAULT
+
     def auxiliary_single_rack_log_basename(self, name: str) -> bool:
-        """True for non-NEMO basenames that still tie to one rack (e.g. ClusterKit ``root-CK-…``)."""
-        low = (name or "").lower()
-        if "root-ck-" in low or low.startswith("root-ck-"):
-            return True
-        if "clusterkit" in low:
-            return True
-        return False
+        """True for any basename that could be a single-rack result log.
+
+        This is the ONE predicate all three basename gates funnel through
+        (``_nemo_single_rack_log_basename``, ``_nemo_nccl_in_log_basename``,
+        ``rack_id_from_log_basename``), so it decides what the dashboard table,
+        Open Log, parser-results and the exports will even consider.
+
+        Default (``NVIS_LOG_BASENAME_MODE`` unset / ``open``): accept ANY plausible
+        result log — known tools (MNUBERGEMM, ClusterKit, nvbandwidth, HPL, DCGM,
+        NVLoom, bringup, NCCL, …), unknown tools, Slurm's default
+        ``slurm-<jobid>.out``, and ``.log/.out/.txt/.err/.json/.csv`` plus their
+        compressed variants. Only genuine noise is rejected (dotfiles, editor swap
+        files, ``*.bak``/``*.tmp``/``*.lock``, binaries/archives/media).
+
+        Set ``NVIS_LOG_BASENAME_MODE=strict`` to fall back to the legacy tool-marker
+        allowlist.
+
+        Rack attribution is unchanged and independent: the caller still requires
+        EXACTLY ONE rack id in the basename, and multirack / Llama basenames are
+        excluded upstream, so widening this cannot pull in a multi-rack sweep or
+        mis-attribute a log to the wrong rack.
+        """
+        if _log_basename_mode() == "strict":
+            markers = list(self._AUX_LOG_MARKERS) + _env_marker_list("NVIS_EXTRA_LOG_MARKERS")
+            low = _basename_only(name).lower()
+            return bool(low) and any(m in low for m in markers)
+        return is_plausible_log_basename(name)
 
     def is_llama_slurm_stdout_basename(self, name: str) -> bool:
         """True for ``run-llama.sh`` Slurm stdout (``…NEMO-LLAMA3_8B-1N-<host>-<jid>.txt``), not 1Rack NEMO validation."""
@@ -590,9 +1131,13 @@ class NvisNaming:
         return None
 
     def rack_id_from_log_basename(self, name: str) -> str | None:
-        """Rack id from a single-rack NEMO validation log basename (1Rack-, auxiliary e.g. root-CK-…).
+        """Rack id from a single-rack result log basename (1Rack-, auxiliary e.g. root-CK-…).
 
-        Excludes NCCL-only sweeps and Llama Slurm stdout (``…NEMO-LLAMA3_8B-1N-…``).
+        Excludes Llama Slurm stdout (``…NEMO-LLAMA3_8B-1N-…``) and any sweep that
+        names two or more racks. NCCL sweeps used to be excluded as well, as a
+        side effect of the marker allowlist; since that predicate was widened to
+        accept any plausible result log, an NCCL log naming exactly one rack is
+        attributed to it like any other tool's.
         """
         if self.is_llama_slurm_stdout_basename(name):
             return None
@@ -605,6 +1150,11 @@ class NvisNaming:
             if len(racks) == 1:
                 return next(iter(racks))
         if not self.auxiliary_single_rack_log_basename(name):
+            return None
+        # A sweep that names N >= 2 racks in its basename (``…-4Rack-…``) must never be
+        # attributed to one rack even when only one rack id is spelled out. Guards the
+        # widened auxiliary predicate; ``1Rack``/single-rack names are unaffected.
+        if _MULTIRACK_N_RACK_RE.search(_basename_only(name)):
             return None
         racks = self.find_rack_ids_in_string(name)
         if len(racks) != 1:

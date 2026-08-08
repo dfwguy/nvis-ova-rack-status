@@ -27,6 +27,7 @@ export const rackDetailPath = (rack: string): string =>
 
 export const ROUTES: RouteDef[] = [
   { viewId: "dashboard", path: DEFAULT_PATH, domain: "Compute", label: "Cluster overview" },
+  { viewId: "nodes", path: "/compute/nodes", domain: "Compute", label: "Nodes" },
   { viewId: "singleRack", path: RACKS_PATH, domain: "Compute", label: "Racks" },
   { viewId: "multirack", path: "/compute/multirack", domain: "Compute", label: "Multirack operations" },
   { viewId: "slurm", path: "/compute/scheduler", domain: "Compute", label: "Scheduler" },
@@ -41,6 +42,9 @@ export const ROUTES: RouteDef[] = [
   { viewId: "terminal", path: "/tools/terminal", domain: "Tools", label: "Terminal" },
   { viewId: "analytics", path: "/analytics/overview", domain: "Analytics & Benchmarks", label: "Analytics" },
   { viewId: "reports", path: "/analytics/reports", domain: "Analytics & Benchmarks", label: "Reports" },
+  { viewId: "projects", path: "/platform/projects", domain: "Platform", label: "Projects & Clusters" },
+  { viewId: "platformCatalog", path: "/platform/catalog", domain: "Platform", label: "Platform Catalog" },
+  { viewId: "toolRegistry", path: "/platform/tools", domain: "Platform", label: "Tool Registry" },
   { viewId: "settings", path: "/settings", domain: "Platform", label: "Settings" },
 ];
 

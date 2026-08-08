@@ -1,6 +1,6 @@
 {
   "generated_by": "frontend/scripts/gen-help-content.mjs",
-  "count": 72,
+  "count": 76,
   "entries": [
     {
       "id": "dashboard",
@@ -127,6 +127,68 @@
         "description": "Sortable, filterable table of all racks showing validation status, latest job, comments, and per-rack actions."
       },
       "aiContext": "The Racks page is the main table listing every rack with its validation state, latest job, and comment. Users sort/filter, click status summary tags to filter by state, edit comments, open parser charts, and click a rack to open its detail view (rackDetail)."
+    },
+    {
+      "id": "nodes",
+      "kind": "view",
+      "title": "Nodes",
+      "domain": "Compute",
+      "routePath": "/compute/nodes",
+      "summary": "Flat, filterable inventory of every compute node with per-node actions.",
+      "description": "The Nodes page lists every compute node across the cluster in one paginated table (18 rows by default, one NVL72 rack in view). Filter by datacenter row, rack, or node name, then select a single node to run Validation, Hardware, Networking, and Services actions scoped to just that node. Node inventory and up/down state come from the same live status feed the Racks and Rack Detail views use.",
+      "features": [
+        "Paginated node table (default 18 rows) with sortable node names.",
+        "Filters for row, rack, and node name.",
+        "Per-node status tag (UP / DOWN / INST / UNKNOWN) and BMC/RedFish link.",
+        "Select a node to expose Validation, Hardware, Networking, and Services action tabs scoped to that node.",
+        "Bring-up results panel: per-job status, metric, and reason from the cluster automation (results + reports), with open-log and NCCL charts per job.",
+        "Per-node web terminal."
+      ],
+      "howTo": [
+        {
+          "task": "Run an action on a single node",
+          "steps": [
+            "Open Compute > Nodes.",
+            "Filter by rack or name to find the node.",
+            "Click the node row to select it.",
+            "Open the relevant action tab (Validation, Hardware, Networking, Services) and confirm."
+          ]
+        },
+        {
+          "task": "Narrow the list to one rack",
+          "steps": [
+            "Use the Rack filter and pick one or more racks.",
+            "The table and pagination update to the matching nodes."
+          ]
+        }
+      ],
+      "tips": [
+        "The default page size is 18 so a single NVL72 rack fits on one page.",
+        "Actions here apply to the one selected node; use the Racks view to act on a whole rack."
+      ],
+      "related": [
+        "singleRack",
+        "rackDetail",
+        "validationTab",
+        "hardwareTab",
+        "networkingTab",
+        "servicesTab"
+      ],
+      "keywords": [
+        "nodes",
+        "node",
+        "tray",
+        "inventory",
+        "filter",
+        "single node",
+        "per-node",
+        "compute"
+      ],
+      "aria": {
+        "label": "Nodes inventory page",
+        "description": "Paginated table of every compute node with row/rack/name filters; selecting a node exposes per-node Validation, Hardware, Networking, and Services actions."
+      },
+      "aiContext": "The Nodes page is a flat, paginated inventory of every compute node (default 18 rows). Users filter by row, rack, or name and select a single node to run Validation, Hardware, Networking, and Services actions scoped to that node. A Bring-up results panel shows per-job status/metric/reason from the cluster automation (Travis's /home/cmods/bringup results + reports, via /api/bringup/node) with open-log and NCCL charts per job. Node/tray state reuses the same live status feed as the Racks and Rack Detail views."
     },
     {
       "id": "multirack",
@@ -2395,25 +2457,67 @@
       "title": "Analytics",
       "domain": "Analytics & Benchmarks",
       "routePath": "/analytics/overview",
-      "summary": "Aggregate rack analytics and benchmark trends across the cluster.",
-      "description": "The Analytics page aggregates rack and benchmark data into cluster-wide charts and tables — validation pass rates, NCCL/NEMO benchmark trends, and comparisons across racks — to spot outliers and track campaign progress.",
+      "summary": "Rack-level and node-level analytics, plus the downloadable daily report.",
+      "description": "The Analytics page has two tabs. Rack Level aggregates rack and benchmark data into cluster-wide charts and tables — validation pass rates, NCCL/NEMO benchmark trends, and comparisons across racks. Node Level shows a heatmap with one square per node, coloured by a selectable data view (node up/down, test completion, or any bring-up benchmark that produces a metric such as NCCL busbw), with each node's up/down state always drawn as the square's border. The Compact layout tiles racks eight across as blocks of trays so a whole floor fits on one screen; Linear gives each rack its own row and shows a load gauge per node. The heatmap can be downloaded as a PNG or JPEG image, and a Download report button on either tab produces the daily node-validation report as schema-validated JSON.",
       "features": [
-        "Cluster-wide aggregate charts.",
-        "Benchmark trend analysis.",
-        "Cross-rack comparisons."
+        "Rack Level: cluster-wide aggregate charts, benchmark trends, cross-rack comparisons.",
+        "Node Level: per-node heatmap grouped by rack, with a data-view selector.",
+        "Compact layout tiles racks as blocks with a per-rack tally; Linear shows a gauge per node.",
+        "Test completion view: all tests done, partial, or none run — independent of pass/fail.",
+        "Up/down state shown as each cell's border on every view.",
+        "Metric views scale against the fleet's observed range, stated in the legend.",
+        "Download image: the heatmap as a report-ready PNG or JPEG with title, legend and timestamp.",
+        "Download report: daily node-validation JSON, validated against the report schema."
       ],
       "howTo": [
         {
           "task": "Compare benchmark results across racks",
           "steps": [
             "Open Analytics & Benchmarks > Analytics.",
+            "Stay on the Rack Level tab.",
             "Select the metric/benchmark.",
             "Read the aggregate chart and rack comparison."
+          ]
+        },
+        {
+          "task": "Find slow or failed nodes across the cluster",
+          "steps": [
+            "Open Analytics & Benchmarks > Analytics.",
+            "Switch to the Node Level tab.",
+            "Pick a benchmark in the data-view selector.",
+            "Hover a square for that node's value and verdict; pale cells are failures or tests that never ran."
+          ]
+        },
+        {
+          "task": "See how far bring-up has got",
+          "steps": [
+            "Open Analytics & Benchmarks > Analytics.",
+            "Switch to the Node Level tab.",
+            "Choose the Test completion view.",
+            "Green racks are fully tested, red have not started, yellow are part-way; the per-rack tally counts each."
+          ]
+        },
+        {
+          "task": "Put the heatmap in a status email",
+          "steps": [
+            "Open Analytics & Benchmarks > Analytics.",
+            "Switch to the Node Level tab.",
+            "Pick the view and layout you want to show.",
+            "Choose PNG or JPEG and click Download image — the file carries the cluster name, legend and timestamp."
+          ]
+        },
+        {
+          "task": "Produce the daily report",
+          "steps": [
+            "Open Analytics & Benchmarks > Analytics.",
+            "Click Download report.",
+            "Edit the TBD firmware and test-plan fields before sending it on."
           ]
         }
       ],
       "related": [
         "reports",
+        "nodes",
         "parserResultsDialog",
         "dashboard"
       ],
@@ -2423,13 +2527,22 @@
         "benchmark",
         "trends",
         "comparison",
-        "charts"
+        "charts",
+        "heatmap",
+        "node level",
+        "daily report",
+        "json report",
+        "test completion",
+        "download image",
+        "png",
+        "jpeg",
+        "compact layout"
       ],
       "aria": {
         "label": "Analytics page",
-        "description": "Aggregate rack analytics and benchmark trends across the cluster."
+        "description": "Rack-level and node-level analytics with a downloadable daily report."
       },
-      "aiContext": "The Analytics page aggregates rack/benchmark data into cluster-wide charts and tables (validation pass rates, NCCL/NEMO trends, cross-rack comparisons) to spot outliers and track progress."
+      "aiContext": "The Analytics page has a Rack Level tab (cluster-wide aggregate charts: validation pass rates, NCCL/NEMO trends, cross-rack comparisons) and a Node Level tab (per-node heatmap grouped by rack; the fill is a selectable view — node up/down, test completion, or a bring-up metric like NCCL busbw — and the border always shows up/down). Test completion counts a test as done once it has a verdict, pass or fail, so it answers 'has this node been tested' rather than 'did it pass'. Two layouts: Compact tiles racks eight across as tray blocks with a per-rack good/warn/bad tally (the whole floor on one screen), Linear gives each rack a row and each node a load gauge. Metric views auto-scale to the fleet's observed range. Download image renders the heatmap to a light-background PNG/JPEG with title, legend, cluster and timestamp baked in, drawn on a canvas so it does not depend on the UI theme. A Download report button on either tab returns the daily node-validation report as JSON validated against the vendored report schema; fields bring-up cannot measure (firmware versions, test plan reference) are marked TBD for the operator to edit."
     },
     {
       "id": "reports",
@@ -2471,6 +2584,155 @@
         "description": "Generate and export validation and benchmark reports."
       },
       "aiContext": "The Reports page generates and exports shareable validation/benchmark reports for a rack or campaign."
+    },
+    {
+      "id": "projects",
+      "kind": "view",
+      "title": "Projects & Clusters",
+      "domain": "Platform",
+      "routePath": "/platform/projects",
+      "summary": "Customer projects and clusters; set the active cluster to re-scope the app.",
+      "description": "Projects & Clusters defines each customer engagement and the clusters within it: naming convention (rack/node/NVSwitch templates), site geometry, the hardware platform, the cluster manager (BCM/MAAS), and the connection (local or SSH). The active cluster is server-authoritative: switching it re-scopes status, validation geometry, tool execution, and the AI context across the whole app.",
+      "features": [
+        "Create projects with a customer name and description.",
+        "Add clusters with platform, manager, naming convention, geometry, and connection.",
+        "Set the active cluster (also available from the top-bar switcher)."
+      ],
+      "howTo": [
+        {
+          "task": "Switch the active cluster",
+          "steps": [
+            "Open Projects & Clusters.",
+            "Find the cluster card.",
+            "Click 'Set active' (or use the top-bar switcher)."
+          ]
+        },
+        {
+          "task": "Add a cluster",
+          "steps": [
+            "Open the project.",
+            "Click 'Cluster'.",
+            "Pick a platform, set naming + connection, and save."
+          ]
+        }
+      ],
+      "related": [
+        "platformCatalog",
+        "toolRegistry",
+        "settings"
+      ],
+      "keywords": [
+        "project",
+        "cluster",
+        "customer",
+        "naming",
+        "active",
+        "switch",
+        "tenant",
+        "bcm",
+        "maas",
+        "ssh"
+      ],
+      "aria": {
+        "label": "Projects and clusters page",
+        "description": "Manage customer projects and clusters and set the active cluster."
+      },
+      "aiContext": "Projects & Clusters manages customer projects and their clusters (platform, manager, naming, geometry, connection). The active cluster is server-authoritative and re-scopes status, geometry, tools, and AI context."
+    },
+    {
+      "id": "platformCatalog",
+      "kind": "view",
+      "title": "Platform Catalog",
+      "domain": "Platform",
+      "routePath": "/platform/catalog",
+      "summary": "Hardware/system SKUs (GPU, CPU, vendor, topology, geometry, capabilities).",
+      "description": "The Platform Catalog defines hardware/system SKUs across NVIDIA generations (GB200/GB300/B200/B300, future VR200/R200), with CPU vendor (Grace/Intel/AMD), system vendor (NVIDIA/DGX/Dell/SMC), form factor, per-rack geometry, interconnect, capabilities (nvlink, nvswitch, imex, mnnvl, roce), and tool parameter defaults. A cluster's platform drives dashboard geometry and which tools are compatible.",
+      "features": [
+        "Define GPU/CPU/vendor/form-factor and per-rack geometry.",
+        "Declare capabilities used for tool compatibility.",
+        "Set tool parameter defaults (e.g. GPU model flag, MNNVL topology, CUDA major)."
+      ],
+      "howTo": [
+        {
+          "task": "Add a platform",
+          "steps": [
+            "Open Platform Catalog.",
+            "Click 'New platform'.",
+            "Fill GPU/CPU/vendor, geometry, capabilities, and save."
+          ]
+        }
+      ],
+      "related": [
+        "projects",
+        "toolRegistry"
+      ],
+      "keywords": [
+        "platform",
+        "gpu",
+        "gb200",
+        "gb300",
+        "b200",
+        "b300",
+        "vr200",
+        "r200",
+        "geometry",
+        "capability",
+        "nvlink",
+        "nvswitch",
+        "mnnvl",
+        "vendor"
+      ],
+      "aria": {
+        "label": "Platform catalog page",
+        "description": "Define hardware/system platforms and their geometry and capabilities."
+      },
+      "aiContext": "The Platform Catalog defines hardware SKUs (GPU/CPU/vendor/form-factor), per-rack geometry, capabilities, and tool param defaults. The active cluster's platform drives geometry and tool compatibility."
+    },
+    {
+      "id": "toolRegistry",
+      "kind": "view",
+      "title": "Tool Registry",
+      "domain": "Platform",
+      "routePath": "/platform/tools",
+      "summary": "Each script as a document: platform compatibility, surfaces, and execution.",
+      "description": "The Tool Registry describes each validation/performance/maintenance script as a document: the script basename, optional env-key override, platform compatibility (all platforms, required capabilities, or specific platform ids), where it surfaces in the UI, and how it executes (async/sync/stream; rack/multirack/cluster/node). Tools are filtered to the active cluster's platform so only compatible tools are offered.",
+      "features": [
+        "Register a tool with its script and execution mode/target.",
+        "Set platform compatibility by capability or platform id.",
+        "Declare UI surfaces (e.g. rackDetail.hardware)."
+      ],
+      "howTo": [
+        {
+          "task": "Register a tool",
+          "steps": [
+            "Open Tool Registry.",
+            "Click 'New tool'.",
+            "Set script, compatibility, surfaces, execution, and save."
+          ]
+        }
+      ],
+      "related": [
+        "projects",
+        "platformCatalog",
+        "tools"
+      ],
+      "keywords": [
+        "tool",
+        "registry",
+        "script",
+        "sysinfo",
+        "clusterkit",
+        "nvloom",
+        "compatibility",
+        "surface",
+        "execution",
+        "platform"
+      ],
+      "aria": {
+        "label": "Tool registry page",
+        "description": "Define tools, their platform compatibility, surfaces, and execution."
+      },
+      "aiContext": "The Tool Registry describes scripts as documents (script, compatibility by capability/platform, surfaces, execution mode/target). Tools are filtered to the active platform."
     },
     {
       "id": "settings",

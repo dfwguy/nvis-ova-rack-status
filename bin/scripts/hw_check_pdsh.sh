@@ -3,6 +3,11 @@
 # Remote runs with RACK_WEB_HW_CHECK=1 so checker.sh never calls scontrol drain/undrain.
 set -uo pipefail
 
+# Force ssh transport for pdsh/pdcp: this cluster's pdsh defaults to rsh, which is
+# refused on compute nodes ("connect: Connection refused"). Matches sysinfo.sh.
+export PDSH_SSH_ARGS_APPEND="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=quiet -o CheckHostIP=no"
+export PDSH_RCMD_TYPE=ssh
+
 PDSH_W="${1:-}"
 shift || true
 if [[ "${1:-}" == "--" ]]; then shift; fi
@@ -28,15 +33,26 @@ fi
 
 TMP="/tmp/rack_web_checker.$$.$RANDOM.sh"
 cleanup() {
-  pdsh -w "${PDSH_W}" -f 64 "rm -f ${TMP}" >/dev/null 2>&1 || true
+  pdsh -R ssh -w "${PDSH_W}" -f 64 "rm -f ${TMP}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
-pdcp -w "${PDSH_W}" -f 64 "${LOCAL}" "${TMP}" || exit 5
+pdcp -R ssh -w "${PDSH_W}" -f 64 "${LOCAL}" "${TMP}" || exit 5
 
 args_q=()
 for a in "$@"; do args_q+=("$(printf '%q' "$a")"); done
 qargs="${args_q[*]}"
 
-pdsh -w "${PDSH_W}" -f 64 "RACK_WEB_HW_CHECK=1 bash ${TMP} ${qargs}"
+# checker.sh hard-requires root. This script's header always claimed it ran "as root", but the
+# pdsh line never elevated — it only worked if the pdsh identity was already root, i.e. when the
+# privileged profile (RACK_SCRIPT_SSH_USER=root) was configured. On NscaleTX it is not, and
+# cmods has NO sudo on the head node — so every node returned "ERROR: Please run as root".
+# cmods DOES have NOPASSWD sudo on the compute trays (verified), so elevate there instead.
+#
+# `sudo -n env VAR=…` is deliberate: sudo strips the environment, and RACK_WEB_HW_CHECK=1 is what
+# stops checker.sh calling `scontrol drain`. Passing it as `sudo -n VAR=… bash` would silently drop
+# it and a hardware check could DRAIN THE RACK. Do not "simplify" this.
+_remote="RACK_WEB_HW_CHECK=1 bash ${TMP} ${qargs}"
+pdsh -R ssh -w "${PDSH_W}" -f 64 \
+  "if [ \"\$(id -u)\" -ne 0 ] && sudo -n true 2>/dev/null; then sudo -n env ${_remote}; else ${_remote}; fi"
 exit $?

@@ -27,7 +27,8 @@ import MuiButton from "@mui/material/Button";
 import Snackbar from "@mui/material/Snackbar";
 import Alert from "@mui/material/Alert";
 import CircularProgress from "@mui/material/CircularProgress";
-import { Tag, Text, Flex, Combobox, Button } from "@nvidia/foundations-react-core";
+import { Tag, Text, Flex, Button } from "@nvidia/foundations-react-core";
+import { MultiSelectCombobox } from "./MultiSelectCombobox";
 import Tooltip from "@mui/material/Tooltip";
 import {
   CircleCheck,
@@ -52,6 +53,7 @@ import {
 import { useRackCommandsStore } from "../context/RackCommandsStoreContext";
 import { RackTableCommandIndicator } from "./RackTableCommandIndicator";
 import { ParserResultsDialog } from "./ParserResultsDialog";
+import { GrafanaLinksMenu } from "./GrafanaLinksMenu";
 import { TailLogDialog } from "./TailLogDialog";
 import { HwCheckRunDialog } from "./rack/HwCheckRunDialog";
 import {
@@ -61,6 +63,14 @@ import {
   type TailLogStreamBody,
 } from "../lib/rackLog";
 import { validationStatusTooltip } from "../lib/validationStatusTooltip";
+import {
+  VALIDATION_CATEGORIES,
+  VALIDATION_STAGES,
+  nemoCategory,
+  stageStates,
+  stageStateColor,
+  stageStateLabel,
+} from "../lib/validationStages";
 import type { RackRow } from "../types/api";
 import type { NvisNamingSchema } from "../types/naming";
 import {
@@ -92,7 +102,7 @@ type SortDir = "asc" | "desc";
 type ActionKind = "drain" | "undrain" | "cancel" | "power_up";
 type MenuKind = "sinfo" | "job" | "device" | "comment";
 
-const VALIDATION_OPTIONS = ["done", "fail", "ongoing", "pending"];
+const VALIDATION_OPTIONS: string[] = VALIDATION_CATEGORIES;
 const SINFO_OPTIONS = ["idle", "alloc", "mix", "drain", "down", "comp"];
 
 const ACTION_LABELS: Record<ActionKind, { title: string; description: (rack: string, jobId?: string) => string; confirm: string }> = {
@@ -123,13 +133,6 @@ function nemoSortKey(nemo: string): number {
   if (nemo.startsWith("ongoing")) return 1;
   if (nemo === "pending") return 2;
   return 3;
-}
-
-function nemoCategory(nemo: string): string {
-  if (nemo === "done") return "done";
-  if (nemo === "fail") return "fail";
-  if (nemo.startsWith("ongoing")) return "ongoing";
-  return "pending";
 }
 
 function extractSinfoStates(sinfo: string): string[] {
@@ -180,26 +183,57 @@ function sinfoIcon(state: string) {
   }
 }
 
+/** Compact colored badges for each per-rack validation stage (NCCL, NeMo). */
+function StageBadges({ row }: { row: RackRow }) {
+  const states = stageStates(row);
+  return (
+    <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
+      {VALIDATION_STAGES.map((stage) => {
+        const state = states[stage.key];
+        return (
+          <Tooltip
+            key={stage.key}
+            title={`${stage.label} — ${stage.tool}: ${stageStateLabel(state)}`}
+            enterDelay={350}
+            arrow
+          >
+            <span style={{ display: "inline-flex", cursor: "default" }}>
+              <Tag color={stageStateColor(state)} kind="outline" readOnly density="compact">
+                {stage.short} {stage.tool}
+              </Tag>
+            </span>
+          </Tooltip>
+        );
+      })}
+    </Box>
+  );
+}
+
 function ValidationTag({ row }: { row: RackRow }) {
   const nemo = row.nemo;
   const color = validationTagColor(nemoCategory(nemo));
   const tip = validationStatusTooltip(row);
-  const tag = (
+  const overall = (
     <Tag color={color} kind="solid" readOnly density="compact">
       {nemo}
     </Tag>
   );
-  if (!tip) {
-    return tag;
-  }
-  return (
+  const overallWithTip = !tip ? (
+    overall
+  ) : (
     <Tooltip
       title={<span style={{ display: "block", maxWidth: 420, whiteSpace: "pre-wrap" }}>{tip}</span>}
       enterDelay={350}
       arrow
     >
-      <span style={{ display: "inline-flex", cursor: "default" }}>{tag}</span>
+      <span style={{ display: "inline-flex", cursor: "default" }}>{overall}</span>
     </Tooltip>
+  );
+  return (
+    <Box sx={{ display: "flex", flexDirection: "column", gap: 0.5, alignItems: "flex-start" }}>
+      {overallWithTip}
+      <StageBadges row={row} />
+    </Box>
   );
 }
 
@@ -405,6 +439,13 @@ export function RackTable({
 
   const [tailStream, setTailStream] = useState<{ title: string; body: TailLogStreamBody } | null>(null);
 
+  // Declared above its first consumer (openLogForRow, just below). When it sat further down,
+  // the React Compiler refused to compile this component at all -- which silently disabled
+  // the memoisation on the six useMemo/useCallback blocks in this file.
+  const [snackbar, setSnackbar] = useState<{ open: boolean; message: string; severity: "success" | "error" }>({
+    open: false, message: "", severity: "success",
+  });
+
   const openLogForRow = useCallback(
     async (row: RackRow) => {
       const job = row.last_job.trim() && row.last_job !== "-" ? row.last_job : undefined;
@@ -441,9 +482,6 @@ export function RackTable({
   // Confirmation + feedback
   const [confirmAction, setConfirmAction] = useState<{ kind: ActionKind; rack: string; jobId?: string } | null>(null);
   const [actionLoading, setActionLoading] = useState(false);
-  const [snackbar, setSnackbar] = useState<{ open: boolean; message: string; severity: "success" | "error" }>({
-    open: false, message: "", severity: "success",
-  });
 
   const store = useRackCommandsStore();
   const [selectMode, setSelectMode] = useState(false);
@@ -522,7 +560,7 @@ export function RackTable({
         setRunMenuAnchor(null);
         return;
       }
-      if (["nemo", "llama", "stress", "nvloom", "clusterkit"].includes(key) && !logDir?.trim()) {
+      if (["nemo", "llama", "stress", "nvloom", "clusterkit", "llmb"].includes(key) && !logDir?.trim()) {
         setSnackbar({
           open: true,
           message: "Set log directory (toolbar / settings) before launching validation or Llama jobs.",
@@ -589,6 +627,18 @@ export function RackTable({
               "validation",
               "/api/run-clusterkit-async",
               (jid) => `/api/run-clusterkit-status?job_id=${encodeURIComponent(jid)}`,
+              validationFamilyBody(rack, ld, nodesFullRack(rack), naming),
+            ),
+          );
+          break;
+        case "llmb":
+          fireBulkParallel("NCCL Microbenchmark (LLMB)", (rack) =>
+            void store.runAsyncValidationFamily(
+              rack,
+              "NCCL Microbenchmark (LLMB)",
+              "validation",
+              "/api/run-llmb-nccl-async",
+              (jid) => `/api/run-llmb-nccl-status?job_id=${encodeURIComponent(jid)}`,
               validationFamilyBody(rack, ld, nodesFullRack(rack), naming),
             ),
           );
@@ -923,11 +973,10 @@ export function RackTable({
             <Text kind="body/regular/sm" style={{ color: "var(--text-color-secondary)", marginBottom: 4, display: "block" }}>
               Validation
             </Text>
-            <Combobox
+            <MultiSelectCombobox
               items={VALIDATION_OPTIONS}
-              multiple
               value={validationFilters}
-              onValueChange={(v: string[]) => { setValidationFilters(v); setPage(0); }}
+              onValueChange={(v) => { setValidationFilters(v); setPage(0); }}
               size="small"
               disabled={selectMode}
               aria-label="Filter by validation status"
@@ -938,11 +987,10 @@ export function RackTable({
             <Text kind="body/regular/sm" style={{ color: "var(--text-color-secondary)", marginBottom: 4, display: "block" }}>
               Sinfo
             </Text>
-            <Combobox
+            <MultiSelectCombobox
               items={SINFO_OPTIONS}
-              multiple
               value={sinfoFilters}
-              onValueChange={(v: string[]) => { setSinfoFilters(v); setPage(0); }}
+              onValueChange={(v) => { setSinfoFilters(v); setPage(0); }}
               size="small"
               disabled={selectMode}
               aria-label="Filter by sinfo state"
@@ -953,14 +1001,13 @@ export function RackTable({
             <Text kind="body/regular/sm" style={{ color: "var(--text-color-secondary)", marginBottom: 4, display: "block" }}>
               Nodes status
             </Text>
-            <Combobox
+            <MultiSelectCombobox
               items={[
                 { value: "has_down", children: "Has down nodes" },
                 { value: "all_up", children: "All nodes up" },
               ]}
-              multiple
               value={deviceFilters}
-              onValueChange={(v: string[]) => { setDeviceFilters(v); setPage(0); }}
+              onValueChange={(v) => { setDeviceFilters(v); setPage(0); }}
               size="small"
               disabled={selectMode}
               aria-label="Filter by nodes status"
@@ -1014,6 +1061,9 @@ export function RackTable({
                 </MenuItem>
                 <MenuItem onClick={() => handleBulkRun("clusterkit")}>
                   <ListItemText primary="Run ClusterKit" secondary="Async · log_dir/clusterkit/" />
+                </MenuItem>
+                <MenuItem onClick={() => handleBulkRun("llmb")}>
+                  <ListItemText primary="Run NCCL Microbenchmark (LLMB)" secondary="Async · llmb-run microbenchmark_nccl" />
                 </MenuItem>
                 <MenuItem onClick={() => handleBulkRun("power_on")}>
                   <ListItemText primary="Power on" secondary="Async" />
@@ -1232,6 +1282,7 @@ export function RackTable({
                           <LineChart size={18} />
                         </IconButton>
                       </Tooltip>
+                      <GrafanaLinksMenu rack={row.rack} disabled={selectMode} />
                     </Box>
                   </TableCell>
                 </TableRow>

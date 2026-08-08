@@ -8,7 +8,22 @@
 
 set -uo pipefail
 
+# Force ssh transport: this cluster's pdsh defaults to rsh (refused on compute nodes).
+export PDSH_SSH_ARGS_APPEND="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=quiet -o CheckHostIP=no"
+export PDSH_RCMD_TYPE=ssh
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# Which NeMo batch script to submit. Default = the Stage-2 soak / Stage-3 LLM engine
+# (nemo-nemotron5h_56b-mbridge-fp8.sh, now parametrized by NVIS_NEMO_DTYPE/MAX_STEPS/GBS/MODEL_SIZE).
+# Override with NVIS_NEMO_BATCH_SCRIPT to point at a different launcher.
+NVIS_NEMO_BATCH_SCRIPT="${NVIS_NEMO_BATCH_SCRIPT:-nemo-nemotron5h_56b-mbridge-fp8.sh}"
+
+# Make the Slurm CLI (scontrol/sbatch) usable in non-login SSH shells: the dashboard
+# launches this over `ssh host '<cmd>'` where Environment Modules aren't initialized,
+# so scontrol/sbatch would be "command not found". Idempotent; also on the head.
+# shellcheck disable=SC1091
+[[ -f "${SCRIPT_DIR}/slurm-init.inc.sh" ]] && source "${SCRIPT_DIR}/slurm-init.inc.sh"
 
 # Filename tag: same specs as passed in (comma-separated if multiple argv).
 spec_tag=""
@@ -17,31 +32,177 @@ for _a in "$@"; do
   spec_tag+="$_a"
 done
 
-a=( $(nodeset --expand "$@") )
-if ((${#a[@]} == 0)); then
-  echo "run-nemo-xrack: nodeset --expand produced no nodes for: $*" >&2
-  exit 1
-fi
-
 echo "Hosts: ${spec_tag}"
 
-hosts=""
-for r in "${a[@]}"; do
-  hosts="${hosts} $(scontrol show hostname "$r")"
+# Resolve targets to a REAL Slurm nodelist. The dashboard passes CT-validation specs
+# like "bos01-b05-ct[01-18],bos01-b06-ct[01-18]"; on GB200 sites those are NOT Slurm
+# hostnames (e.g. real = bos01-b05-11-s1-dgx-05-c01), so derive each spec's rack id and
+# map it to real nodes via lib/nodes.inc.sh (RACK_TO_NODE_SED / RACK_NODE_MATCH_SUFFIX),
+# the same mapping the NCCL launcher uses. Falls back to a direct hostlist expansion
+# when the mapping yields nothing (sites where the passed names are already real Slurm
+# nodes). Avoids clustershell `nodeset`, which is frequently absent on BCM head nodes.
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/nodes.inc.sh"
+
+# Split the comma-joined specs on commas that are OUTSIDE [...]. A plain IFS=',' split tears a
+# bracketed range apart wherever the range itself contains a comma: this site's tray range is
+# 11-18,28-37, so "ink50-dh01-h02-[11-18,28-37]" became the two fragments
+# "ink50-dh01-h02-[11-18" and "28-37]". Neither is a rack id, so nvis_nodes_resolve found nothing
+# and we fell through to the per-spec fallback — which works here only because the CT template
+# happens to equal the real hostname, and would produce wrong names on a site where it does not
+# (Boston: real = bos01-b05-11-s1-dgx-05-c01). Bright ranges like [01-18] have no inner comma,
+# which is why this stayed hidden.
+_specs=()
+_buf=""
+_depth=0
+for ((_i = 0; _i < ${#spec_tag}; _i++)); do
+  _c="${spec_tag:_i:1}"
+  case "$_c" in
+    '[') _depth=$((_depth + 1)); _buf+="$_c" ;;
+    ']') _depth=$((_depth > 0 ? _depth - 1 : 0)); _buf+="$_c" ;;
+    ',')
+      if ((_depth > 0)); then _buf+="$_c"; else
+        [[ -n "$_buf" ]] && _specs+=("$_buf")
+        _buf=""
+      fi
+      ;;
+    *) _buf+="$_c" ;;
+  esac
 done
-hosts=( $hosts )
+[[ -n "$_buf" ]] && _specs+=("$_buf")
+
+racks=()
+for _s in "${_specs[@]}"; do
+  # Strip the tray part to leave the rack id. The joiner is site-specific (NVIS_CT_ID): Bright
+  # is <rack>-ct[…] but Nscale TX is <rack>-[…], so matching a literal "-ct" left the whole
+  # spec as the "rack id", nvis_nodes_resolve found nothing, and we silently fell through to the
+  # per-spec fallback below — which bypasses this site's rack->node mapping entirely and only
+  # happens to work where the CT template already equals the real hostname.
+  #
+  # Drop a trailing [ranges] group with an optional "ct" joiner, plus the legacy single-tray
+  # -ct<N> form. Deliberately NOT a bare trailing -<N>: that would turn a real hostname
+  # (ink50-dh01-h02-11) into a truncated prefix instead of leaving it for the fallback.
+  racks+=( "$(printf '%s' "${_s}" | sed -E 's/-(ct)?\[[^]]*\]$//; s/-ct[0-9]+$//')" )
+done
+
+hosts=()
+if nvis_nodes_resolve "${racks[@]}" 2>/dev/null && [[ -n "${NVIS_NODELIST:-}" ]]; then
+  mapfile -t hosts < <(scontrol show hostname "${NVIS_NODELIST}" 2>/dev/null)
+fi
+if ((${#hosts[@]} == 0)); then
+  # Fallback: expand the passed spec directly (sites where these ARE real Slurm nodes).
+  mapfile -t hosts < <(scontrol show hostname "${spec_tag}" 2>/dev/null)
+fi
+if ((${#hosts[@]} == 0)); then
+  echo "run-nemo-xrack: could not resolve any Slurm nodes for: ${spec_tag}" >&2
+  echo "run-nemo-xrack: set RACK_TO_NODE_SED / RACK_NODE_MATCH_SUFFIX for this site, or pass a real nodelist." >&2
+  exit 1
+fi
+echo "run-nemo-xrack: resolved ${#hosts[@]} nodes: ${hosts[0]} ... ${hosts[-1]}"
 
 n=$(( ${#hosts[*]} / 2 * 2 ))
 
+# Force the batch script's multi-rack (IB) path when this allocation spans >1 rack, even if it is
+# <=18 nodes. The batch script otherwise infers single-rack from node count and would disable IB +
+# force MNNVL (fatal across a rack boundary). Explicit NVIS_NEMO_XRACK from the caller wins.
+#
+# Group hosts by rack via NVIS_RACK_ID (nvis_nodes_rack_of). This used to hardcode
+# 'bos01-[a-z][0-9]+', which matches nothing outside Boston: elsewhere every hostname
+# stayed distinct, so an 18-node SINGLE-rack run counted 18 "racks" and was pushed
+# onto the cross-rack IB path. Without the template, fall back to the number of rack
+# specs the caller passed (the dashboard always passes one spec per rack).
+_nracks=$(for _h in "${hosts[@]}"; do nvis_nodes_rack_of "${_h}"; echo; done 2>/dev/null | sort -u | grep -c .)
+if (( _nracks == 0 )); then
+  _nracks=$(printf '%s\n' "${racks[@]}" | sort -u | grep -c .)
+fi
+if [[ -z "${NVIS_NEMO_XRACK:-}" ]]; then
+  if (( _nracks > 1 )); then NVIS_NEMO_XRACK=1; else NVIS_NEMO_XRACK=0; fi
+fi
+export NVIS_NEMO_XRACK
+echo "run-nemo-xrack: ${_nracks} distinct rack(s) -> NVIS_NEMO_XRACK=${NVIS_NEMO_XRACK}"
+
+# Prefer the NCCL 2.30.7 image (libnccl + nccl-tests baked at 2.30.7) when present. This overrides
+# the caller's NEMO_SQSH_SRC (incl. the app/UI default of the stock image) so every launch uses the
+# matched-NCCL image without needing per-launch env. Set NVIS_NEMO_USE_VETTED=0 to force the caller's
+# NEMO_SQSH_SRC (e.g. to compare vs stock).
+#
+# WHY 2.30.7 (not the older 2.28.9 vetted image): cross-rack (multi-domain NVL72) alltoall REQUIRES
+# NCCL >= 2.30 — 2.28.9 fails the bootstrap regardless of env vars (validated 2026-07-07: same
+# NCCL_NET_PLUGIN=none, 2.30.7 PASSES job 203 vs 2.28.9 FAILS job 210). 2.30.7 then needs
+# NCCL_IGNORE_COLLNET_MISMATCH=1 (set below + in the batch script) to tolerate the stale HPC-X SHARP
+# plugin's asymmetric CollNet device count while KEEPING SHARP (job 208 all-pass). See
+# VALIDATION_TRACKER "Cross-rack alltoall". Override the path with NVIS_NEMO_VETTED_SQSH.
+_vetted="${NVIS_NEMO_VETTED_SQSH:-/home/cmods/workspace/images/nemo-nccl2.30.7.sqsh}"
+if [[ "${NVIS_NEMO_USE_VETTED:-1}" == "1" && -f "${_vetted}" ]]; then
+  echo "run-nemo-xrack: using NCCL 2.30.7 image ${_vetted} (matched NCCL baked in; LD_PRELOAD off; IGNORE_COLLNET_MISMATCH keeps HPC-X/SHARP)"
+  NEMO_SQSH_SRC="${_vetted}"
+  export NVIS_NCCL_PRELOAD_DISABLE="${NVIS_NCCL_PRELOAD_DISABLE:-1}"
+fi
+# Cross-rack alltoall fix (keeps SHARP). The batch script defaults this to 1 too, but set it here so
+# the launcher is self-documenting and forwards it explicitly. Override with NVIS_NCCL_IGNORE_COLLNET_MISMATCH.
+export NVIS_NCCL_IGNORE_COLLNET_MISMATCH="${NVIS_NCCL_IGNORE_COLLNET_MISMATCH:-1}"
 : "${NEMO_SQSH_SRC:?set NEMO_SQSH_SRC to the head-node path of the nemo .sqsh image to copy under /raid/data/ on compute nodes}"
 _sqsh_b=$(basename "$NEMO_SQSH_SRC")
-pdsh -w "$(echo "${hosts[*]}" | tr ' ' ',')" "mkdir -p /raid/data; rsync -ah --progress $NEMO_SQSH_SRC /raid/data/$_sqsh_b"
+_hostcsv="$(echo "${hosts[*]}" | tr ' ' ',')"
+# Stage the image to each node's LOCAL /raid/data (fast NVMe; avoids saturating NFS with a
+# 36-node container-start read). /raid/data is root-owned on the compute trays, so use
+# passwordless sudo (NOPASSWD is propagated on the b0x trays). Then VERIFY every node has the
+# full image before submitting — otherwise pyxis dies with "No such file" mid-job.
+_src_size=$(stat -c%s "$NEMO_SQSH_SRC" 2>/dev/null || echo 0)
+echo "run-nemo-xrack: staging ${_sqsh_b} (${_src_size} bytes) to /raid/data on ${#hosts[@]} nodes (sudo rsync)…"
+pdsh -R ssh -w "$_hostcsv" "sudo -n mkdir -p /raid/data && sudo -n rsync -ah '${NEMO_SQSH_SRC}' /raid/data/'${_sqsh_b}'" 2>&1 | dshbak -c 2>/dev/null || true
+# Verify by counting nodes that POSITIVELY confirm the full size, and require all of them.
+#
+# This used to count nodes that answered with a WRONG size ("echo BAD") and pass when that count
+# was zero, with pdsh's stderr sent to /dev/null. A node that could not be reached at all never
+# ran the remote command, so it printed no BAD and was silently counted as staged: a run where
+# ssh failed 255 on all 36 nodes still reported "staged OK on all 36 nodes" and went on to
+# submit. Requiring one OK per node inverts that — unreachable, sudo-denied, out of disk or
+# short file all fail the same way, because none of them produce an OK.
+_verify_out=$(pdsh -R ssh -w "$_hostcsv" \
+  "s=\$(stat -c%s /raid/data/'${_sqsh_b}' 2>/dev/null || echo 0); [ \"\$s\" = '${_src_size}' ] && echo STAGED_OK" 2>&1)
+_ok=$(printf '%s\n' "${_verify_out}" | grep -c 'STAGED_OK' || true)
+if [ "${_ok:-0}" -ne "${#hosts[@]}" ]; then
+  echo "run-nemo-xrack: ERROR: image verified on only ${_ok}/${#hosts[@]} nodes in /raid/data." >&2
+  echo "run-nemo-xrack: check ssh reachability, passwordless sudo (sudo -n) and /raid free space." >&2
+  echo "run-nemo-xrack: first failures reported by pdsh:" >&2
+  printf '%s\n' "${_verify_out}" | grep -v 'STAGED_OK' | head -10 | sed 's/^/  /' >&2
+  echo "run-nemo-xrack: aborting before submit." >&2
+  exit 1
+fi
+echo "run-nemo-xrack: staged OK on all ${#hosts[@]} nodes (verified ${_ok}/${#hosts[@]})"
+# Tell the batch script which staged image to run (it defaults to the stock name otherwise, so
+# NEMO_SQSH_SRC=<vetted image> would be staged but not actually used).
+export NVIS_NEMO_CONT="/raid/data/${_sqsh_b}"
 
-_out_stem="root-NEMO-${spec_tag}-${n}N"
+# Log filename uses just the racks included in the test. The arg may be a full curated nodelist
+# (real hostnames) rather than rack-ct specs; using it verbatim would blow past the 255-byte
+# filename limit for --output and make sbatch fail before writing any log (job dies ~2s,
+# ExitCode 0:53). Derive the distinct rack ids from the resolved hosts instead.
+#
+# Via nvis_nodes_rack_of (NVIS_RACK_ID), the same way the rack count above does. This was the
+# second place hardcoding 'bos01-[a-z][0-9]+'; only the count was converted. Outside Boston the
+# sed matched nothing, so every hostname stayed distinct and _racktag became all N hostnames
+# joined by '+' — roughly 700 characters for 36 nodes, which is exactly the >255-byte --output
+# name this comment warns about.
+_racktag=$(for _h in "${hosts[@]}"; do nvis_nodes_rack_of "${_h}"; echo; done 2>/dev/null \
+  | sort -u | grep -v '^$' | paste -sd+ | tr -d ' ')
+# No template match: fall back to the rack specs the caller passed (the dashboard passes one per
+# rack), never to the raw hostname list.
+if [[ -z "${_racktag}" ]]; then
+  _racktag=$(printf '%s\n' "${racks[@]}" | sort -u | paste -sd+ | tr -d ' ')
+fi
+[[ -n "${_racktag}" ]] || _racktag="${spec_tag}"
+_out_stem="root-NEMO-${_racktag}-${n}N"
 
+# Export the real scripts dir to the job so the batch script can find lib/fabric.inc.sh
+# (Slurm spools only the batch script, not lib/). Without it the fabric classifier no-ops
+# and NCCL falls back to a naive mlx5_0..3 set that mixes IB + RoCE and fails.
+export NVIS_SCRIPTS_DIR="${SCRIPT_DIR}"
 sbatch -N "${n}" \
   -w "$(echo "${hosts[*]}" | tr ' ' ',')" \
-  -t 03:00:00 \
+  -t "${NVIS_NEMO_WALLTIME:-03:00:00}" \
   --job-name="NEMO-${n}N" \
+  --export="ALL,NVIS_SCRIPTS_DIR=${SCRIPT_DIR},NVIS_NEMO_CONT=${NVIS_NEMO_CONT},NVIS_NEMO_XRACK=${NVIS_NEMO_XRACK},NVIS_NCCL_PRELOAD_DISABLE=${NVIS_NCCL_PRELOAD_DISABLE:-0},NVIS_NCCL_IGNORE_COLLNET_MISMATCH=${NVIS_NCCL_IGNORE_COLLNET_MISMATCH:-1},NVIS_NCCL_DEBUG=${NVIS_NCCL_DEBUG:-},NVIS_NEMO_MAX_STEPS=${NVIS_NEMO_MAX_STEPS:-},NVIS_NEMO_DTYPE=${NVIS_NEMO_DTYPE:-},NVIS_NEMO_MODEL_SIZE=${NVIS_NEMO_MODEL_SIZE:-},NVIS_NEMO_GBS=${NVIS_NEMO_GBS:-},NVIS_NEMO_UB_SKIPMC=${NVIS_NEMO_UB_SKIPMC:-},NVIS_NEMO_NVLS_ENABLE=${NVIS_NEMO_NVLS_ENABLE:-},NVIS_NEMO_RECIPE_DEFAULT=${NVIS_NEMO_RECIPE_DEFAULT:-},NVIS_NCCL_PRELOAD_SRC=${NVIS_NCCL_PRELOAD_SRC:-},NVIS_NCCL_NET_PLUGIN=${NVIS_NCCL_NET_PLUGIN:-},NVIS_NEMO_CLI=${NVIS_NEMO_CLI:-},NVIS_NEMO_GPU=${NVIS_NEMO_GPU:-},NVIS_NEMO_FORCE_BF16_ALIAS=${NVIS_NEMO_FORCE_BF16_ALIAS:-},NVIS_NEMO_RECIPE_NAME=${NVIS_NEMO_RECIPE_NAME:-},NVIS_NEMO_HF_HOME=${NVIS_NEMO_HF_HOME:-},NVIS_HF_HOME_CONT=${NVIS_HF_HOME_CONT:-}" \
   --output="${_out_stem}-%j.txt" \
-  "$SCRIPT_DIR/nemo-nemotron5h_56b-mbridge-fp8.sh"
+  "$SCRIPT_DIR/${NVIS_NEMO_BATCH_SCRIPT}"

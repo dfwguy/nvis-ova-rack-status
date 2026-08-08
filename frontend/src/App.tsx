@@ -1,37 +1,50 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useRef, lazy, Suspense } from "react";
 import { HashRouter, Routes, Route, Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
 import Box from "@mui/material/Box";
 import { Text } from "@nvidia/foundations-react-core";
-import { ThemeProvider, useThemeMode } from "./context/ThemeContext";
-import { AuthProvider, useAuth } from "./context/AuthContext";
-import { AIChatProvider, useAIChat } from "./context/AIChatContext";
+import { useThemeMode } from "./context/ThemeContext";
+import { ThemeProvider } from "./context/ThemeProvider";
+import { useAuth } from "./context/AuthContext";
+import { AuthProvider } from "./context/AuthProvider";
+import { useAIChat } from "./context/AIChatContext";
+import { AIChatProvider } from "./context/AIChatProvider";
 import { AppLayout } from "./components/AppLayout";
 import { Sidebar, type ViewId } from "./components/Sidebar";
 import { Toolbar } from "./components/Toolbar";
 import { AppBreadcrumbs } from "./components/AppBreadcrumbs";
+import { ConnectionBanner } from "./components/ConnectionBanner";
 import AIChatWidget from "./components/ai/AIChatWidget";
 import { ClusterDashboardView } from "./views/ClusterDashboardView";
 import { SingleRackView } from "./views/SingleRackView";
 import { useClusterOverview } from "./hooks/useClusterOverview";
+import { useClusterOverviewLive } from "./hooks/useClusterOverviewLive";
 import { RackDetailView } from "./views/RackDetailView";
-import { MultirackView } from "./views/MultirackView";
-import { SlurmView } from "./views/SlurmView";
-import { ReportsView } from "./views/ReportsView";
-import { AnalyticsView } from "./views/AnalyticsView";
-import { ToolsView } from "./views/ToolsView";
-import { WorkflowsView } from "./views/WorkflowsView";
-import { MetricsView } from "./views/MetricsView";
-import { LogsView } from "./views/LogsView";
-import { EventsView } from "./views/EventsView";
-import { InfrastructureView } from "./views/InfrastructureView";
-import { TerminalPlaceholderView } from "./views/TerminalPlaceholderView";
-import { SettingsView } from "./views/SettingsView";
+// Lazy-loaded routes: keep the initial (index) bundle small by code-splitting each view. Heavy
+// deps move into their own on-demand chunks (reactflow -> Workflows, chart.js -> Analytics/Metrics,
+// the large ToolsView -> Tools). ClusterDashboard + SingleRack stay eager for fast first paint.
+const NodesView = lazy(() => import("./views/NodesView").then((m) => ({ default: m.NodesView })));
+const MultirackView = lazy(() => import("./views/MultirackView").then((m) => ({ default: m.MultirackView })));
+const SlurmView = lazy(() => import("./views/SlurmView").then((m) => ({ default: m.SlurmView })));
+const ReportsView = lazy(() => import("./views/ReportsView").then((m) => ({ default: m.ReportsView })));
+const AnalyticsView = lazy(() => import("./views/AnalyticsView").then((m) => ({ default: m.AnalyticsView })));
+const ToolsView = lazy(() => import("./views/ToolsView").then((m) => ({ default: m.ToolsView })));
+const WorkflowsView = lazy(() => import("./views/WorkflowsView").then((m) => ({ default: m.WorkflowsView })));
+const MetricsView = lazy(() => import("./views/MetricsView").then((m) => ({ default: m.MetricsView })));
+const LogsView = lazy(() => import("./views/LogsView").then((m) => ({ default: m.LogsView })));
+const EventsView = lazy(() => import("./views/EventsView").then((m) => ({ default: m.EventsView })));
+const InfrastructureView = lazy(() => import("./views/InfrastructureView").then((m) => ({ default: m.InfrastructureView })));
+const TerminalPlaceholderView = lazy(() => import("./views/TerminalPlaceholderView").then((m) => ({ default: m.TerminalPlaceholderView })));
+const SettingsView = lazy(() => import("./views/SettingsView").then((m) => ({ default: m.SettingsView })));
+const ProjectsView = lazy(() => import("./views/ProjectsView").then((m) => ({ default: m.ProjectsView })));
+const PlatformCatalogView = lazy(() => import("./views/PlatformCatalogView").then((m) => ({ default: m.PlatformCatalogView })));
+const ToolRegistryView = lazy(() => import("./views/ToolRegistryView").then((m) => ({ default: m.ToolRegistryView })));
+import { ActiveClusterProvider } from "./context/ActiveClusterProvider";
 import { LoginPage } from "./pages/LoginPage";
-import TerminalView from "./views/TerminalView";
+const TerminalView = lazy(() => import("./views/TerminalView"));
 import { useRackStatus } from "./hooks/useRackStatus";
 import type { RackStatusResponse } from "./types/api";
-import { RackCommandsStoreProvider } from "./context/RackCommandsStoreContext";
-import { RackLocksProvider } from "./context/RackLocksContext";
+import { RackCommandsStoreProvider } from "./context/RackCommandsStoreProvider";
+import { RackLocksProvider } from "./context/RackLocksProvider";
 import { HelpPanelProvider } from "./context/HelpPanelProvider";
 import HelpPanel from "./components/help/HelpPanel";
 import { DEFAULT_PATH, RACKS_PATH, rackDetailPath, pathToRoute, rackIdFromPath, viewIdToPath } from "./routes";
@@ -41,6 +54,7 @@ const SIDEBAR_STORAGE_KEY = "nvis-sidebar-open";
 
 const VIEW_TITLES: Record<ViewId, string> = {
   dashboard: "Cluster overview",
+  nodes: "Nodes",
   singleRack: "Racks",
   slurm: "Scheduler",
   infraEthernet: "Ethernet",
@@ -55,6 +69,9 @@ const VIEW_TITLES: Record<ViewId, string> = {
   tools: "Operations & Scripts",
   workflows: "Workflows",
   terminal: "Terminal",
+  projects: "Projects & Clusters",
+  platformCatalog: "Platform Catalog",
+  toolRegistry: "Tool Registry",
   settings: "Settings",
 };
 
@@ -72,6 +89,16 @@ function getInitialSidebarState(): boolean {
  * from the shared rack-status data (kept in `AppContent` so it persists across
  * navigation). Keeps `RackDetailView`'s existing prop contract.
  */
+function ViewSuspenseFallback() {
+  return (
+    <Box sx={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: "40vh" }}>
+      <Text kind="body/regular/md" style={{ color: "var(--text-color-secondary)" }}>
+        Loading…
+      </Text>
+    </Box>
+  );
+}
+
 function RackDetailRoute({
   data,
   onBack,
@@ -111,17 +138,57 @@ function AppContent() {
   const activeView: ViewId = pathToRoute(location.pathname)?.viewId ?? "dashboard";
   const selectedRack = rackIdFromPath(location.pathname);
 
-  const { data, loading, error, refresh, activeUsers } = useRackStatus(logDir);
+  const {
+    data,
+    loading,
+    error,
+    reachable: statusReachable,
+    unreachableDetail: statusUnreachableDetail,
+    backendConnected,
+    lastUpdated: statusLastUpdated,
+    refresh,
+    retry: retryStatus,
+    activeUsers,
+  } = useRackStatus(logDir);
   const {
     data: clusterOverview,
     loading: clusterLoading,
+    refreshing: clusterRefreshing,
     error: clusterError,
+    lastUpdated: clusterLastUpdated,
     refresh: refreshCluster,
+    retry: retryCluster,
   } = useClusterOverview(logDir);
+  const {
+    data: clusterLive,
+    loading: clusterLiveLoading,
+    error: clusterLiveError,
+    retry: retryClusterLive,
+  } = useClusterOverviewLive(logDir);
 
   const refreshAll = useCallback(async () => {
-    await Promise.all([refresh(), refreshCluster()]);
-  }, [refresh, refreshCluster]);
+    await Promise.all([refresh(), refreshCluster(), retryClusterLive()]);
+  }, [refresh, refreshCluster, retryClusterLive]);
+
+  const [reconnecting, setReconnecting] = useState(false);
+  const clusterUnreachable =
+    statusReachable === false || clusterOverview?.cluster_reachable === false;
+  const unreachableDetail =
+    statusUnreachableDetail || clusterOverview?.cluster_unreachable_detail || null;
+
+  const handleReconnect = useCallback(async () => {
+    setReconnecting(true);
+    try {
+      await fetch("/api/cluster-health/reconnect", { method: "POST" });
+    } catch {
+      /* ignore; refreshAll below will reflect the new state */
+    }
+    try {
+      await refreshAll();
+    } finally {
+      setReconnecting(false);
+    }
+  }, [refreshAll]);
 
   useEffect(() => {
     if (!data?.log_dir || logDirSeededRef.current) return;
@@ -169,15 +236,17 @@ function AppContent() {
     navigate(RACKS_PATH);
   }, [navigate]);
 
-  const handleCommentChange = useCallback((rack: string, comment: string | null) => {
-    if (!data) return;
-    if (comment) {
-      data.comments[rack] = comment;
-    } else {
-      delete data.comments[rack];
-    }
+  /**
+   * A comment was saved server-side; pull the status feed so the table shows it.
+   *
+   * This used to also write `data.comments[rack]` directly as an optimistic update, which could
+   * never work: `data` is useRackStatus's own state and the hook exposes no setter, so mutating
+   * it in place neither triggered a re-render nor survived the next fetch — it only risked the
+   * table rendering from an object React believed unchanged. The refresh is what updates the UI.
+   */
+  const handleCommentChange = useCallback(() => {
     refresh();
-  }, [data, refresh]);
+  }, [refresh]);
 
   const toolbarTitle = selectedRack ? selectedRack : VIEW_TITLES[activeView];
 
@@ -189,7 +258,6 @@ function AppContent() {
           onToggle={handleSidebarToggle}
           activeView={activeView}
           onNavigate={handleNavigate}
-          projectName={data?.project_name}
         />
       }
       toolbar={
@@ -200,17 +268,32 @@ function AppContent() {
           onRefresh={() => {
             void refreshAll();
           }}
-          loading={loading || clusterLoading}
+          loading={loading || clusterLoading || clusterRefreshing}
           sidebarOpen={sidebarOpen}
           onMenuToggle={handleSidebarToggle}
           activeUsers={activeUsers}
           logDir={logDir}
+          onClusterSwitched={() => {
+            void refreshAll();
+          }}
+          backendConnected={backendConnected}
+          clusterReachable={!clusterUnreachable}
+          execMode={data?.exec_mode ?? clusterOverview?.exec_mode ?? "ssh"}
+          lastUpdated={statusLastUpdated ?? clusterLastUpdated}
+          onReconnect={() => void handleReconnect()}
         />
       }
       breadcrumbs={<AppBreadcrumbs />}
       backendMode={data?.native_workers?.mode}
     >
       <RackCommandsStoreProvider>
+        <ConnectionBanner
+          unreachable={Boolean(clusterUnreachable)}
+          detail={unreachableDetail}
+          reconnecting={reconnecting}
+          onReconnect={() => void handleReconnect()}
+        />
+        <Suspense fallback={<ViewSuspenseFallback />}>
         <Routes>
           <Route path="/" element={<Navigate to={DEFAULT_PATH} replace />} />
           <Route
@@ -219,11 +302,19 @@ function AppContent() {
               <ClusterDashboardView
                 data={clusterOverview}
                 loading={clusterLoading}
+                refreshing={clusterRefreshing}
+                lastUpdated={clusterLastUpdated}
                 error={clusterError}
+                onRetry={retryCluster}
                 onClusterMetadataSaved={refreshCluster}
+                liveData={clusterLive}
+                liveLoading={clusterLiveLoading}
+                liveError={clusterLiveError}
+                onLiveRetry={retryClusterLive}
               />
             }
           />
+          <Route path="/compute/nodes" element={<NodesView data={data} logDir={logDir} />} />
           <Route
             path="/compute/racks"
             element={
@@ -231,6 +322,7 @@ function AppContent() {
                 data={data}
                 loading={loading}
                 error={error}
+                onRetry={retryStatus}
                 onRackSelect={handleRackSelect}
                 onCommentChange={handleCommentChange}
               />
@@ -251,8 +343,11 @@ function AppContent() {
           <Route path="/tools/operations" element={<ToolsView logDir={logDir} />} />
           <Route path="/tools/workflows" element={<WorkflowsView rackData={data} />} />
           <Route path="/tools/terminal" element={<TerminalPlaceholderView />} />
-          <Route path="/analytics/overview" element={<AnalyticsView logDir={logDir} rows={data?.rows ?? []} />} />
+          <Route path="/analytics/overview" element={<AnalyticsView logDir={logDir} rows={data?.rows ?? []} status={data} />} />
           <Route path="/analytics/reports" element={<ReportsView />} />
+          <Route path="/platform/projects" element={<ProjectsView />} />
+          <Route path="/platform/catalog" element={<PlatformCatalogView />} />
+          <Route path="/platform/tools" element={<ToolRegistryView />} />
           <Route
             path="/settings"
             element={
@@ -265,6 +360,7 @@ function AppContent() {
           />
           <Route path="*" element={<Navigate to={DEFAULT_PATH} replace />} />
         </Routes>
+        </Suspense>
       </RackCommandsStoreProvider>
       <AIChatWidget />
       <HelpPanel />
@@ -288,13 +384,15 @@ function AuthGate() {
   }
 
   return (
-    <AIChatProvider>
-      <HelpPanelProvider>
-        <RackLocksProvider>
-          <AppContent />
-        </RackLocksProvider>
-      </HelpPanelProvider>
-    </AIChatProvider>
+    <ActiveClusterProvider>
+      <AIChatProvider>
+        <HelpPanelProvider>
+          <RackLocksProvider>
+            <AppContent />
+          </RackLocksProvider>
+        </HelpPanelProvider>
+      </AIChatProvider>
+    </ActiveClusterProvider>
   );
 }
 

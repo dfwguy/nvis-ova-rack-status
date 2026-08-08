@@ -11,11 +11,24 @@
 
 
 #CONT=/home/cmsupport/workspace/nemo-25.11.01.sqsh
-CONT=/raid/data/nemo-25.11.01.sqsh
+# Container to run. run-nemo-xrack.sh stages NEMO_SQSH_SRC to /raid/data and passes the staged
+# path via NVIS_NEMO_CONT, so pointing NEMO_SQSH_SRC at the vetted image actually switches the
+# container here. Falls back to the stock image for direct/manual runs.
+CONT="${NVIS_NEMO_CONT:-/raid/data/nemo-25.11.01.sqsh}"
 SYSINFO_SH=${SLURM_SUBMIT_DIR}/sysinfo.sh
 
 single_rack=1
 [ $SLURM_NNODES -gt 18 ] && single_rack=0
+# Force multi-rack (IB + auto-MNNVL) path regardless of node count. The heuristic above assumes
+# <=18 nodes == one NVL72 rack, but a SMALL job whose nodes span >1 rack (>1 NVLink/IMEX domain)
+# MUST use IB between racks — the single-rack path sets NCCL_IB_DISABLE=1 and forces
+# NCCL_MNNVL_ENABLE=1, and MNNVL cannot cross a rack boundary ("Cuda failure 400 invalid resource
+# handle"). run-nemo-xrack.sh sets NVIS_NEMO_XRACK=1 automatically when the allocation spans >1
+# rack. NVIS_NEMO_XRACK=1 forces multi-rack; =0 forces single-rack; unset keeps the count heuristic.
+if [ -n "${NVIS_NEMO_XRACK:-}" ]; then
+  if [ "${NVIS_NEMO_XRACK}" = 1 ]; then single_rack=0; else single_rack=1; fi
+fi
+echo "INFO: nnodes=${SLURM_NNODES} single_rack=${single_rack} (NVIS_NEMO_XRACK=${NVIS_NEMO_XRACK:-<unset>})"
 if [ $(( ${SLURM_NNODES} % 2 )) != 0 ]
 then
   echo "ERROR: SLURM_NNODES=$SLURM_NNODES is not multiple of 2!!!"
@@ -73,7 +86,35 @@ select_ns_nic() {
 ns_nic=$(select_ns_nic)
 echo "INFO: ns_nic=${ns_nic} (auto: bond0 vs enP22s22f0np0)"
 set -x
-ew_nics=($(echo mlx5_{0..3}))
+# East-west (compute) rails via the shared classifier (ACTIVE + IB/RoCE + top line
+# rate; excludes slower BlueField-3 storage NICs). Falls back to mlx5_0..3.
+# Locate lib/fabric.inc.sh. Slurm spools ONLY this batch script (not lib/), so
+# $(dirname BASH_SOURCE) points at /var/spool/slurmd/... where lib/ does NOT exist —
+# that made the fabric classifier silently no-op and fall back to the naive mlx5_0..3
+# set, which MIXES IB + RoCE NICs and breaks NCCL ("Remote IB device is incompatible
+# with the local mlx5_2:1/RoCE"). Prefer NVIS_SCRIPTS_DIR (exported by the launcher),
+# then the submit dir, then the deployed bin/scripts path.
+_nvis_lib=""
+for _cand in \
+  "${NVIS_SCRIPTS_DIR:-}/lib/fabric.inc.sh" \
+  "${SLURM_SUBMIT_DIR:-}/lib/fabric.inc.sh" \
+  "$(dirname "${BASH_SOURCE[0]}")/lib/fabric.inc.sh" \
+  "${RACK_REMOTE_BASE_PATH:-/home/cmsupport/nvis-rack-status}/bin/scripts/lib/fabric.inc.sh"; do
+  [[ -n "${_cand}" && -f "${_cand}" ]] && { _nvis_lib="${_cand}"; break; }
+done
+# shellcheck disable=SC1090
+if [[ -n "${_nvis_lib}" ]]; then
+  echo "INFO: fabric classifier: ${_nvis_lib}"
+  . "${_nvis_lib}"
+else
+  echo "WARN: lib/fabric.inc.sh not found (set NVIS_SCRIPTS_DIR); falling back to mlx5_0..3 (may mix IB/RoCE)"
+fi
+if declare -F nvis_fabric_scan >/dev/null 2>&1; then eval "$(nvis_fabric_scan 2>/dev/null)"; fi
+if [[ -n "${NVIS_FAB_IB_HCA:-}" ]]; then
+  IFS=',' read -r -a ew_nics <<< "${NVIS_FAB_IB_HCA}"
+else
+  ew_nics=($(echo mlx5_{0..3}))
+fi
 export MELLANOX_VISIBLE_DEVICES=all
 export PMIX_MCA_gds=hash
 #
@@ -101,7 +142,20 @@ export SLURM_CPU_BIND=none
 export NCCL_NVLS_ENABLE=1
 #export NCCL_CUMEM_ENABLE=1
 #export NCCL_CUMEM_HOST_ENABLE=0
-export NCCL_MNNVL_ENABLE=1
+# MNNVL (multi-node NVLink) is only valid WITHIN one NVL72 / IMEX domain (a single rack =
+# one GPU-fabric ClusterUUID). Forcing it ON across a multi-rack job makes NCCL import CUDA
+# fabric handles across the rack (ClusterUUID) boundary -> "Cuda failure 400 'invalid
+# resource handle'" and the collective dies (validated on bos01-b05+b06, job 189).
+# Single-rack: force MNNVL=1 (one domain, optimal NVLink). Multi-rack: let NCCL AUTO-detect
+# per-rack MNNVL cliques (distinct ClusterUUID) and use IB between racks. Override with
+# NVIS_NCCL_MNNVL=0|1 (e.g. NVIS_NCCL_MNNVL=0 forces IB everywhere as a fallback).
+if [ -n "${NVIS_NCCL_MNNVL:-}" ]; then
+  export NCCL_MNNVL_ENABLE=${NVIS_NCCL_MNNVL}
+elif [ $single_rack -eq 1 ]; then
+  export NCCL_MNNVL_ENABLE=1
+else
+  unset NCCL_MNNVL_ENABLE
+fi
 export NCCL_MIN_CTAS=16
 #export NCCL_P2P_LEVEL=NVL
 #export NCCL_P2P_LEVEL=C2C
@@ -116,21 +170,124 @@ export NCCL_P2P_NET_CHUNKSIZE=262144
 #export NCCL_GDRCOPY_ENABLE=1
 #export NCCL_GDRCOPY_SYNC_ENABLE=1
 
+# --- Cross-rack CollNet-mismatch fix (THE multi-rack alltoall fix; keeps HPC-X/SHARP) ------------
+# ROOT CAUSE (isolated 2026-07-07 on a07+a08 with NCCL_DEBUG=INFO, jobs 198-206): the container's
+# HPC-X SHARP plugin /opt/hpcx/nccl_rdma_sharp_plugin/lib/libnccl-net.so predates the runtime NCCL
+# (2.28.9 AND 2.30.7): its `*_v11` entry points are missing, so NCCL falls back to the v10 ABI and
+# DOES load "collnet plugin SHARP (v10)". SHARP then registers an ASYMMETRIC CollNet device count
+# across nodes (min 3, max 4); NCCL 2.30 treats that as fatal by default and aborts with "Detected
+# mixed local CollNet device counts across ranks", which surfaced downstream as the MISLEADING
+# "bootstrap Message truncated: received 512 bytes instead of 256". It was NOT the NCCL version, NOT
+# PXN/PROTO/NCHANNELS (A/B job 198/199 — every knob FAILs), and NOT the degraded c15 rail (job 202
+# fails without it). Two fixes work (jobs 203/205/206):
+#   1. NCCL_IGNORE_COLLNET_MISMATCH=1 (DEFAULT here) — tolerate the asymmetry, KEEP HPC-X + SHARP(v10).
+#   2. NCCL_NET_PLUGIN=none — drop the external plugin entirely (built-in IB, NO SHARP). Fallback.
+# Prefer #1 so cross-rack allreduce still gets IB SHARP offload. Flip to #2 by setting
+# NVIS_NCCL_NET_PLUGIN=none. Harmless single-rack (NVLink). The real long-term fix is a container
+# HPC-X plugin that exports the v11 ABI.
+export NCCL_IGNORE_COLLNET_MISMATCH="${NVIS_NCCL_IGNORE_COLLNET_MISMATCH:-1}"
+if [ -n "${NVIS_NCCL_NET_PLUGIN:-}" ]; then
+  export NCCL_NET_PLUGIN="${NVIS_NCCL_NET_PLUGIN}"
+fi
+
+# --- Container NCCL workaround (validated 2026-07-02 on bos01-b05 / bos01-b06) --------------------
+# The nemo-25.11.01 container's bundled NCCL 2.28.3 SEGFAULTS at MNNVL init on GB200 NVL72
+# ("NCCL INFO MNNVL busId ... healthMask 0xaa" -> SIGSEGV, srun exit 139) — even on a SINGLE node —
+# while the host NCCL 2.28.9 drives the SAME fabric fine (portable all_reduce = ~914 GB/s; nvlink
+# preflight PASS; torch CUDA in-container OK). Root cause is the container NCCL, not the fabric.
+# Fix: bind-mount the host NCCL dir into the container and LD_PRELOAD the newer libnccl so every rank
+# (the NCCL pre-checks AND the training) uses it. Override via NVIS_NCCL_PRELOAD_SRC / _LIB; if the
+# lib is absent we fall back to the container's own NCCL (and warn).
+CONT_MOUNTS="/dev:/dev"
+EXPORT_ARG="ALL"
+# With the VETTED image (build_vetted_nemo_image.sh: libnccl + nccl-tests both baked at the vetted
+# NCCL), the runtime LD_PRELOAD is redundant AND undesirable (it would shadow the image's matched
+# libs). Set NVIS_NCCL_PRELOAD_DISABLE=1 when running the vetted image. On the STOCK image the
+# preload is still needed (its NCCL 2.28.3 segfaults at MNNVL init).
+if [ "${NVIS_NCCL_PRELOAD_DISABLE:-0}" = 1 ]; then
+  echo "INFO: NCCL preload DISABLED (NVIS_NCCL_PRELOAD_DISABLE=1) — using the container's own NCCL (expected with the vetted image)"
+else
+  NCCL_PRELOAD_SRC="${NVIS_NCCL_PRELOAD_SRC:-/home/cmods/workspace/nccl/bins}"
+  NCCL_PRELOAD_LIB="${NVIS_NCCL_PRELOAD_LIB:-}"
+  if [ -z "$NCCL_PRELOAD_LIB" ] && [ -d "$NCCL_PRELOAD_SRC" ]; then
+    NCCL_PRELOAD_LIB=$(ls "$NCCL_PRELOAD_SRC"/libnccl.so.2.* 2>/dev/null | sort -V | tail -1 | xargs -r basename)
+  fi
+  if [ -n "$NCCL_PRELOAD_LIB" ] && [ -f "${NCCL_PRELOAD_SRC}/${NCCL_PRELOAD_LIB}" ]; then
+    CONT_MOUNTS="${CONT_MOUNTS},${NCCL_PRELOAD_SRC}:/host-nccl"
+    EXPORT_ARG="ALL,LD_PRELOAD=/host-nccl/${NCCL_PRELOAD_LIB}"
+    echo "INFO: NCCL preload workaround ON -> /host-nccl/${NCCL_PRELOAD_LIB} (host ${NCCL_PRELOAD_SRC}); container NCCL 2.28.3 MNNVL segfault bypass"
+  else
+    echo "WARN: host NCCL preload not found under ${NCCL_PRELOAD_SRC}; container's own NCCL will be used (may segfault at MNNVL init)"
+  fi
+fi
+
+# NCCL flight-recorder dump dir on NFS, mounted into the container at /nccl_traces. The training
+# container is ephemeral (enroot remove at job end), so a dump written to the container's /tmp is
+# lost (job 322). Point TORCH_NCCL_DEBUG_INFO_TEMP_FILE at this NFS-backed mount so per-rank traces
+# from a watchdog-timeout survive for post-mortem. $(pwd) is the NFS submit/log dir (same path on all
+# nodes). Override the location with NVIS_NCCL_TRACE_HOST_DIR.
+NVIS_NCCL_TRACE_HOST_DIR="${NVIS_NCCL_TRACE_HOST_DIR:-$(pwd)/nccl_traces/${SLURM_JOB_ID:-0}}"
+mkdir -p "${NVIS_NCCL_TRACE_HOST_DIR}" 2>/dev/null || true
+CONT_MOUNTS="${CONT_MOUNTS},${NVIS_NCCL_TRACE_HOST_DIR}:/nccl_traces"
+echo "INFO: NCCL flight-recorder dumps -> ${NVIS_NCCL_TRACE_HOST_DIR} (container:/nccl_traces)"
+
+# Optional HF cache overlay: pre-staged tokenizer/config on NFS for OFFLINE compute nodes (some recipes,
+# e.g. nemotron_3_nano, need a HuggingFace tokenizer the nodes can't fetch). Mount it in + point HF_HOME
+# there + run offline. Pre-cache on the head (has network): HF_TOKEN=.. HF_HOME=<dir> huggingface_hub
+# snapshot_download('<repo>', allow_patterns=['*.json','tokenizer*',...]).
+if [ -n "${NVIS_NEMO_HF_HOME:-}" ]; then
+  CONT_MOUNTS="${CONT_MOUNTS},${NVIS_NEMO_HF_HOME}:/hf-cache"
+  export NVIS_HF_HOME_CONT=/hf-cache
+  echo "INFO: HF cache overlay -> ${NVIS_NEMO_HF_HOME} (container:/hf-cache); HF_HOME=/hf-cache, offline"
+fi
+
 srun -N ${SLURM_NNODES} --ntasks-per-node=1 enroot remove -f pyxis_nemo &>/dev/null
 
 ## test nccl
-export NCCL_DEBUG=WARN
+# NCCL pre-flight verbosity — default WARN (quiet). Override from the UI/launch (NVIS_NCCL_DEBUG=
+# INFO|TRACE) to diagnose a silent cross-rack hang: INFO names the stuck rank/peer connection.
+export NCCL_DEBUG="${NVIS_NCCL_DEBUG:-WARN}"
 export NCCL_NVLS_ENABLE=1
+
+# NCCL pre-flight selector: which collectives to run before NeMo training (space/comma
+# list of: allreduce alltoall allgather). Default = all three (original behavior). The
+# all-reduce alone proves the cross-rack fabric; alltoall/allgather can be skipped when the
+# workload doesn't use them (Nemotron-H with ep=1 does NO all-to-all) or to sidestep a
+# container-vs-host NCCL bootstrap ABI mismatch that trips only alltoall/allgather
+# ("bootstrap.cc Message truncated"). Set e.g. NVIS_NCCL_PREFLIGHT="allreduce"; "none"
+# skips the pre-flight entirely.
+NVIS_NCCL_PREFLIGHT="${NVIS_NCCL_PREFLIGHT:-allreduce alltoall allgather}"
+_preflight_on() { [[ " ${NVIS_NCCL_PREFLIGHT//,/ } " == *" $1 "* ]]; }
+# all-reduce is the FATAL fabric gate. alltoall/allgather are informational by default:
+# Nemotron-H (ep=1) issues neither, and their nccl-tests bootstrap can trip ("Message
+# truncated") independently of a healthy fabric — so their failure must not block training.
+# Set NVIS_NCCL_PREFLIGHT_STRICT=1 to make every selected pre-flight fatal.
+NVIS_NCCL_PREFLIGHT_STRICT="${NVIS_NCCL_PREFLIGHT_STRICT:-0}"
+echo "INFO: NCCL pre-flight tests = ${NVIS_NCCL_PREFLIGHT} (strict=${NVIS_NCCL_PREFLIGHT_STRICT})"
+
+# alltoall/alltoallv on multi-domain NVL72 (NCCL 2.28+) can hit PXN / channel chunk-size bugs at
+# the NVSwitch<->IB boundary -> NCCL bootstrap "Message truncated (512 vs 256)". Apply a
+# serialized, PXN-off, SIMPLE-proto, fixed-16-channel config to the alltoall/allgather PRE-FLIGHT
+# ONLY (all-reduce and the NeMo training keep full LL128 / all-channel perf). Toggle off with
+# NVIS_NCCL_ALLTOALL_WORKAROUND=0; tune channels via NVIS_NCCL_A2A_NCHANNELS (default 16).
+_a2a_export="${EXPORT_ARG}"
+if [ "${NVIS_NCCL_ALLTOALL_WORKAROUND:-1}" = 1 ]; then
+  _a2a_nch="${NVIS_NCCL_A2A_NCHANNELS:-16}"
+  _a2a_export="${EXPORT_ARG},NCCL_PXN_DISABLE=1,NCCL_PROTO=SIMPLE,NCCL_MIN_NCHANNELS=${_a2a_nch},NCCL_MAX_NCHANNELS=${_a2a_nch}"
+  echo "INFO: alltoall/allgather NCCL workaround ON (PXN off, PROTO=SIMPLE, ${_a2a_nch} channels) — NVIS_NCCL_ALLTOALL_WORKAROUND=0 to disable"
+fi
+
+if _preflight_on allreduce; then
 echo "*********************************************"
 echo "* NCCL ALL-Reduce                           *"
 echo "*********************************************"
 
 timeout 300 \
-srun --export=ALL --cpu-bind=none --mpi=pmix \
+srun --export=${EXPORT_ARG} --cpu-bind=none --mpi=pmix \
 --container-name=nemo \
 --container-writable \
 --container-image=$CONT \
---container-mounts=/dev:/dev \
+--container-mounts=${CONT_MOUNTS} \
 all_reduce_perf_mpi -dfloat -b 8 -f 2 -g 1 -e 16G --iters 20
 exitcode=$?
 if [ $exitcode -ne 0 ]; then
@@ -142,17 +299,19 @@ if [ $exitcode -ne 0 ]; then
 fi
 
 sleep 10
+fi
 
+if _preflight_on alltoall; then
 echo "*********************************************"
 echo "* NCCL ALL-to-ALL                            *"
 echo "*********************************************"
 
 timeout 300 \
-srun --export=ALL --cpu-bind=none --mpi=pmix \
+srun --export=${_a2a_export} --cpu-bind=none --mpi=pmix \
 --container-name=nemo \
 --container-writable \
 --container-image=$CONT \
---container-mounts=/dev:/dev \
+--container-mounts=${CONT_MOUNTS} \
 alltoall_perf_mpi -dfloat -b 8 -f 2 -g 1 -e 16G --iters 20
 exitcode=$?
 if [ $exitcode -ne 0 ]; then
@@ -160,20 +319,23 @@ if [ $exitcode -ne 0 ]; then
   echo "* ERROR: AllToAll NCCL failed to run!!!              *"
   echo "*********************************************"
   srun -N ${SLURM_NNODES} --ntasks-per-node=1 enroot remove -f pyxis_nemo &>/dev/null
-  exit 1
+  if [ "${NVIS_NCCL_PREFLIGHT_STRICT}" = 1 ]; then exit 1; fi
+  echo "WARN: AllToAll not required for this workload (ep=1) — continuing (NVIS_NCCL_PREFLIGHT_STRICT=1 to gate)."
+fi
 fi
 
 
+if _preflight_on allgather; then
 echo "*********************************************"
 echo "* NCCL ALL-Gather                           *"
 echo "*********************************************"
 
 timeout 300 \
-srun --export=ALL --cpu-bind=none --mpi=pmix \
+srun --export=${_a2a_export} --cpu-bind=none --mpi=pmix \
 --container-name=nemo \
 --container-writable \
 --container-image=$CONT \
---container-mounts=/dev:/dev \
+--container-mounts=${CONT_MOUNTS} \
 all_gather_perf_mpi -dfloat -b 8 -f 2 -g 1 -e 16G --iters 20
 exitcode=$?
 if [ $exitcode -ne 0 ]; then
@@ -181,7 +343,9 @@ if [ $exitcode -ne 0 ]; then
   echo "* ERROR: All-Gather  NCCL failed to run!!!  *"
   echo "*********************************************"
   srun -N ${SLURM_NNODES} --ntasks-per-node=1 enroot remove -f pyxis_nemo &>/dev/null
-  exit 1
+  if [ "${NVIS_NCCL_PREFLIGHT_STRICT}" = 1 ]; then exit 1; fi
+  echo "WARN: All-Gather not required for this workload (ep=1) — continuing (NVIS_NCCL_PREFLIGHT_STRICT=1 to gate)."
+fi
 fi
 
 
@@ -215,22 +379,55 @@ sleep 10
 ## export NCCL_NVLS_ENABLE=0
 ## export UB_SKIPMC=1
 ### For optimal performance, it's recommended to keep NVLS enabled and let UB use multicast if possible.
-export NCCL_DEBUG=INFO
-export NCCL_NVLS_ENABLE=1
-export UB_SKIPMC=0
+# Training-phase verbosity — default INFO; overridable from the UI/launch via NVIS_NCCL_DEBUG.
+export NCCL_DEBUG="${NVIS_NCCL_DEBUG:-INFO}"
+# NVLS multicast + UserBuffers multicast. BF16 exercises the TP-comm-overlap UserBuffers path harder
+# than FP8; on a marginal NVLink/NVSwitch multicast state this throws "CUDA Error ... create_communicator
+# grouped2" / "Cuda failure 226 invalid peer access over nvlink". Documented workaround: UB_SKIPMC=1
+# (UserBuffers fall back to IPC; keeps NVLS for NCCL). Set NVIS_NEMO_UB_SKIPMC=1 (and optionally
+# NVIS_NEMO_NVLS_ENABLE=0) for BF16 acceptance on GB200 if the full-multicast path is unstable.
+export NCCL_NVLS_ENABLE=${NVIS_NEMO_NVLS_ENABLE:-1}
+export UB_SKIPMC=${NVIS_NEMO_UB_SKIPMC:-0}
 # export MAX_STEPS=2010 #For stress test, you can set a large number for MAX_STEPS. 
 #export MAX_STEPS=110
-export MAX_STEPS=2010
-srun --export=ALL --cpu-bind=none --mpi=pmix \
+# Stage-2 soak defaults (2010 steps, fp8, GBS=12*nodes). Stage-3 LLM acceptance overrides these via
+# env so the SAME engine serves both: the soak AND the short perf benchmark (e.g. NVIS_NEMO_MAX_STEPS=50,
+# NVIS_NEMO_DTYPE=bf16). compute_dtype choices: bf16|fp8_cs|fp8_mx|fp8_sc|nvfp4. GBS must stay divisible
+# by the data-parallel size (TP=2 -> DP=nodes*2); the 12*nodes default satisfies this (18N->216, 36N->432).
+export MAX_STEPS=${NVIS_NEMO_MAX_STEPS:-2010}
+export NVIS_NEMO_DTYPE=${NVIS_NEMO_DTYPE:-fp8_cs}
+export NVIS_NEMO_MODEL_SIZE=${NVIS_NEMO_MODEL_SIZE:-56b}
+export NVIS_NEMO_GBS=${NVIS_NEMO_GBS:-$((192*SLURM_NNODES/16))}
+# Parallelism/overlap args. Default: explicit perf config (tp2/pp1/gbs, FSDP off, TE CUDA graphs) —
+# preserves the validated FP8 soak. NVIS_NEMO_RECIPE_DEFAULT=1 drops ALL of these so run_script.py
+# uses the DGXC recipe's built-in optimal parallelism for the model/size/dtype (mirrors Mayo's
+# run_nemotronh.sh, which passed no tp/pp/mb/gb) — use for BF16 where the hardcoded config OOMs.
+if [ "${NVIS_NEMO_RECIPE_DEFAULT:-0}" = 1 ]; then
+  export NVIS_NEMO_EXTRA_ARGS=""
+else
+  export NVIS_NEMO_EXTRA_ARGS="--use_megatron_fsdp 0 -tp 2 -pp 1 -cp 1 -ep 1 -mb 1 -gb ${NVIS_NEMO_GBS} --cuda_graph_impl transformer_engine --cuda_graph_scope mamba,attn"
+fi
+# Container CLI style + GPU config token. legacy = 25.11.01 (--model_name/--model_size);
+# v2 = 26.02.01+ (--model_family_name/--model_recipe_name/--offline; has the precision-decoupled
+# recipe so BF16 resolves a config). GPU token (gb200/gb300/b200/h100) selects the per-platform base.
+export NVIS_NEMO_GPU_TYPE=${NVIS_NEMO_GPU:-gb300}
+if [ "${NVIS_NEMO_CLI:-v2}" = "v2" ]; then
+  export NVIS_NEMO_MODEL_ARGS="--model_family_name nemotronh --model_recipe_name ${NVIS_NEMO_RECIPE_NAME:-nemotronh_${NVIS_NEMO_MODEL_SIZE}}"
+else
+  export NVIS_NEMO_MODEL_ARGS="--model_name nemotronh --model_size ${NVIS_NEMO_MODEL_SIZE}"
+fi
+echo "INFO: LLM params model=nemotronh size=${NVIS_NEMO_MODEL_SIZE} dtype=${NVIS_NEMO_DTYPE} gbs=${NVIS_NEMO_GBS} max_steps=${MAX_STEPS} recipe_default=${NVIS_NEMO_RECIPE_DEFAULT:-0} cli=${NVIS_NEMO_CLI:-v2} gpu=${NVIS_NEMO_GPU_TYPE}"
+echo "INFO: model_args=[${NVIS_NEMO_MODEL_ARGS}] extra_args=[${NVIS_NEMO_EXTRA_ARGS}]"
+srun --export=${EXPORT_ARG} --cpu-bind=none --mpi=pmix \
 --container-name=nemo \
 --container-writable \
 --container-image=$CONT \
---container-mounts=/dev:/dev \
+--container-mounts=${CONT_MOUNTS} \
 bash <<- '__END__'
 set -ex
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export HF_HOME=/root/.cache/huggingface
+export HF_HOME=${NVIS_HF_HOME_CONT:-/root/.cache/huggingface}
 
 export NEMORUN_HOME=/mnt/nemo
 export CPATH=/usr/local/cuda/include
@@ -243,9 +440,49 @@ export NVTE_FUSED_ATTN=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_FWD_LAYERNORM_SM_MARGIN=16
 export NVTE_BWD_LAYERNORM_SM_MARGIN=16
+# Mayo-proven NemotronH perf/stability env (from the delivered DGXC recipe, dgxc-runai/run_nemotronh.sh).
+# NCCL_GRAPH_REGISTER=0 is REQUIRED with expandable_segments + CUDA graphs (else "illegal memory access");
+# the NVTE amax knobs match the recipe. NVLS multicast is controlled outside via NVIS_NEMO_NVLS_ENABLE
+# (set 0 for BF16 to avoid the UserBuffers reduce-scatter / Cuda-226 multicast failure seen on GB200).
+export NCCL_GRAPH_REGISTER=0
+export NVTE_DP_AMAX_REDUCE_INTERVAL=0
+export NVTE_ASYNC_AMAX_REDUCTION=1
 export NCCL_P2P_NET_CHUNKSIZE=2097152
 export TORCH_NCCL_HIGH_PRIORITY=1
 export PYTHONPATH=/opt/Megatron-Bridge/scripts/performance:$PYTHONPATH
+
+# NCCL flight recorder (job 320 post-mortem: DATA_PARALLEL collective hung, 10-min watchdog aborted
+# the whole run but did not name the rank that stalled FIRST). The recorder ring-buffers the last N
+# collectives per rank and, on the watchdog timeout, dumps them so the stuck rank/op is identified.
+# Dumps land on node-local /tmp (collect with pdsh after a hang: /tmp/nccl_trace_<jobid>_<rank>).
+# Low overhead; overridable via NVIS_NCCL_TRACE_BUFFER_SIZE. NCCL_DEBUG is already INFO for training.
+export TORCH_NCCL_TRACE_BUFFER_SIZE=${NVIS_NCCL_TRACE_BUFFER_SIZE:-20000}
+export TORCH_NCCL_DUMP_ON_TIMEOUT=${NVIS_NCCL_DUMP_ON_TIMEOUT:-1}
+# Dump to the NFS-mounted /nccl_traces (see CONT_MOUNTS above) so traces survive container teardown.
+export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=/nccl_traces/trace_${SLURM_JOB_ID:-0}_rank
+
+# NVIS BF16 force-enable for nemotronh-56b (benchmark-only). The DGXC recipe ships FP8_CS base
+# configs ONLY; the workload base config is precision-INDEPENDENT parallelism (actual precision is
+# applied separately via get_precision_config("bf16")=bf16_mixed). So alias the BF16 config names to
+# the FP8_CS_V1 base so get_workload_base_config() resolves, then --compute_dtype bf16 runs true BF16.
+# flock-serialized + idempotent (one writer per node). NOTE: this is a FORCE-ENABLED, NVIDIA-unvalidated
+# BF16 config for this model — use for HW throughput benchmarking, label it as such in any report.
+if [ "${NVIS_NEMO_FORCE_BF16_ALIAS:-0}" = 1 ]; then
+  _nvcfg=/opt/Megatron-Bridge/scripts/performance/configs/nemotronh/__init__.py
+  (
+    flock 9
+    if ! grep -q "NVIS BF16 alias" "$_nvcfg" 2>/dev/null; then
+      {
+        echo ""
+        echo "# NVIS BF16 alias (force-enable, benchmark-only): base config is precision-independent parallelism"
+        echo "NEMOTRONH_56B_PRETRAIN_CONFIG_GB200_BF16_V1 = NEMOTRONH_56B_PRETRAIN_CONFIG_GB200_FP8_CS_V1"
+        echo "NEMOTRONH_56B_PRETRAIN_CONFIG_GB200_BF16_V2 = NEMOTRONH_56B_PRETRAIN_CONFIG_GB200_FP8_CS_V1"
+        echo "NEMOTRONH_56B_PRETRAIN_CONFIG_GB200_BF16 = NEMOTRONH_56B_PRETRAIN_CONFIG_GB200_FP8_CS_V1"
+      } >> "$_nvcfg"
+      echo "INFO: NVIS BF16 alias injected into $_nvcfg"
+    fi
+  ) 9>/tmp/nvis_bf16_patch.lock
+fi
 
 ## Rule: num_gpus % (ep * et * tp * pp) == 0
 #With CUDA graphs, then expandable segments must be disabled by "unset PYTORCH_CUDA_ALLOC_CONF".
@@ -260,19 +497,12 @@ python /opt/Megatron-Bridge/scripts/performance/run_script.py \
   --log_dir ${NEMORUN_HOME} \
   --container_image ${NEMORUN_HOME}/nemo-25.11.01.sqsh \
   --nemo_home ${NEMORUN_HOME}/experiments \
-  --gpu gb300 \
+  --gpu ${NVIS_NEMO_GPU_TYPE} \
   --num_gpus $[4*${SLURM_NNODES}] \
   --gpus_per_node 4 \
-  --compute_dtype fp8_cs \
-  --model_name nemotronh --model_size 56b \
-  --use_megatron_fsdp 0 \
-  -tp 2 \
-  -pp 1 \
-  -cp 1 \
-  -ep 1 \
-  -mb 1 \
-  -gb $[192*${SLURM_NNODES}/16] \
-  --cuda_graph_impl transformer_engine --cuda_graph_scope mamba,attn \
+  --compute_dtype ${NVIS_NEMO_DTYPE} \
+  ${NVIS_NEMO_MODEL_ARGS} \
+  ${NVIS_NEMO_EXTRA_ARGS} \
   --max_steps ${MAX_STEPS} \
   train.manual_gc=true train.manual_gc_interval=100
 __END__

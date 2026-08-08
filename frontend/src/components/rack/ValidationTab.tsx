@@ -1,9 +1,13 @@
+import { useState } from "react";
 import Box from "@mui/material/Box";
 import { Text, Divider } from "@nvidia/foundations-react-core";
 import { ActionCard } from "./ActionCard";
-import { Play, Flame, Zap, Boxes, FileSearch, XCircle, ArrowDownToLine, ArrowUpFromLine, Network } from "lucide-react";
+import { NvlinkPreflightPanel } from "./NvlinkPreflightPanel";
+import { LaunchOptionsDialog } from "./LaunchOptionsDialog";
+import { ValidationActivitiesTable } from "./ValidationActivitiesTable";
+import { Play, Flame, Zap, Boxes, FileSearch, XCircle, ArrowDownToLine, ArrowUpFromLine, Network, Gauge, Activity } from "lucide-react";
 import { useRackCommands } from "../../context/RackCommandContext";
-import { llamaNodesBody, slurmTargetBody, validationFamilyBody } from "../../lib/rackCommandBodies";
+import { llamaNodesBody, slurmTargetBody, validationFamilyBody, type LaunchOptions } from "../../lib/rackCommandBodies";
 import type { NvisNamingSchema } from "../../types/naming";
 
 interface ValidationTabProps {
@@ -16,35 +20,118 @@ interface ValidationTabProps {
   onViewResults?: () => void;
 }
 
+/** A NCCL/NEMO launch deferred until the user confirms options in the modal. */
+interface PendingLaunch {
+  label: string;
+  postUrl: string;
+  statusUrl: (jobId: string) => string;
+  /** Modal title/subtitle for context. */
+  title: string;
+  /**
+   * Show the NCCL library-version selector — only for the direct NCCL path
+   * (run-llmb-nccl-async → nccl_allreduce.sbatch), which resolves libnccl via
+   * LD_LIBRARY_PATH. Container/NEMO launches ignore it.
+   */
+  showNcclVersion?: boolean;
+  /** Show the iterations (sweep-rounds) stepper — direct NCCL paths only. */
+  showIters?: boolean;
+}
+
 export function ValidationTab({ rack, logDir, naming, selectedNodes, disabled, jobId, onViewResults }: ValidationTabProps) {
   const { runAsyncValidationFamily, runSyncJson, openText } = useRackCommands();
   const nodeCount = selectedNodes.size;
+  const [pendingLaunch, setPendingLaunch] = useState<PendingLaunch | null>(null);
 
   const validationBody = () => validationFamilyBody(rack, logDir, selectedNodes, naming);
 
+  const confirmLaunch = (opts: LaunchOptions) => {
+    const p = pendingLaunch;
+    setPendingLaunch(null);
+    if (!p) return;
+    void runAsyncValidationFamily(
+      p.label,
+      "validation",
+      p.postUrl,
+      p.statusUrl,
+      validationFamilyBody(rack, logDir, selectedNodes, naming, opts),
+    );
+  };
+
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: 2 }}>
+      {/* First, above the stages: the cheap gate that decides whether the expensive ones are
+          worth starting. A wedged NVSwitch route makes NCCL/NeMo hang rather than fail. */}
       <Text kind="body/bold/sm" style={{ color: "var(--text-color-secondary)", marginTop: 8 }}>
-        Benchmarks &amp; Tests
+        Preflight
+      </Text>
+
+      <NvlinkPreflightPanel
+        rack={rack}
+        naming={naming}
+        selectedNodes={selectedNodes}
+        disabled={disabled}
+      />
+
+      <Divider />
+
+      <Text kind="body/bold/sm" style={{ color: "var(--text-color-secondary)" }}>
+        Validation Stages
       </Text>
 
       <ActionCard
-        title="Run Validation (NEMO)"
-        description={`Launch single-rack NEMO/NCCL validation on ${nodeCount} selected node(s) in ${rack}. Runs the configured NEMO validation script via Slurm.`}
+        title="Stage 1 — NCCL Benchmark"
+        description={`Stage-1 NCCL acceptance on ${nodeCount} selected node(s) in ${rack}, submitted via llmb-run (workload microbenchmark_nccl): the full 24-test sweep across all_reduce / all_gather / reduce_scatter / alltoall / sendrecv up to 16G, including the NVLS variants. Writes an NCCL-1Rack log to log_dir so it appears on the dashboard + parser results.`}
+        icon={<Activity size={20} />}
+        buttonLabel="Run NCCL"
+        disabled={disabled}
+        selectedNodes={selectedNodes}
+        onRun={() =>
+          setPendingLaunch({
+            label: "NCCL Benchmark (Stage-1)",
+            postUrl: "/api/run-nccl-fullrack-async",
+            statusUrl: (jid) => `/api/run-nccl-fullrack-status?job_id=${encodeURIComponent(jid)}`,
+            title: "Launch Stage-1 NCCL Benchmark",
+            showNcclVersion: true,
+            showIters: true,
+          })
+        }
+      />
+      <ActionCard
+        title="Stage 2 — NEMO Training (NCCL + LLMB)"
+        description={`Stage-2 single-rack validation on ${nodeCount} selected node(s) in ${rack}, both halves submitted via llmb-run: the NCCL sweep (microbenchmark_nccl) followed by Nemotron-H 56B fp8 pretraining (pretrain_nemotron-h). Slurm serialises the two jobs on the rack.`}
         icon={<Play size={20} />}
         buttonLabel="Run NEMO"
         disabled={disabled}
         selectedNodes={selectedNodes}
         onRun={() =>
-          runAsyncValidationFamily(
-            "NEMO validation",
-            "validation",
-            "/api/run-validation-async",
-            (jid) => `/api/run-validation-status?job_id=${encodeURIComponent(jid)}`,
-            validationBody(),
-          )
+          setPendingLaunch({
+            label: "NEMO validation",
+            postUrl: "/api/run-validation-async",
+            statusUrl: (jid) => `/api/run-validation-status?job_id=${encodeURIComponent(jid)}`,
+            title: "Launch Stage-2 NEMO Training",
+          })
         }
       />
+
+      {logDir?.trim() ? (
+        <>
+          <div style={{ margin: "8px 0" }}>
+            <Divider />
+          </div>
+          <ValidationActivitiesTable logDir={logDir} rack={rack} title="Validation activities" />
+        </>
+      ) : null}
+
+      <div style={{ margin: "8px 0" }}>
+        <Divider />
+      </div>
+      <Text kind="body/bold/sm" style={{ color: "var(--text-color-secondary)" }}>
+        Optional Tests &amp; Diagnostics
+      </Text>
+      <Text kind="body/regular/sm" style={{ color: "var(--text-color-secondary)", marginTop: -8 }}>
+        Stage 3 (cross-rack) runs from the multi-rack action menu.
+      </Text>
+
       <ActionCard
         title="Run Llama"
         description={`Launch Llama inference benchmark on ${nodeCount} selected node(s) in ${rack}. Submits a Slurm job using the Llama validation script.`}
@@ -114,6 +201,25 @@ export function ValidationTab({ rack, logDir, naming, selectedNodes, disabled, j
         }
       />
 
+      <ActionCard
+        title="Run NCCL Microbenchmark (LLMB)"
+        description={`Launch the NCCL microbenchmark (llmb-run microbenchmark_nccl, fp8) on ${rack}. Resolves NVIS rack ids to real Slurm nodes and computes GPU scale (nodes*4); single rack = scale 72 on GB300 NVL72.`}
+        icon={<Gauge size={20} />}
+        buttonLabel="Run LLMB NCCL"
+        disabled={disabled}
+        selectedNodes={selectedNodes}
+        onRun={() =>
+          setPendingLaunch({
+            label: "NCCL Microbenchmark (LLMB)",
+            postUrl: "/api/run-llmb-nccl-async",
+            statusUrl: (jid) => `/api/run-llmb-nccl-status?job_id=${encodeURIComponent(jid)}`,
+            title: "Launch NCCL Microbenchmark (LLMB)",
+            showNcclVersion: true,
+            showIters: true,
+          })
+        }
+      />
+
       <div style={{ margin: "8px 0" }}>
         <Divider />
       </div>
@@ -161,6 +267,17 @@ export function ValidationTab({ rack, logDir, naming, selectedNodes, disabled, j
         disabled={disabled}
         selectedNodes={selectedNodes}
         onRun={() => runSyncJson("Slurm undrain", "/api/slurm-undrain", slurmTargetBody(rack, selectedNodes, naming))}
+      />
+
+      <LaunchOptionsDialog
+        open={pendingLaunch !== null}
+        onClose={() => setPendingLaunch(null)}
+        onConfirm={confirmLaunch}
+        title={pendingLaunch?.title ?? "Launch options"}
+        subtitle={`${nodeCount} selected node(s) in ${rack}`}
+        confirmLabel="Launch"
+        showNcclVersion={pendingLaunch?.showNcclVersion ?? false}
+        showIters={pendingLaunch?.showIters ?? false}
       />
     </Box>
   );

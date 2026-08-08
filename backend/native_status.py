@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the single-rack status table without ``rack_status.sh``.
 
-Fast path: ``cmsh -c "rack; list"`` synchronously, render rows with placeholders where needed.
+Fast path: cache ``cmsh -c "rack; list"`` (15-minute default TTL), render rows with placeholders where needed.
 Background threads: ``cmsh -c ds`` (device status), ``sinfo`` (+ ``scontrol`` hostnames), and log-dir
 parsing via ``probe_fn`` (typically ``rack_status.sh --probe-json``). Results merge into in-memory
 state and the next ``/api/status`` read shows updated cells.
@@ -19,17 +19,19 @@ omitted (stray ``pN-r0`` tokens); set ``RACK_CMSH_INCLUDE_R00=1`` if rack 0 exis
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import threading
+import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import host_exec
@@ -40,6 +42,14 @@ _PKG_DIR = Path(__file__).resolve().parent
 # Runtime cache lives under repo-root var/ (parent of backend/).
 _REPO_ROOT = _PKG_DIR.parent
 _NATIVE_LOG_JSON = _REPO_ROOT / "var" / "cache" / "native_log_analysis.json"
+
+# Bump when the per-log probe/parse LOGIC changes (e.g. nccl_parse.inc.sh dialect handling) so stale
+# entries keyed only on log mtime/size are discarded on load instead of serving an outdated PASS/FAIL.
+#
+# Deliberately shared by BOTH the single-rack and multirack caches below: they are produced by the
+# same probe path, so a logic change invalidates both. Giving them separate counters would let one
+# keep serving verdicts from superseded parse logic.
+_NATIVE_LOG_CACHE_VERSION = 2
 
 
 def _job_env_overrides_file() -> Path:
@@ -220,9 +230,45 @@ def validate_cmsh_ds_find_parse_patterns(find_pat: str, parse_pat: str) -> str |
     return None
 
 
+_RACK_ALIAS_CACHE: list | None = None
+
+
+def _rack_alias_rules() -> list:
+    """Optional hostname-rack -> BCM-rack rewrites, for sites where the BCM rack
+    object id is NOT a prefix of the tray hostname.
+
+    NscaleTX: BCM rack objects are ``WH1H1``..``WH1H22`` while trays are
+    ``ink50-dh01-h01-11``. Without a rewrite the ds parse can never attach trays to
+    racks and every rack row renders "-".
+
+    Configure with RACK_ID_ALIAS_RULES = "<regex>=><replacement>[;<regex>=><replacement>]"
+    (Python re.sub syntax, matched case-insensitively against the lowercased
+    hostname-derived rack id). Unset = no rewriting, original behaviour.
+    """
+    global _RACK_ALIAS_CACHE
+    if _RACK_ALIAS_CACHE is None:
+        rules = []
+        raw = (os.environ.get("RACK_ID_ALIAS_RULES") or "").strip()
+        for part in raw.split(";"):
+            part = part.strip()
+            if not part or "=>" not in part:
+                continue
+            pat, repl = part.split("=>", 1)
+            try:
+                rules.append((re.compile(pat.strip(), re.IGNORECASE), repl.strip()))
+            except re.error:
+                continue
+        _RACK_ALIAS_CACHE = rules
+    return _RACK_ALIAS_CACHE
+
+
 def _normalize_rack_key_for_ds(rack_raw: str) -> str:
     """Align ds-derived rack ids with ``rack; list`` (``p5-r1`` → ``p5-r01``)."""
     rr = rack_raw.strip().lower()
+    for pat, repl in _rack_alias_rules():
+        if pat.match(rr):
+            rr = pat.sub(repl, rr)
+            break
     c = canonical_rack_id(rr)
     return c if c else rr
 
@@ -260,9 +306,6 @@ def _condense_tray_tokens(nums_s: str) -> str:
 
 _MULTIRACK_LOG_JSON = _REPO_ROOT / "var" / "cache" / "native_multirack_log_analysis.json"
 
-_MULTIRACK_N_RACK_RE = re.compile(r"(?:[2-9]|[1-9]\d{1,3})rack", re.IGNORECASE)
-
-
 def _env_int(name: str, default: int) -> int:
     try:
         v = int((os.environ.get(name) or "").strip())
@@ -271,33 +314,26 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+# Log-basename classification lives in nvis_id_templates so this module, app.py and the shell
+# probes cannot drift apart on which table a log belongs to. These wrappers exist only to bind
+# this module's NvisNaming (built from its own job-env-override subset, not the process env);
+# keep them free of logic.
+
+
 def _nemo_nccl_bn(name: str) -> bool:
-    low = name.lower()
-    if "nemo" in low or "nccl" in low:
-        return True
-    return _nvis_naming().auxiliary_single_rack_log_basename(name)
+    return _nvis_ids.nemo_nccl_in_log_basename(name, _nvis_naming())
 
 
 def _nemo_single_rack_bn(name: str) -> bool:
-    """NEMO validation logs for the single-rack table (excludes NCCL-only basename sweeps)."""
-    low = name.lower()
-    if "nemo" in low:
-        return True
-    return _nvis_naming().auxiliary_single_rack_log_basename(name)
+    return _nvis_ids.nemo_single_rack_log_basename(name, _nvis_naming())
+
+
+def _stage_kind_of_log_bn(name: str) -> str | None:
+    return _nvis_ids.stage_kind_of_log_basename(name)
 
 
 def _is_multirack_bn(name: str) -> bool:
-    if not _nemo_nccl_bn(name):
-        return False
-    if _MULTIRACK_N_RACK_RE.search(name):
-        return True
-    low = name.lower()
-    naming = _nvis_naming()
-    if (low.startswith("root-nemo-") or low.startswith("root-nccl-")) and naming.multirack_comma_after_rack_re().search(
-        low
-    ):
-        return True
-    return len(naming.find_rack_ids_in_string(name)) >= 2
+    return _nvis_ids.is_multirack_log_basename(name, _nvis_naming())
 
 
 _NODELIST_LINE_RE = re.compile(r"^\s*NODELIST:\s*(.+)\s*$", re.IGNORECASE | re.MULTILINE)
@@ -311,12 +347,12 @@ def extract_physical_rack_ids_from_multirack_log(path: Path) -> list[str]:
     of the file are scanned for ``pN-rMM`` tokens (same word-boundary rules as cmsh rack scraping).
     """
     max_b = max(8192, _env_int("RACK_MULTIRACK_LOG_RACK_SCAN_BYTES", 524288))
-    try:
-        with open(path, "rb") as f:
-            chunk = f.read(max_b)
-    except OSError:
+    # Read through the connection: the log lives on the execution host, which for a
+    # containerised deployment is not this filesystem. Only the head of the file is
+    # needed, so the tail cap is zero.
+    text, meta = host_exec.read_text(path, head_bytes=max_b, tail_bytes=0, whole_bytes=max_b)
+    if meta.get("read_error"):
         return []
-    text = chunk.decode("utf-8", errors="replace")
     naming = _nvis_naming()
     racks: set[str] = set()
     nodem = _NODELIST_LINE_RE.search(text)
@@ -335,21 +371,63 @@ def extract_physical_rack_ids_from_multirack_log(path: Path) -> list[str]:
     return out
 
 
-def _glob_multirack_logs(log_dir: Path) -> list[Path]:
-    """Multirack NEMO/NCCL logs under *log_dir* root and ``failed/`` (basename deduped)."""
-    root = log_dir.resolve()
+def _host_resolve(p: Path) -> PurePosixPath:
+    """Canonicalise *p* against the execution host.
+
+    Delegates to the active connection, so the path is resolved wherever it
+    actually lives rather than against this process's filesystem (which, for a
+    containerised app driving a head node, is the wrong machine entirely).
+    """
+    return _host_path(host_exec.resolve(p))
+
+
+def _host_path(path: str) -> PurePosixPath:
+    """Wrap an execution-host path string.
+
+    Always a :class:`PurePosixPath`: the file belongs to the exec host, so local
+    filesystem operations on it are a category error. Ask the connection instead
+    (``host_exec.is_file`` / ``stat`` / ``read_text``), which reaches the right
+    host either way.
+    """
+    return PurePosixPath(str(path))
+
+
+def _host_log_entries(base: str) -> list[tuple[str, int, int]]:
+    """List ``*.txt``/``*.out`` files (non-recursive) in *base* on the EXEC host as ``(path, mtime_ns, size)``.
+
+    Routes through ``host_exec`` so log discovery + stat honor ``RACK_EXEC_MODE`` exactly like
+    script execution: SSH to the target when remote, local filesystem when on-node. One ``find``
+    call per dir (GNU ``-printf``) avoids a stat round-trip per file over SSH.
+
+    ``.out`` is included so multi-rack NCCL launchers (``run_nccl_mpi.sh`` → ``nccl-mpi_*.out`` /
+    ``llmb-nccl_*.out``) are discoverable; callers filter by basename (``_nemo_nccl_bn`` /
+    ``_is_multirack_bn`` / single-rack ``nemo``/``1rack``), so single-rack views are unaffected.
+
+    One batched directory listing via the connection, so a remote target costs a
+    single round trip rather than a stat per file.
+    """
+    entries = host_exec.stat_dir(base, patterns=("*.txt", "*.out"))
+    return [
+        (path, int(st.mtime * 1_000_000_000), int(st.size))
+        for path, st in entries.items()
+    ]
+
+
+def _glob_multirack_logs(log_dir: Path) -> list[tuple[Path, int, int]]:
+    """Multirack NEMO/NCCL logs under *log_dir* root and ``failed/`` as ``(path, mtime_ns, size)``."""
+    root = str(_host_resolve(log_dir)).rstrip("/")
     seen: set[str] = set()
-    out: list[Path] = []
-    for base in (root, root / "failed"):
-        if not base.is_dir():
-            continue
-        for p in sorted(base.glob("*.txt"), key=lambda x: x.name.lower()):
-            if not p.is_file() or p.name in seen:
+    out: list[tuple[Path, int, int]] = []
+    for base in (root, root + "/failed"):
+        for path, mtime_ns, size in _host_log_entries(base):
+            name = os.path.basename(path)
+            if name in seen:
                 continue
-            if not _nemo_nccl_bn(p.name) or not _is_multirack_bn(p.name):
+            if not _nemo_nccl_bn(name) or not _is_multirack_bn(name):
                 continue
-            seen.add(p.name)
-            out.append(p)
+            seen.add(name)
+            out.append((_host_path(path), mtime_ns, size))
+    out.sort(key=lambda t: t[0].name.lower())
     return out
 
 
@@ -358,28 +436,27 @@ def _rack_from_1rack_log(name: str) -> str | None:
 
 
 def _jobid_from_log_name(name: str) -> str | None:
-    m = re.search(r"N-(\d+)\.txt$", name, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    m2 = re.search(r"NEMO-LLAMA3_8B-1N-.+-(\d+)\.txt$", name, re.IGNORECASE)
-    return m2.group(1) if m2 else None
+    # Llama-first, matching app.py and validation_activities: a hostname ending in "N" would
+    # otherwise let the generic ``N-<jid>`` pattern win on a Llama basename.
+    return _nvis_ids.job_id_from_log_basename(name)
 
 
-def _glob_one_rack_logs(log_dir: Path) -> list[Path]:
-    """``*.txt`` in *log_dir* root only (NEMO single-rack validation); excludes multirack and Llama stdout."""
-    root = log_dir.resolve()
-    out: list[Path] = []
+def _glob_one_rack_logs(log_dir: Path) -> list[tuple[Path, int, int]]:
+    """``*.txt`` in *log_dir* root only (NEMO single-rack validation) as ``(path, mtime_ns, size)``;
+    excludes multirack and Llama stdout. Routed through ``host_exec`` (local or SSH)."""
+    base = str(_host_resolve(log_dir))
     naming = _nvis_naming()
-    for p in sorted(root.glob("*.txt"), key=lambda x: x.name.lower()):
-        if not p.is_file():
+    out: list[tuple[Path, int, int]] = []
+    for path, mtime_ns, size in _host_log_entries(base):
+        name = os.path.basename(path)
+        if not _nemo_single_rack_bn(name):
             continue
-        if not _nemo_single_rack_bn(p.name):
+        if naming.is_llama_slurm_stdout_basename(name):
             continue
-        if naming.is_llama_slurm_stdout_basename(p.name):
+        if _is_multirack_bn(name):
             continue
-        if _is_multirack_bn(p.name):
-            continue
-        out.append(p)
+        out.append((_host_path(path), mtime_ns, size))
+    out.sort(key=lambda t: t[0].name.lower())
     return out
 
 
@@ -428,7 +505,7 @@ def extract_rack_ids_from_cmsh_text(text: str) -> list[str]:
 def _cmsh_rack_list() -> list[str]:
     plat = _get_platform()
     cmd = plat.list_racks_cmd()
-    if not host_exec.is_remote() and not shutil.which(cmd[0]):
+    if not host_exec.which(cmd[0]):
         return []
     try:
         proc = host_exec.run_on_host(
@@ -440,19 +517,40 @@ def _cmsh_rack_list() -> list[str]:
     return extract_rack_ids_from_cmsh_text(proc.stdout or "")
 
 
+DS_LAST_DIAG: dict = {}
+
+
 def _cmsh_ds_text() -> str:
+    """Fetch `cmsh -c ds`. Records a diagnostic instead of silently returning "".
+
+    The original swallowed OSError/TimeoutExpired and returned an empty string, so a
+    failing remote call was indistinguishable from a cluster with no devices — every
+    rack row then rendered "-" with no error anywhere. DS_LAST_DIAG is surfaced via
+    /api/ds-diag.
+    """
     plat = _get_platform()
     cmd = plat.device_status_cmd()
-    if not host_exec.is_remote() and not shutil.which(cmd[0]):
+    DS_LAST_DIAG.clear()
+    DS_LAST_DIAG["cmd"] = " ".join(cmd)
+    DS_LAST_DIAG["target"] = host_exec.exec_kind()
+    DS_LAST_DIAG["remote"] = DS_LAST_DIAG["target"] == "ssh"
+    if not host_exec.which(cmd[0]):
+        DS_LAST_DIAG["error"] = "%s not on PATH on the %s target" % (cmd[0], DS_LAST_DIAG["target"])
         return ""
     try:
         proc = host_exec.run_on_host(
             cmd,
             timeout=max(30, _env_int("RACK_NATIVE_DS_TIMEOUT_SEC", 300)),
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as e:
+        DS_LAST_DIAG["error"] = "%s: %s" % (type(e).__name__, e)
         return ""
-    return proc.stdout or ""
+    out = proc.stdout or ""
+    DS_LAST_DIAG["returncode"] = getattr(proc, "returncode", None)
+    DS_LAST_DIAG["stdout_len"] = len(out)
+    DS_LAST_DIAG["stdout_head"] = out[:400]
+    DS_LAST_DIAG["stderr_head"] = (getattr(proc, "stderr", "") or "")[:400]
+    return out
 
 
 def condense_ct_nums(nums: list[int]) -> str:
@@ -627,6 +725,12 @@ def _parse_cmsh_ds_nvis_templates(ds_text: str) -> dict[str, str]:
         else:
             st = "INST"
         for hm in matcher.find_in_line(line):
+            # Skip NVSwitch trays: the compute CT template matches the
+            # "<rack>-<slot>" prefix inside "<rack>-<slot>-nv", which would fold
+            # NVSwitch slots (19-27) into the compute tray range.
+            after = line[line.find(hm.hostname) + len(hm.hostname):]
+            if after[:3].lower().startswith("-nv"):
+                continue
             ingest(hm.hostname, hm.rack_id, hm.tray, st)
 
     ct_dn: dict[str, str] = {}
@@ -669,10 +773,16 @@ def sinfo_state_trim(s: str) -> str:
 
 
 def collect_sinfo_counts() -> dict[tuple[str, str], int]:
-    """Map (rack_id, trimmed_state) -> count of nodes (after hostname expansion)."""
+    """Map (rack_id, trimmed_state) -> count of nodes (after hostname expansion).
+
+    No bare-name ``which("sinfo")`` guard: the Slurm CLI is not on PATH here
+    (``plat.sinfo_cmd()`` supplies the absolute path plus ``SLURM_CONF``), so that probe
+    always returned None and short-circuited this function to ``{}``. Every rack then
+    rendered ``sinfo: "-"``, was treated as a 0-node non-compute rack, and dropped out of
+    the dashboard summary. Matches ``load_squeue_jobs_map()``, which calls
+    ``run_slurm_on_host`` directly with no guard.
+    """
     plat = _get_platform()
-    if not host_exec.is_remote() and not shutil.which("sinfo"):
-        return {}
     opts = (os.environ.get("SINFO_OPTS") or "").strip()
     extra = "-N -h -o '%N %t'"
     if opts:
@@ -727,6 +837,16 @@ def shlex_split_safe(s: str) -> list[str]:
         return shlex.split(s, posix=True)
     except ValueError:
         return s.split()
+
+
+def rack_total_sinfo_nodes(rack: str, counts: dict[tuple[str, str], int]) -> int:
+    """Total Slurm nodes reported by sinfo for *rack* (sum across all node states).
+
+    Zero means the rack has no compute nodes in Slurm — i.e. a non-GB200 rack (switch /
+    management / networking). Used to keep such "0/0" racks out of the validation
+    statistics (they are not part of the node/rack count we need to validate).
+    """
+    return sum(cnt for (rr, _st), cnt in counts.items() if rr == rack)
 
 
 def format_sinfo_cell(rack: str, counts: dict[tuple[str, str], int]) -> str:
@@ -788,6 +908,110 @@ def validation_status_hint(
             return " ".join(parts)
         return "Validation did not reach done; inspect the log or adjust VALIDATION_TEST in Settings."
     return ""
+
+
+# Per-rack validation is a staged process (single-rack scope):
+#   Stage 1 = NCCL benchmark  -> tracked by ``nccl_ok``
+#   Stage 2 = NeMo / LLM train -> tracked by ``llm_ok``
+# (Stage 3 = cross-rack is a *multi-rack* concern surfaced in the multirack tab, not per rack.)
+# A rack is considered individually validated once BOTH stage 1 and stage 2 are done.
+STAGE_LABELS = {"stage1": "NCCL", "stage2": "NeMo"}
+
+
+_NCCL_TOKENS = frozenset(
+    {
+        "nccl_all_reduce",
+        "all_reduce",
+        "allreduce",
+        "nccl_alltoall",
+        "alltoall",
+        "nccl_all_toall",
+        "nccl_allgather",
+        "all_gather",
+        "allgather",
+    }
+)
+_LLM_TOKENS = frozenset({"llm", "nemotron"})
+_DEFAULT_VALIDATION_TEST = "nccl_all_reduce,nccl_alltoall,nccl_allgather,llm"
+
+
+def validation_wants(validation_test: str | None) -> tuple[bool, bool]:
+    """Return ``(want_nccl, want_llm)`` from a ``VALIDATION_TEST`` string.
+
+    Mirrors ``validation_test_env.sh``: an empty/unset value means the default suite
+    (all NCCL collectives + llm). ``nccl_ok`` / ``llm_ok`` from the probe are vacuously
+    ``True`` when their stage is *not* part of the suite, so we must consult the suite to
+    tell "passed" from "not part of this run".
+    """
+    raw = (validation_test or "").strip()
+    if not raw:
+        raw = _DEFAULT_VALIDATION_TEST
+    want_nccl = False
+    want_llm = False
+    for tok in raw.split(","):
+        t = tok.strip().lower()
+        if t in _NCCL_TOKENS:
+            want_nccl = True
+        elif t in _LLM_TOKENS:
+            want_llm = True
+    return want_nccl, want_llm
+
+
+def _stage_state(
+    nemo_lower: str,
+    ok: bool | None,
+    wanted: bool,
+) -> str:
+    """Resolve a single stage's state given the overall status and its probe flag.
+
+    A stage that is not part of the validation suite reports ``pending`` (not started) —
+    e.g. NeMo when only NCCL was run — instead of a vacuous ``done``.
+
+    ``ok is None`` means the stage has no probe evidence of its own (its log does not exist, or
+    could not be classified). That is **not** a failure: it reports ``pending``. Only an explicit
+    ``False`` — a probe that ran and returned a negative verdict — is ``fail``. Without this, a
+    rack that only ever ran NCCL renders as "NeMo FAIL" citing the NCCL job id.
+    """
+    if not wanted or nemo_lower == "pending":
+        return "pending"
+    if nemo_lower.startswith("ongoing"):
+        return "done" if ok is True else "ongoing"
+    # done or fail overall: the stage passed only with a positive probe flag.
+    if ok is True:
+        return "done"
+    if ok is None:
+        return "pending"
+    return "fail"
+
+
+def compute_stage_states(
+    nemo: str,
+    nccl_ok: bool | None,
+    llm_ok: bool | None,
+    validation_test: str | None = None,
+) -> tuple[str, str]:
+    """Derive per-stage states ``(stage1, stage2)`` from the combined ``nemo`` status.
+
+    Stage 1 tracks the NCCL suite (``nccl_ok``); stage 2 tracks NeMo/LLM training (``llm_ok``).
+    Each returned value is one of ``done`` | ``fail`` | ``ongoing`` | ``pending``.
+    A stage not included in ``validation_test`` reports ``pending`` (not started), so NeMo
+    never shows ``done`` when only NCCL has run.
+    """
+    n = (nemo or "").strip().lower()
+    want_nccl, want_llm = validation_wants(validation_test)
+    return (
+        _stage_state(n, nccl_ok, want_nccl),
+        _stage_state(n, llm_ok, want_llm),
+    )
+
+
+def empty_stage_summary() -> dict[str, int]:
+    return {"done": 0, "fail": 0, "ongoing": 0, "pending": 0}
+
+
+def tally_stage(summary: dict[str, int], state: str) -> None:
+    key = state if state in summary else "pending"
+    summary[key] += 1
 
 
 def load_squeue_jobs_map() -> tuple[set[str], dict[str, str]]:
@@ -892,68 +1116,87 @@ def _last_job_for_log_row(basename: str, probe: dict[str, Any]) -> str:
     return jfb if jfb else "-"
 
 
-def _log_fingerprint(path: Path) -> tuple[int, int] | None:
+def _load_log_cache(path: Path) -> dict[str, Any]:
+    """Probe entries from *path*, or ``{}`` if absent, unreadable or written by older logic.
+
+    No lock: writers publish with ``os.replace``, so a reader sees either the whole old file or
+    the whole new one.
+    """
+    if not path.is_file():
+        return {}
     try:
-        st = path.stat()
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    if raw.get("version") != _NATIVE_LOG_CACHE_VERSION:
+        return {}
+    ent = raw.get("entries")
+    return ent if isinstance(ent, dict) else {}
+
+
+@contextlib.contextmanager
+def _log_cache_write_lock(path: Path):
+    """Serialize the read-merge-write in :func:`_save_log_cache` across Gunicorn workers.
+
+    The lock is a sidecar file, not the cache itself: the cache is published with ``os.replace``,
+    which swaps in a new inode, so a lock held on the cache file would guard an inode the next
+    writer no longer opens. Best-effort -- if the lock cannot be taken the save still proceeds,
+    since losing a cache entry only costs a re-probe.
+    """
+    lock_path = path.with_name(path.name + ".lock")
+    f = None
+    # Acquisition is kept separate from the body so that a read-only var/ (no lock file) falls
+    # through to an unlocked save instead of skipping the save, and so a failure raised by the
+    # body is never mistaken for a failure to lock.
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        f = open(lock_path, "a+", encoding="utf-8")  # noqa: SIM115 - released in finally below
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        except OSError:
+            pass
     except OSError:
-        return None
-    mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
-    return (int(mtime_ns), int(st.st_size))
-
-
-def _load_disk_log_cache() -> dict[str, Any]:
-    if not _NATIVE_LOG_JSON.is_file():
-        return {}
+        f = None
     try:
-        with open(_NATIVE_LOG_JSON, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-    except (OSError, json.JSONDecodeError, TypeError):
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    ent = raw.get("entries")
-    return ent if isinstance(ent, dict) else {}
+        yield
+    finally:
+        if f is not None:
+            try:
+                fcntl.flock(f, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            f.close()
 
 
-def _save_disk_log_cache(entries: dict[str, Any]) -> None:
-    _NATIVE_LOG_JSON.parent.mkdir(parents=True, exist_ok=True)
-    blob = json.dumps({"version": 1, "entries": entries}, indent=2, sort_keys=True) + "\n"
-    tmp = _NATIVE_LOG_JSON.with_name(_NATIVE_LOG_JSON.name + ".tmp")
-    tmp.write_text(blob, encoding="utf-8")
-    os.replace(str(tmp), str(_NATIVE_LOG_JSON))
+def _save_log_cache(path: Path, local: dict[str, Any], alive: set[str]) -> None:
+    """Merge *local* into the cache at *path* and prune entries whose log is gone.
 
+    Re-reads under an exclusive lock instead of writing the snapshot this worker loaded minutes
+    ago. Two workers probing concurrently both take ~a minute of remote commands; with a
+    last-writer-wins save, whichever finished second erased the other's fresh entries and those
+    logs were re-probed on the very next cycle. The probe itself stays outside the lock -- only
+    the merge is serialized, so concurrent probing is still parallel.
 
-def _load_multirack_disk_cache() -> dict[str, Any]:
-    if not _MULTIRACK_LOG_JSON.is_file():
-        return {}
-    try:
-        with open(_MULTIRACK_LOG_JSON, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-    except (OSError, json.JSONDecodeError, TypeError):
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    ent = raw.get("entries")
-    return ent if isinstance(ent, dict) else {}
-
-
-def _save_multirack_disk_cache(entries: dict[str, Any]) -> None:
-    _MULTIRACK_LOG_JSON.parent.mkdir(parents=True, exist_ok=True)
-    blob = json.dumps({"version": 1, "entries": entries}, indent=2, sort_keys=True) + "\n"
-    tmp = _MULTIRACK_LOG_JSON.with_name(_MULTIRACK_LOG_JSON.name + ".tmp")
-    tmp.write_text(blob, encoding="utf-8")
-    os.replace(str(tmp), str(_MULTIRACK_LOG_JSON))
+    *alive* is the set of paths this worker just scanned; entries outside it are dropped so the
+    cache does not grow forever as logs are deleted.
+    """
+    with _log_cache_write_lock(path):
+        merged = dict(_load_log_cache(path))
+        merged.update(local)
+        if alive:
+            merged = {k: v for k, v in merged.items() if k in alive}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        blob = json.dumps({"version": _NATIVE_LOG_CACHE_VERSION, "entries": merged}, indent=2, sort_keys=True) + "\n"
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(blob, encoding="utf-8")
+        os.replace(str(tmp), str(path))
 
 
 def _multirack_node_count_suffix_from_basename(name: str) -> str:
-    """Same node-count suffix as app ``_multirack_node_count_suffix`` (for display only)."""
-    m = re.search(r"-(\d+)N-\d", name, re.IGNORECASE)
-    if m:
-        return f" ({m.group(1)}N)"
-    m2 = re.search(r"-(\d+)N\.txt$", name, re.IGNORECASE)
-    if m2:
-        return f" ({m2.group(1)}N)"
-    return ""
+    return _nvis_ids.node_count_suffix_from_basename(name)
 
 
 def _multirack_rack_display_label(
@@ -1013,10 +1256,13 @@ class NativeRackTableState:
         "log_dir",
         "lock",
         "racks",
+        "racks_refresh_lock",
+        "racks_refreshed_monotonic",
         "ct_by_rack",
         "sinfo_counts",
         "per_path_probe",
         "by_rack_log",
+        "by_rack_stage_log",
         "ds_thread",
         "sinfo_thread",
         "log_thread",
@@ -1028,13 +1274,19 @@ class NativeRackTableState:
 
     def __init__(self, key: str, log_dir: Path) -> None:
         self.key = key
-        self.log_dir = log_dir.resolve()
+        self.log_dir = _host_resolve(log_dir)
         self.lock = threading.RLock()
         self.racks: list[str] = []
+        self.racks_refresh_lock = threading.Lock()
+        self.racks_refreshed_monotonic = 0.0
         self.ct_by_rack: dict[str, str] = {}
         self.sinfo_counts: dict[tuple[str, str], int] = {}
         self.per_path_probe: dict[str, dict[str, Any]] = {}
         self.by_rack_log: dict[str, dict[str, Any]] = {}
+        # rack -> stage kind ("nccl" | "nemo") -> newest probe record of THAT kind.
+        # by_rack_log alone keeps only the newest log of any kind, which silently discards a
+        # passing NCCL result as soon as a NeMo run for the same rack finishes after it.
+        self.by_rack_stage_log: dict[str, dict[str, dict[str, Any]]] = {}
         self.ds_thread: threading.Thread | None = None
         self.sinfo_thread: threading.Thread | None = None
         self.log_thread: threading.Thread | None = None
@@ -1044,9 +1296,25 @@ class NativeRackTableState:
         self.last_errors: list[str] = []
 
     def refresh_racks_blocking(self) -> None:
-        racks = _cmsh_rack_list()
-        with self.lock:
-            self.racks = racks
+        """Refresh slow-changing BCM inventory at most once per configured TTL.
+
+        Device state still refreshes on the normal status cadence. Keeping the
+        last good rack inventory on a transient cmsh failure prevents an empty
+        table and avoids multiplying CMDaemon work across concurrent readers.
+        Set RACK_NATIVE_RACK_LIST_TTL_SEC=0 only for diagnostics.
+        """
+        ttl = max(0, _env_int("RACK_NATIVE_RACK_LIST_TTL_SEC", 900))
+        with self.racks_refresh_lock:
+            now = time.monotonic()
+            with self.lock:
+                if self.racks and ttl > 0 and now - self.racks_refreshed_monotonic < ttl:
+                    return
+            racks = _cmsh_rack_list()
+            if not racks:
+                return
+            with self.lock:
+                self.racks = racks
+                self.racks_refreshed_monotonic = now
 
     def _worker_ds(self) -> None:
         try:
@@ -1073,17 +1341,13 @@ class NativeRackTableState:
 
     def _worker_logs(self, probe_fn: Callable[[Path], dict[str, object] | None]) -> None:
         try:
-            disk = _load_disk_log_cache()
-            paths = _glob_one_rack_logs(self.log_dir)
+            disk = _load_log_cache(_NATIVE_LOG_JSON)
+            entries = _glob_one_rack_logs(self.log_dir)
             alive: set[str] = set()
             dirty = False
-            for p in paths:
-                keyp = str(p.resolve())
+            for p, mtime_ns, size in entries:
+                keyp = str(p)
                 alive.add(keyp)
-                fp = _log_fingerprint(p)
-                if not fp:
-                    continue
-                mtime_ns, size = fp
                 hit = disk.get(keyp) if isinstance(disk.get(keyp), dict) else None
                 rec: dict[str, Any] | None = None
                 if isinstance(hit, dict):
@@ -1101,32 +1365,27 @@ class NativeRackTableState:
                     dirty = True
                 rec_d = rec if isinstance(rec, dict) else {}
                 rk = _rack_from_1rack_log(p.name)
-                try:
-                    m_this = p.stat().st_mtime
-                except OSError:
-                    m_this = 0.0
+                m_this = mtime_ns / 1_000_000_000
                 with self.lock:
                     self.per_path_probe[keyp] = rec_d
                     if rk:
                         prev = self.by_rack_log.get(rk)
                         replace = prev is None
                         if not replace and isinstance(prev, dict):
-                            pp = prev.get("_path")
-                            if isinstance(pp, str) and pp:
-                                try:
-                                    replace = m_this >= Path(pp).stat().st_mtime
-                                except OSError:
-                                    replace = True
-                            else:
-                                replace = True
+                            replace = m_this >= float(prev.get("_mtime") or 0.0)
                         if replace:
                             self.by_rack_log[rk] = {**rec_d, "_path": str(p), "_mtime": m_this}
-            pruned = {k: v for k, v in disk.items() if k in alive}
-            if len(pruned) != len(disk):
-                dirty = True
-            disk = pruned
-            if dirty:
-                _save_disk_log_cache(disk)
+                        kind = _stage_kind_of_log_bn(p.name)
+                        if kind:
+                            bucket = self.by_rack_stage_log.setdefault(rk, {})
+                            prev_k = bucket.get(kind)
+                            replace_k = prev_k is None
+                            if not replace_k and isinstance(prev_k, dict):
+                                replace_k = m_this >= float(prev_k.get("_mtime") or 0.0)
+                            if replace_k:
+                                bucket[kind] = {**rec_d, "_path": str(p), "_mtime": m_this}
+            if dirty or any(k not in alive for k in disk):
+                _save_log_cache(_NATIVE_LOG_JSON, disk, alive)
         except Exception as e:
             with self.lock:
                 self.last_errors.append(f"logs: {e}")
@@ -1153,19 +1412,38 @@ class NativeRackTableState:
                 )
                 self.log_thread.start()
 
-    def build_table_rows(self) -> tuple[list[dict[str, str]], dict[str, int], list[str], str]:
+    def build_table_rows(self) -> tuple[list[dict[str, str]], dict[str, Any], list[str], str]:
         running, job_times = load_squeue_jobs_map()
+        # Open validation activities carry the live scheduler ref for a just-launched stage,
+        # even when the newest on-disk *-1Rack-* artefact is still from a prior failed job.
+        try:
+            import validation_activities as _va
+
+            live_jobs = _va.live_stage_jobs_by_rack()
+        except Exception:  # noqa: BLE001 — the overlay is best-effort; the rack table must still
+            # render if the activities store is missing, locked or corrupt.
+            live_jobs = {}
         with self.lock:
             racks = list(self.racks)
             ct = dict(self.ct_by_rack)
             sct = dict(self.sinfo_counts)
             by_rack = {k: dict(v) for k, v in self.by_rack_log.items()}
+            by_rack_stage = {k: {kk: dict(vv) for kk, vv in v.items()} for k, v in self.by_rack_stage_log.items()}
             errs = list(self.last_errors)
             ds_done = self.ds_done
             sinfo_done = self.sinfo_done
         rows: list[dict[str, str]] = []
         n_done = n_fail = n_on = n_pending = 0
+        stage1_summary = empty_stage_summary()
+        stage2_summary = empty_stage_summary()
         want: set[str] = set()
+        for kinds in live_jobs.values():
+            if not isinstance(kinds, dict):
+                continue
+            for jid in kinds.values():
+                sj = str(jid or "").strip()
+                if sj.isdigit():
+                    want.add(sj)
         for rack in sorted(racks, key=_rack_sort_key):
             pr_full = by_rack.get(rack)
             if not pr_full:
@@ -1177,15 +1455,62 @@ class NativeRackTableState:
             lj0 = _last_job_for_log_row(bn0, pr0)
             if lj0 != "-" and lj0.isdigit():
                 want.add(lj0)
+            for _kind, src in (by_rack_stage.get(rack) or {}).items():
+                if not isinstance(src, dict):
+                    continue
+                sp = str(src.get("_path") or "")
+                sbn = Path(sp).name if sp else ""
+                probe = {k: v for k, v in src.items() if k not in ("_path", "_mtime")}
+                lj = _last_job_for_log_row(sbn, probe)
+                if lj != "-" and lj.isdigit():
+                    want.add(lj)
         augment_running_set_for_job_ids(running, job_times, want)
         for rack in sorted(racks, key=_rack_sort_key):
+            # A rack with 0 Slurm nodes (once sinfo is done) is a non-GB200 rack
+            # (switch / mgmt / networking) — keep it in the table/floor but exclude it
+            # from the validation statistics so the counts reflect only compute racks.
+            countable = not (sinfo_done and rack_total_sinfo_nodes(rack, sct) == 0)
+            live = live_jobs.get(rack) if isinstance(live_jobs.get(rack), dict) else {}
+            live_nccl = str((live or {}).get("nccl") or "").strip()
+            live_nemo = str((live or {}).get("nemo") or "").strip()
             pr_full = by_rack.get(rack)
             if not pr_full:
-                n_pending += 1
+                # No results log yet — still paint ongoing when an activity-tracked job is live.
+                nccl_live = bool(live_nccl and live_nccl in running)
+                nemo_live = bool(live_nemo and live_nemo in running)
+                if nccl_live or nemo_live:
+                    live_jid = live_nccl if nccl_live else live_nemo
+                    tm = job_times.get(live_jid, "?")
+                    nemo = f"ongoing [{tm}]"
+                    stage1 = "ongoing" if nccl_live else "pending"
+                    stage2 = "ongoing" if nemo_live else "pending"
+                    if countable:
+                        n_on += 1
+                        tally_stage(stage1_summary, stage1)
+                        tally_stage(stage2_summary, stage2)
+                    rows.append(
+                        {
+                            "rack": rack,
+                            "nemo": nemo,
+                            "stage1": stage1,
+                            "stage2": stage2,
+                            "last_job": live_jid,
+                            "sinfo": "?" if not sinfo_done else format_sinfo_cell(rack, sct),
+                            "ct_down_unk": "?" if not ds_done else ct.get(rack, "-"),
+                            "nemo_hint": validation_status_hint(nemo, live_jid),
+                        }
+                    )
+                    continue
+                if countable:
+                    n_pending += 1
+                    tally_stage(stage1_summary, "pending")
+                    tally_stage(stage2_summary, "pending")
                 rows.append(
                     {
                         "rack": rack,
                         "nemo": "pending",
+                        "stage1": "pending",
+                        "stage2": "pending",
                         "last_job": "-",
                         "sinfo": "?" if not sinfo_done else format_sinfo_cell(rack, sct),
                         "ct_down_unk": "?" if not ds_done else ct.get(rack, "-"),
@@ -1199,34 +1524,108 @@ class NativeRackTableState:
             path_s = str(path) if path else ""
             bn = Path(path_s).name if path_s else ""
             jid_s = _last_job_for_log_row(bn, pr)
-            in_slurm = bool(jid_s != "-" and jid_s in running)
+
+            # Judge each stage from the newest log of its OWN kind. NCCL and NeMo run as
+            # separate jobs writing separate logs, so `pr` (newest log of any kind) only ever
+            # carries evidence for one of the two stages; using it for both makes the stage
+            # whose log is older read as a failure even though it passed.
+            #
+            # An empty stage map is NOT treated as "not validated": _stage_kind_of_log_bn needs
+            # the exact "-NEMO-1Rack-"/"-NCCL-1Rack-" infix, while the file filter accepts any
+            # name containing "nemo" or "1rack", so a site naming its logs differently would
+            # have every rack read as pending regardless of a passing probe. Those racks fall
+            # through to the single-log path below, where an unclassifiable probe still yields
+            # pending via the `not st` branch -- which is the case worth protecting.
+            stage_logs = by_rack_stage.get(rack) or {}
+            nccl_src = stage_logs.get("nccl") or pr_full
+            nemo_src = stage_logs.get("nemo") or pr_full
+            split_stage_logs = "nccl" in stage_logs and "nemo" in stage_logs
+            # A NON-EMPTY stage map that lacks one stage means that stage has genuinely never run
+            # on this rack (j15/j16 on 2026-08-07: NCCL only, no NeMo job was ever submitted).
+            # Guarded on a non-empty map on purpose, so the unclassifiable-log-naming case
+            # described above still falls through to the probe instead of going all-pending.
+            nccl_missing = bool(stage_logs) and "nccl" not in stage_logs
+            nemo_missing = bool(stage_logs) and "nemo" not in stage_logs
+
+            # Per-stage queue membership — do not paint both stages "ongoing" from one job id.
+            def _jid_of(src: dict[str, Any]) -> str:
+                sp = str(src.get("_path") or "")
+                sbn = Path(sp).name if sp else ""
+                probe = {k: v for k, v in src.items() if k not in ("_path", "_mtime")}
+                return _last_job_for_log_row(sbn, probe)
+
+            nccl_jid = _jid_of(nccl_src) if stage_logs.get("nccl") else ("-" if split_stage_logs else jid_s)
+            nemo_jid = _jid_of(nemo_src) if stage_logs.get("nemo") else ("-" if split_stage_logs else jid_s)
+            # Single-log racks: only the matching stage inherits the newest-log job id.
+            if not split_stage_logs:
+                kind_newest = _stage_kind_of_log_bn(bn)
+                if kind_newest == "nccl":
+                    nccl_jid, nemo_jid = jid_s, "-"
+                elif kind_newest == "nemo":
+                    nccl_jid, nemo_jid = "-", jid_s
+                else:
+                    nccl_jid = nemo_jid = jid_s
+            nccl_in_slurm = bool(nccl_jid != "-" and nccl_jid in running)
+            nemo_in_slurm = bool(nemo_jid != "-" and nemo_jid in running)
+            # Prefer activity-tracked live jobs over a stale results-log jid (re-launch case).
+            if live_nccl and live_nccl in running:
+                nccl_in_slurm = True
+                nccl_jid = live_nccl
+            if live_nemo and live_nemo in running:
+                nemo_in_slurm = True
+                nemo_jid = live_nemo
+            in_slurm = nccl_in_slurm or nemo_in_slurm
+            live_jid = nccl_jid if nccl_in_slurm else (nemo_jid if nemo_in_slurm else jid_s)
 
             if in_slurm:
-                tm = job_times.get(jid_s, "?")
+                tm = job_times.get(live_jid, "?")
                 nemo = f"ongoing [{tm}]"
-                n_on += 1
+                cat = "ongoing"
+            elif split_stage_logs:
+                # Both stages have their own log: the rack is done only when each stage's own
+                # log passes. Never read one stage's verdict off the other stage's log.
+                cat = "done" if (bool(nccl_src.get("nccl_ok")) and bool(nemo_src.get("llm_ok"))) else "fail"
+                nemo = cat
+            elif nccl_missing or nemo_missing:
+                # Exactly one stage has ever run on this rack. Judge it from its OWN log. If that
+                # stage passed, the rack is INCOMPLETE (pending the other stage), not failed —
+                # a stage that was never submitted is not a failure. If it failed, the rack fails.
+                ran_ok = (
+                    bool(nccl_src.get("nccl_ok")) if nemo_missing else bool(nemo_src.get("llm_ok"))
+                )
+                cat = "pending" if ran_ok else "fail"
+                nemo = cat
             else:
-                st = str(pr.get("nemo_state") or "fail").strip().lower()
+                st = str(pr.get("nemo_state") or "").strip().lower()
                 if st == "ongoing":
                     # Disk probe cache is keyed by log mtime/size only. After the Slurm job ends,
                     # we can still serve a stale probe that says "ongoing". If Slurm does not list
                     # the job, re-classify like rack_status.sh once the run is no longer queued.
                     nccl_ok = bool(pr.get("nccl_ok"))
                     llm_ok = bool(pr.get("llm_ok"))
-                    if nccl_ok and llm_ok:
-                        nemo = "done"
-                        n_done += 1
-                    else:
-                        nemo = "fail"
-                        n_fail += 1
+                    cat = "done" if (nccl_ok and llm_ok) else "fail"
+                    nemo = cat
                 elif st == "done":
                     nemo = "done"
-                    n_done += 1
-                elif st == "fail":
-                    nemo = "fail"
-                    n_fail += 1
+                    cat = "done"
+                elif not st:
+                    # The probe could not classify this log (it failed, timed out, or returned
+                    # nothing). "Could not determine" is not evidence of a failure -- report it
+                    # as not-yet-validated instead of inventing a red result.
+                    nemo = "pending"
+                    cat = "pending"
                 else:
                     nemo = "fail"
+                    cat = "fail"
+            # Non-GB200 (0-node) racks stay in the table but are not tallied into the stats.
+            if countable:
+                if cat == "ongoing":
+                    n_on += 1
+                elif cat == "done":
+                    n_done += 1
+                elif cat == "pending":
+                    n_pending += 1
+                else:
                     n_fail += 1
 
             siv = "?" if not sinfo_done else format_sinfo_cell(rack, sct)
@@ -1236,23 +1635,57 @@ class NativeRackTableState:
                 ctv = ct.get(rack, "-")
 
             vt = str(pr.get("validation_test") or "").strip()
-            nco = pr.get("nccl_ok")
-            llo = pr.get("llm_ok")
+            nco = nccl_src.get("nccl_ok")
+            llo = nemo_src.get("llm_ok")
             nc_b = bool(nco) if isinstance(nco, (bool, int)) else None
             ll_b = bool(llo) if isinstance(llo, (bool, int)) else None
+            # A stage with no log of its own has NO evidence, so its flag must be tri-state None,
+            # not the False that fell through from the other stage's log. parser.sh reports
+            # llm_ok=0 when handed an NCCL log and nccl_ok=0 when handed a NeMo log — it conflates
+            # "absent" with "failed" in both directions, and that is what painted j15/j16 red.
+            if nccl_missing:
+                nc_b = None
+            if nemo_missing:
+                ll_b = None
             nh = validation_status_hint(
                 nemo,
-                jid_s,
+                live_jid if in_slurm else jid_s,
                 nccl_ok=nc_b,
                 llm_ok=ll_b,
                 validation_test=vt or None,
             )
+            stage1, stage2 = compute_stage_states(nemo, nc_b, ll_b, vt or None)
+            # When one stage never ran, the rack-level cell is "pending" — but compute_stage_states
+            # maps a "pending" rack to pending for BOTH stages, which would throw away the other
+            # stage's real verdict (j15/j16 passed NCCL at ~916 GB/s and must still read stage1
+            # done). Derive each stage from its OWN evidence instead. Placed before the in-Slurm
+            # overrides below so a live job still wins.
+            if nccl_missing or nemo_missing:
+                stage1 = "pending" if nc_b is None else ("done" if nc_b else "fail")
+                stage2 = "pending" if ll_b is None else ("done" if ll_b else "fail")
+            # Override per-stage ongoing from that stage's own job id — a live Stage-1 NCCL
+            # must not force Stage-2 NeMo to "running" when its job is not queued. When the
+            # rack-level cell is painted ongoing from one stage's live job, demote the other
+            # stage back to its probe verdict (fail/done/pending).
+            if nccl_in_slurm:
+                stage1 = "ongoing"
+            elif stage1 == "ongoing" and not nccl_in_slurm:
+                stage1 = "done" if nc_b is True else ("fail" if nc_b is False else "pending")
+            if nemo_in_slurm:
+                stage2 = "ongoing"
+            elif stage2 == "ongoing" and not nemo_in_slurm:
+                stage2 = "done" if ll_b is True else ("fail" if ll_b is False else "pending")
+            if countable:
+                tally_stage(stage1_summary, stage1)
+                tally_stage(stage2_summary, stage2)
 
             rows.append(
                 {
                     "rack": rack,
                     "nemo": nemo,
-                    "last_job": jid_s,
+                    "stage1": stage1,
+                    "stage2": stage2,
+                    "last_job": live_jid if in_slurm else jid_s,
                     "sinfo": siv,
                     "ct_down_unk": ctv,
                     "nemo_hint": nh,
@@ -1263,6 +1696,8 @@ class NativeRackTableState:
             "fail": n_fail,
             "ongoing": n_on,
             "pending": n_pending,
+            "stage1": stage1_summary,
+            "stage2": stage2_summary,
         }
         legend = "rack; list (cmsh) — native table; async: ds, sinfo, log probes"
         footnotes = errs[:12]
@@ -1305,7 +1740,7 @@ def _worker_snapshot(st: NativeRackTableState) -> dict[str, Any]:
 
 def worker_snapshot_for_log_dir(log_dir: Path) -> dict[str, Any] | None:
     """Return ``_worker_snapshot`` for *log_dir* if native state exists, else ``None``."""
-    key = str(log_dir.resolve())
+    key = str(_host_resolve(log_dir))
     with _states_lock:
         st = _states.get(key)
     if st is None:
@@ -1319,7 +1754,7 @@ def live_table_snapshot_for_log_dir(log_dir: Path) -> dict[str, Any] | None:
     Cached ``/api/status`` payloads can otherwise keep placeholder ``?`` cells from the first
     snapshot taken before ``ds_done`` / ``sinfo_done`` flipped true.
     """
-    key = str(log_dir.resolve())
+    key = str(_host_resolve(log_dir))
     with _states_lock:
         st = _states.get(key)
     if st is None:
@@ -1347,7 +1782,7 @@ def build_native_rack_status(
     include_raw: bool,
     probe_fn: Callable[[Path], dict[str, object] | None],
 ) -> dict[str, Any]:
-    key = str(log_dir.resolve())
+    key = str(_host_resolve(log_dir))
     st = _get_state(key, log_dir)
     st.refresh_racks_blocking()
     st.schedule_async_workers(probe_fn)
@@ -1356,7 +1791,7 @@ def build_native_rack_status(
         "ok": True,
         "returncode": 0,
         "updated_at": datetime.now(timezone.utc).isoformat(),
-        "log_dir": str(log_dir.resolve()),
+        "log_dir": str(_host_resolve(log_dir)),
         "script": "native_status.py",
         "stderr": "\n".join(footnotes) if footnotes else "",
         "legend": legend,
@@ -1393,9 +1828,9 @@ class MultirackTableState:
 
     def __init__(self, key: str, log_dir: Path) -> None:
         self.key = key
-        self.log_dir = log_dir.resolve()
+        self.log_dir = _host_resolve(log_dir)
         self.lock = threading.RLock()
-        self.log_paths: list[Path] = []
+        self.log_paths: list[tuple[Path, int, int]] = []
         self.per_path_probe: dict[str, dict[str, Any]] = {}
         self.sinfo_counts: dict[tuple[str, str], int] = {}
         self.sinfo_thread: threading.Thread | None = None
@@ -1423,19 +1858,15 @@ class MultirackTableState:
     def _worker_logs_m(
         self,
         probe_fn: Callable[[Path], dict[str, object] | None],
-        paths: list[Path],
+        paths: list[tuple[Path, int, int]],
     ) -> None:
         try:
-            disk = _load_multirack_disk_cache()
+            disk = _load_log_cache(_MULTIRACK_LOG_JSON)
             alive: set[str] = set()
             dirty = False
-            for p in paths:
-                keyp = str(p.resolve())
+            for p, mtime_ns, size in paths:
+                keyp = str(p)
                 alive.add(keyp)
-                fp = _log_fingerprint(p)
-                if not fp:
-                    continue
-                mtime_ns, size = fp
                 hit = disk.get(keyp) if isinstance(disk.get(keyp), dict) else None
                 rec: dict[str, Any] | None = None
                 if isinstance(hit, dict):
@@ -1466,12 +1897,8 @@ class MultirackTableState:
                 rec_d = rec if isinstance(rec, dict) else {}
                 with self.lock:
                     self.per_path_probe[keyp] = rec_d
-            pruned = {k: v for k, v in disk.items() if k in alive}
-            if len(pruned) != len(disk):
-                dirty = True
-            disk = pruned
-            if dirty:
-                _save_multirack_disk_cache(disk)
+            if dirty or any(k not in alive for k in disk):
+                _save_log_cache(_MULTIRACK_LOG_JSON, disk, alive)
         except Exception as e:
             with self.lock:
                 self.last_errors.append(f"multirack logs: {e}")
@@ -1510,17 +1937,19 @@ class MultirackTableState:
             probe_map = {k: dict(v) for k, v in self.per_path_probe.items()}
             sinfo_done = self.sinfo_done
         want: set[str] = set()
-        for p in paths:
-            keyp = str(p.resolve())
+        for p, _mtime_ns, _size in paths:
+            # Paths are PurePosixPath (exec-host) — never .resolve() (AttributeError → HTML 500).
+            # Probe cache keys are str(p) from _worker_logs_m; keep the same form here.
+            keyp = str(p)
             probe = probe_map.get(keyp, {})
             lj = _last_job_for_log_row(p.name, probe)
             if lj != "-" and lj.isdigit():
                 want.add(lj)
         augment_running_set_for_job_ids(running, job_times, want)
         rows: list[dict[str, str]] = []
-        for p in paths:
+        for p, _mtime_ns, _size in paths:
             bn = p.name
-            keyp = str(p.resolve())
+            keyp = str(p)
             probe = probe_map.get(keyp, {})
             last_job = _last_job_for_log_row(bn, probe)
             in_slurm = bool(last_job != "-" and last_job in running)
@@ -1556,6 +1985,9 @@ class MultirackTableState:
             )
             rows.append(
                 {
+                    # SPA reads rack / display_rack; rack_display kept for older clients.
+                    "rack": rack_disp,
+                    "display_rack": rack_disp,
                     "rack_display": rack_disp,
                     "log_file": bn,
                     "nemo": nemo,
@@ -1603,7 +2035,7 @@ def _get_multirack_state(key: str, log_dir: Path) -> MultirackTableState:
 
 
 def worker_snapshot_for_multirack_log_dir(log_dir: Path) -> dict[str, Any] | None:
-    key = str(log_dir.resolve())
+    key = str(_host_resolve(log_dir))
     with _multirack_states_lock:
         st = _multirack_states.get(key)
     if st is None:
@@ -1618,14 +2050,14 @@ def build_multirack_status(
     rack_ids_fn: Callable[[str], list[str]],
 ) -> dict[str, Any]:
     """Multirack table: glob log list synchronously; fill validation + sinfo via two background threads."""
-    key = str(log_dir.resolve())
+    key = str(_host_resolve(log_dir))
     st = _get_multirack_state(key, log_dir)
     st.refresh_paths_blocking()
     st.schedule_workers(probe_fn)
     rows = st.build_rows(rack_label_fn, rack_ids_fn)
     return {
         "ok": True,
-        "log_dir": str(log_dir.resolve()),
+        "log_dir": str(_host_resolve(log_dir)),
         "rows": rows,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "native_workers": _multirack_worker_snapshot(st),

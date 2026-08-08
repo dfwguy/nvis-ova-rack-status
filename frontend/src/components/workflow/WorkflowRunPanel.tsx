@@ -21,6 +21,7 @@ import {
   cancelRun,
   getWorkflow,
   type WorkflowRun,
+  type WorkflowRunHistoryEntry,
   type Workflow,
 } from "../../services/workflowService";
 
@@ -112,11 +113,11 @@ export default function WorkflowRunPanel({ runId, onClose }: WorkflowRunPanelPro
   const [outputDialogOpen, setOutputDialogOpen] = useState(false);
   const [outputStepId, setOutputStepId] = useState("");
   const [outputStepName, setOutputStepName] = useState("");
-  const [outputHistoryEntry, setOutputHistoryEntry] = useState<any>(null);
+  const [outputHistoryEntry, setOutputHistoryEntry] = useState<WorkflowRunHistoryEntry | null>(null);
 
   const handleNodeDoubleClick = useCallback((_event: React.MouseEvent, node: Node) => {
     if (!run?.history) return;
-    const entry = run.history.find((h: any) => h.step_id === node.id);
+    const entry = run.history.find((h) => h.step_id === node.id);
     if (!entry) return;
     const step = workflow?.steps?.find((s) => s.id === node.id);
     setOutputStepId(node.id);
@@ -138,7 +139,7 @@ export default function WorkflowRunPanel({ runId, onClose }: WorkflowRunPanelPro
   const handleExport = async () => {
     if (!run?.history || !workflow) return;
     const steps = await Promise.all(
-      run.history.map(async (entry: any) => {
+      run.history.map(async (entry) => {
         const step = workflow.steps?.find((s) => s.id === entry.step_id);
         let output = entry.output_snippet || "";
         try {
@@ -289,7 +290,7 @@ export default function WorkflowRunPanel({ runId, onClose }: WorkflowRunPanelPro
                   No execution history yet.
                 </Text>
               )}
-              {(run.history || []).map((entry: any, idx: number) => (
+              {(run.history || []).map((entry, idx: number) => (
                 <Box
                   key={idx}
                   sx={{
@@ -329,6 +330,29 @@ export default function WorkflowRunPanel({ runId, onClose }: WorkflowRunPanelPro
                         {entry.completed_at ? new Date(entry.completed_at).toLocaleTimeString() : ""}
                       </Text>
                     </Box>
+
+                    {/* Evaluation message (why it passed/failed) */}
+                    {entry.message && (
+                      <Text
+                        kind="body/regular/sm"
+                        style={{
+                          display: "block",
+                          marginBottom: 4,
+                          color: entry.success === false ? "var(--text-color-danger, #f87171)" : "var(--text-color-secondary)",
+                        }}
+                      >
+                        {entry.message}
+                      </Text>
+                    )}
+                    {/* Agent triage hint */}
+                    {entry.prompt && entry.success === false && (
+                      <Text
+                        kind="body/regular/sm"
+                        style={{ display: "block", marginBottom: 4, color: "var(--text-color-secondary)", fontStyle: "italic" }}
+                      >
+                        Hint: {entry.prompt}
+                      </Text>
+                    )}
 
                     {/* Output snippet */}
                     {entry.output_snippet && (
@@ -455,7 +479,11 @@ export default function WorkflowRunPanel({ runId, onClose }: WorkflowRunPanelPro
         <MuiButton variant="outlined" onClick={onClose}>Close</MuiButton>
       </DialogActions>
 
+      {/* Keyed by step so opening a different step remounts the dialog and its tab/output state
+          resets on its own. The alternative was resetting that state from inside an effect,
+          which costs an extra render pass and is what React's own guidance steers away from. */}
       <StepOutputDialog
+        key={outputStepId}
         open={outputDialogOpen}
         onOpenChange={setOutputDialogOpen}
         stepId={outputStepId}

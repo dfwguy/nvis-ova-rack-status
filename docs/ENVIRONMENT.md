@@ -143,7 +143,10 @@ Requires `RACK_WEB_SECRET_KEY`, **Settings → `RACK_PROJECT_TOKEN`**, vault NVF
 | **`RACK_STATUS_LOG_DIR`** | `APP_DIR/var/logs` | Default log root. |
 | **`RACK_STATUS_SCRIPT`** | `bin/scripts/rack_status.sh` | Shell table script path. |
 | **`RACK_STATUS_EXTRA_ARGS`** | *(unset)* | Extra args for `rack_status.sh`. |
-| **`RACK_STATUS_ALLOWED_PREFIXES`** | *(unset)* | Allowed `log_dir` path prefixes (comma-separated). |
+| **`RACK_STATUS_ALLOWED_PREFIXES`** | *(unset)* | Allowed `log_dir` path prefixes (comma-separated). Must include the bring-up `results` root when the Nodes view reads Travis's per-node artifacts. |
+| **`RACK_BRINGUP_HOME`** | `/home/cmods/bringup` | Root of Travis's bring-up automation tree on the execution host. `/api/bringup/node` shells out to `<home>/daily-report.sh` and `<home>/status-check.sh`; `/api/bringup/config` probes `<home>/results`. |
+| **`RACK_BRINGUP_DISABLED`** | *(unset)* | Truthy → hide the Nodes "Bring-up" panel (`/api/bringup/*` returns disabled). |
+| **`RACK_BRINGUP_CACHE_TTL_SEC`** | `30` | TTL for the cached cluster-wide `daily-report.sh -c` (it re-scans every result dir; the cache makes repeated node opens cheap). |
 | **`RACK_STATUS_TIMEOUT`** | `300` | `rack_status.sh` timeout (shell mode). |
 | **`RACK_STATUS_DEFAULT_REFRESH`** | `30` | UI default refresh (clamped 5–86400). |
 | **`RACK_STATUS_BACKGROUND_DISABLED`** | *(unset)* | Truthy → no `rack-status-bg` cache thread. |
@@ -195,6 +198,10 @@ Requires `RACK_WEB_SECRET_KEY`, **Settings → `RACK_PROJECT_TOKEN`**, vault NVF
 | **`RACK_WEB_GRAFANA_EMBED_DISABLED`** | *(unset)* | Truthy → no iframes. |
 | **`RACK_WEB_GRAFANA_TIME_PAD_SEC`** | `120` | Time window padding (seconds). |
 | **`RACK_WEB_GRAFANA_TIMEZONE`** | *(unset)* | `browser`, `utc`, or IANA; else follows **`RACK_PROMETHEUS_LOG_TIMESTAMP_TZ`**. |
+| **`RACK_WEB_GRAFANA_VAR_RACK`** | `Rack` | Template-var name for rack-scoped deep-links (`var-<name>=<rack>`). BCM/NMC dashboards use `Rack`. |
+| **`RACK_WEB_GRAFANA_VAR_HOST`** | `hostname` | Template-var name for host-scoped deep-links (`var-<name>=<node>`). BCM/NMC dashboards use `hostname`. |
+| **`RACK_WEB_GRAFANA_DEEPLINK_DASHBOARDS`** | *(unset)* | JSON list of "Open in Grafana" deep-link dashboards (`{id,label,uid,slug,scope}`, scope=`host`\|`rack`\|`cluster`). Empty → built-in BCM/NMC GB200 catalog. |
+| **`RACK_WEB_GRAFANA_DEEPLINK_DISABLED`** | *(unset)* | Truthy → hide the "Open in Grafana" deep-link menus (rack table + parser results). |
 | **`RACK_PROMETHEUS_LOG_TIMESTAMP_TZ`** | `UTC` | Log timestamp parsing zone. |
 
 Legacy name **`RACK_APP_GRAFANA_URL`** → use **`RACK_WEB_GRAFANA_URI`**.
@@ -207,7 +214,7 @@ Legacy name **`RACK_APP_GRAFANA_URL`** → use **`RACK_WEB_GRAFANA_URI`**.
 |----------|---------|--------|
 | **`RACK_SLURM_MODULE`** | `slurm` | `module load` name. |
 | **`RACK_SLURM_SKIP_MODULE_LOAD`** | *(unset)* | Truthy → skip `module load`. |
-| **`RACK_SLURM_SCONTROL`**, **`RACK_SLURM_SCANCEL`**, **`RACK_SLURM_SQUEUE`**, **`RACK_SLURM_SINFO`** | binary names | Override Slurm CLI paths. |
+| **`RACK_SLURM_SCONTROL`**, **`RACK_SLURM_SCANCEL`**, **`RACK_SLURM_SQUEUE`**, **`RACK_SLURM_SINFO`**, **`RACK_SLURM_SACCT`** | binary names | Override Slurm CLI paths. Required with `RACK_SLURM_SKIP_MODULE_LOAD=1` when the binaries are not on the non-login shell's `PATH`. |
 | **`RACK_SLURM_SCONTROL_TIMEOUT`** | `120` | Slurm CLI timeouts. |
 | **`RACK_SLURM_DRAIN_REASON`** | `admin` | Default drain reason. |
 | **`RACK_SLURM_NODES_STATE_DISABLED`** | *(unset)* | Truthy → disable drain/undrain. |
@@ -328,11 +335,52 @@ Search in **`app.py`** for: `_DISABLED`, `_DRY_RUN`, `_TIMEOUT`, `_DISABLED` on 
 
 ---
 
+## 17. Execution target: connection topology vs. the flat env contract
+
+How NVIS reaches the cluster can be expressed two ways. The env vars below are the
+**single-host** form and remain fully supported; a declared **topology** supersedes
+them when present. See [`docs/EXECUTION_ARCHITECTURE.md`](EXECUTION_ARCHITECTURE.md) §7.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| **`RACK_EXEC_MODE`** | `ssh` | **Deprecated.** `local` or `ssh`; logs a warning whenever it is set. Connections default to `ssh`. |
+| **`RACK_SSH_HOST`** | *(unset)* | Head-node hostname / IP for the control route. |
+| **`RACK_SSH_USER`** | `root` | SSH user. |
+| **`RACK_SSH_KEY`** | `/run/secrets/ssh_key` | Private key path. Passed as `-i` only when the file exists. |
+| **`RACK_SSH_PORT`** | `22` | SSH port. |
+| **`RACK_SSH_OPTS`** | *(unset)* | Extra `ssh` flags (space-separated). |
+| **`RACK_SSH_MULTIPLEX`** | `1` | ControlMaster multiplexing; `0` opts out (see §6 of the architecture doc). Load-bearing for fan-out — a **stale master** degrades every hop and logs `disabling multiplexing` without this ever changing; recovery in §6.1. |
+| **`RACK_SCRIPT_SSH_*`** | *(unset)* | Same fields for the privileged (`script`) route. Unset → both routes collapse to control. |
+| **`RACK_SCRIPT_SUDO`** | *(unset)* | Truthy → privileged route runs under `sudo -n -E`. |
+| **`RACK_REMOTE_BASE_PATH`** | *(unset)* | One tree on one host: `SCRIPTS_DIR` = `…/bin/scripts`, `DEFAULT_LOG_DIR` = `…/var/logs`. Surfaced as the `scripts` / `logs` role roots when no topology is declared. |
+| **`RACK_FANOUT_MAX_WORKERS`** | `8` | Concurrency cap for workflow node fan-out (`workflow_engine.py`); keep ≤ the gateway's `MaxSessions`. |
+| **`RACK_FS_DIR_CACHE_TTL_SEC`** | `30` | TTL for the `is_dir` cache (each miss is a round trip on a remote target). |
+
+### When the flat form is not enough
+
+It can only say *one hop to one host*, with scripts and logs in the same tree. A
+deployment that needs a bastion in front of the head, or the log directory on a
+different machine from the script tree, declares **endpoints** (`via` chains them,
+N hops) and **roles** (`control`, `scripts`, `logs`, `bcm`, or any site-defined
+name) on the cluster document instead — `GET/PUT /api/catalog/topology`. Roles may
+carry a `root`, which is what `host_exec.role_root(...)` returns.
+
+Env forwarding still applies over every hop: a knob only reaches a remote script if
+its name matches a forwarded prefix (`RACK_`, `NEMO_`, `VALIDATION_`, `SQUEUE_`,
+`NVIS_`, `PDSH_`, `NGC_`, `LLMB_`) or the `FORWARD_ENV_NAMES` list in
+`backend/transport/factory.py`. Per-call values must be passed as `env_extra`, not
+`env` — the latter is a local-subprocess parameter and is dropped when remote.
+
+---
+
 ## Appendix A — Every `RACK_*` name referenced under `nvis-rack-status/` (sorted)
 
 Use this as a checklist against **`app.py`** / **`native_status.py`**. Defaults and semantics are in §§4–14.
 
 ```
+RACK_BRINGUP_CACHE_TTL_SEC
+RACK_BRINGUP_DISABLED
+RACK_BRINGUP_HOME
 RACK_BUG_REPORT_DISABLED
 RACK_BUG_REPORT_DRY_RUN
 RACK_BUG_REPORT_LIST_TIMEOUT
@@ -364,6 +412,10 @@ RACK_HW_CHECK_TIMEOUT
 RACK_IMEX_CHECK_SCRIPT
 RACK_IMEX_RESET_SCRIPT
 RACK_IMEX_RESET_TIMEOUT
+RACK_LAKE_CLUSTER                 # lake cluster tag; defaults to the active catalog cluster/customer, else "unknown-cluster"
+RACK_LAKE_DISABLED
+RACK_LAKE_TIMEOUT
+RACK_LAKE_URL
 RACK_LLAMA_DISABLED
 RACK_LLAMA_SCRIPT
 RACK_LLAMA_TIMEOUT
@@ -373,6 +425,7 @@ RACK_LOG_ANALYSIS_SQUEUE_TIMEOUT_SEC
 RACK_LOG_EXPORT_DISABLED
 RACK_LOG_EXPORT_SKIP_NEMO_DONE_FILTER
 RACK_LOG_INLINE_MAX_BYTES
+RACK_MULTIRACK_JOBS_FILE          # legacy; migrated into RACK_VALIDATION_ACTIVITIES_FILE
 RACK_MULTIRACK_LOG_RACK_SCAN_BYTES
 RACK_MULTIRACK_PROBE_TIMEOUT
 RACK_MULTIRACK_SITE_PREFIX
@@ -425,6 +478,7 @@ RACK_SLURM_NODES_STATE_DRY_RUN
 RACK_SLURM_SCONTROL
 RACK_SLURM_SCONTROL_SHOW_JOB_DISABLED
 RACK_SLURM_SCONTROL_TIMEOUT
+RACK_SLURM_SACCT
 RACK_SLURM_SCANCEL
 RACK_SLURM_SCANCEL_DISABLED
 RACK_SLURM_SINFO
@@ -454,6 +508,7 @@ RACK_TAIL_LOG_DISABLED
 RACK_UPTIME_DISABLED
 RACK_UPTIME_DRY_RUN
 RACK_UPTIME_PDSH_TIMEOUT
+RACK_VALIDATION_ACTIVITIES_FILE   # durable validation activity registry (default var/cache/validation_activities.json)
 RACK_VALIDATION_CT_RANGE
 RACK_VALIDATION_DISABLED
 RACK_VALIDATION_SCRIPT
@@ -464,11 +519,15 @@ RACK_WEB_AUTH_USER
 RACK_WEB_COOKIE_SECURE
 RACK_WEB_GRAFANA_DASH_SLUG
 RACK_WEB_GRAFANA_DASH_UID
+RACK_WEB_GRAFANA_DEEPLINK_DASHBOARDS
+RACK_WEB_GRAFANA_DEEPLINK_DISABLED
 RACK_WEB_GRAFANA_EMBED_DISABLED
 RACK_WEB_GRAFANA_PORT
 RACK_WEB_GRAFANA_TIME_PAD_SEC
 RACK_WEB_GRAFANA_TIMEZONE
 RACK_WEB_GRAFANA_URI
+RACK_WEB_GRAFANA_VAR_HOST
+RACK_WEB_GRAFANA_VAR_RACK
 RACK_WEB_HW_CHECK                 # set by hw_check_pdsh.sh on targets (see §9)
 RACK_WEB_PAM_HELPER_PYTHON
 RACK_WEB_PAM_SERVICE
@@ -503,6 +562,21 @@ RACK_WEB_VERSION
 *Generated from repository sources; if a variable is missing, search **`/home/cmsupport/nvis-rack-status/backend/app.py`** and **`backend/native_status.py`** for the exact spelling.*
 
 ---
+
+### Validation activities
+
+Durable registry for validation-family launches and adopted external logs
+(`validation_activities.py`, `GET/DELETE /api/validation-activities[/<id>]`,
+`POST /api/validation-activities/adopt`). Canonical id is `activity_id` (UUID);
+async endpoints still return the same value as `job_id`. Legacy
+`/api/multirack-jobs` remains a compat alias for `scope=multirack`.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| **`RACK_VALIDATION_ACTIVITIES_FILE`** | `var/cache/validation_activities.json` | Durable activity store (fcntl flock, atomic rewrite, cap ~500). |
+| **`RACK_MULTIRACK_JOBS_FILE`** | `var/cache/multirack_jobs.json` | Legacy path. If the new file is absent and this exists, records are migrated once into `validation_activities.json` (old file kept as `.bak`). |
+
+Subprocess env may include **`NVIS_ACTIVITY_ID=<uuid>`** so wrappers can embed the activity id later.
 
 ### Rack locks
 

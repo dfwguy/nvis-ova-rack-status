@@ -21,6 +21,10 @@ build/*
 # ---- App runtime (regenerated; cluster-specific) ----
 var/cache/
 var/workflows/runs/
+# Catalog store (platforms/tools/projects; seeded on boot, cluster-specific)
+var/store/
+# Durable run/metric history (SQLite + WAL; created on boot by results_history.py)
+var/history/
 
 # ---- Token vault (NEVER commit — encrypted NVFTP tokens + master key material) ----
 var/secrets/
@@ -50,6 +54,16 @@ frontend/node_modules/
 frontend/dist/
 static/spa/
 
+# ---- Manual snapshots taken before edits (foo.py.bak.<tag>) ----
+*.bak
+*.bak.*
+
+# ---- Deployment overrides and key material (plaintext credentials: keep local) ----
+# docker-compose.override.yml carries RACK_WEB_AUTH_TOKEN / RACK_GRAFANA_PASSWORD
+# and deploy-secrets/ holds an ssh key, so neither belongs in history.
+docker-compose.override.yml
+deploy-secrets/
+
 # ---- OS / editor ----
 .DS_Store
 *.zip
@@ -60,3 +74,8 @@ Thumbs.db
 *~
 .coverage
 frontend/coverage/
+
+# Third-party vendor manuals (Dell/NVIDIA PDFs etc). Keep them in Drive, not here: they are
+# multi-MB, redistribution-restricted, and git history is permanent — a manual committed once
+# is carried by every clone forever. Our own docs are markdown and tracked normally.
+docs/*.pdf

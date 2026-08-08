@@ -18,7 +18,8 @@ import TableContainer from "@mui/material/TableContainer";
 import TableHead from "@mui/material/TableHead";
 import TableRow from "@mui/material/TableRow";
 import Paper from "@mui/material/Paper";
-import { Button, Text, Banner, Card, Flex, Tag } from "@nvidia/foundations-react-core";
+import { Button, Text, Banner, Card, Flex, Tag, Checkbox } from "@nvidia/foundations-react-core";
+import { RefreshCw } from "lucide-react";
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -35,6 +36,8 @@ import { Line } from "react-chartjs-2";
 import { ParserGrafanaEmbeds, type GrafanaEmbedPayload } from "./ParserGrafanaEmbeds";
 import { NvloomHeatmapsSection } from "./NvloomHeatmapsSection";
 import { ClusterkitResultsSection, type ClusterkitRunRow } from "./ClusterkitResultsSection";
+import { usePagedRows } from "../hooks/usePagedRows";
+import { TablePager } from "../components/TablePager";
 
 ChartJS.register(
   CategoryScale,
@@ -50,6 +53,11 @@ ChartJS.register(
 
 /** Same key as legacy index.html (displayTzSelect). */
 const DISPLAY_TZ_KEY = "rackWebDisplayTimezone";
+/** Persist "Full rack validation (18N)" preference across opens. */
+const FULL_RACK_KEY = "rackWebParserFullRack";
+
+/** Re-parse cadence while a sweep is still being written. Long enough not to hammer a 10 MB log. */
+const PARTIAL_REPARSE_MS = 20000;
 
 function browserIana(): string {
   try {
@@ -67,6 +75,16 @@ function chartsTzForApi(stored: string): string {
   return u;
 }
 
+function initFullRackFromStorage(): boolean {
+  try {
+    const raw = localStorage.getItem(FULL_RACK_KEY);
+    if (raw === null) return true; // default ON — avoid partial 1N sweeps looking like rack results
+    return raw === "1" || raw.toLowerCase() === "true";
+  } catch {
+    return true;
+  }
+}
+
 export interface ParserResultsDialogProps {
   open: boolean;
   onClose: () => void;
@@ -78,6 +96,12 @@ export interface ParserResultsDialogProps {
    * When set, request uses log_file=… and optional rack= for Grafana context (job_id omitted unless also provided).
    */
   logFileBasename?: string;
+  /**
+   * Explicit allowlisted log path (e.g. a Travis bring-up node log
+   * ``results/<node>/allreduce.txt``). Highest precedence: parses that exact file
+   * via ``/api/parser-results?path=…``, bypassing the rack/basename resolution.
+   */
+  logPath?: string;
   /** 0 = Summary, 1 = NCCL, 2 = NEMO, 3 = LLAMA when server returned rows, 4 = NVLOOM (or LLAMA then NVLOOM), 5 = ClusterKit when runs exist. */
   initialTabIndex?: number;
 }
@@ -95,7 +119,20 @@ interface NcclRow {
   all_reduce_gbps?: string | number;
   all_gather_gbps?: string | number;
   alltoall_gbps?: string | number;
+  // parser.sh emits these via nccl_busbw_ext_csv() (llmb sweeps run all five collectives).
+  reduce_scatter_gbps?: string | number;
+  sendrecv_gbps?: string | number;
+  /** Per-collective bus_bw series (parser.sh nccl_series_by_collective_append). */
+  busbw_series_by_collective?: Record<string, NcclPoint[]>;
   oob_ar_ag_aa?: string;
+  /**
+   * Sweep-block counts from parser.sh nccl_sweep_counts(). ``started > concluded`` means the log
+   * was parsed while the job was still writing it, so the series is a partial read and the peak
+   * is meaningless. Without this a 1-point chart looks identical to a genuinely slow rack.
+   */
+  sweep_blocks_started?: number;
+  sweep_blocks_concluded?: number;
+  sweep_complete?: boolean;
 }
 
 interface StepPoint {
@@ -155,8 +192,28 @@ function normalizeNcclRow(row: RawNccl): NcclRow {
     all_reduce_gbps: row.all_reduce_gbps as string | number | undefined,
     all_gather_gbps: row.all_gather_gbps as string | number | undefined,
     alltoall_gbps: row.alltoall_gbps as string | number | undefined,
+    reduce_scatter_gbps: row.reduce_scatter_gbps as string | number | undefined,
+    sendrecv_gbps: row.sendrecv_gbps as string | number | undefined,
+    busbw_series_by_collective:
+      row.busbw_series_by_collective && typeof row.busbw_series_by_collective === "object"
+        ? (row.busbw_series_by_collective as Record<string, NcclPoint[]>)
+        : undefined,
     oob_ar_ag_aa: row.oob_ar_ag_aa != null ? String(row.oob_ar_ag_aa) : undefined,
+    sweep_blocks_started: Number.isFinite(Number(row.sweep_blocks_started))
+      ? Number(row.sweep_blocks_started)
+      : undefined,
+    sweep_blocks_concluded: Number.isFinite(Number(row.sweep_blocks_concluded))
+      ? Number(row.sweep_blocks_concluded)
+      : undefined,
+    // Older parsers (and non-nccl-tests logs) omit the counts entirely; absent means "no reason to
+    // doubt it", so default to complete rather than warning on every log.
+    sweep_complete: row.sweep_complete == null ? true : Boolean(row.sweep_complete),
   };
+}
+
+/** Rows whose sweep was still being written when the log was parsed. */
+function partialNcclRows(rows: NcclRow[] | undefined): NcclRow[] {
+  return (rows ?? []).filter((r) => r.sweep_complete === false);
 }
 
 function initChartsTzFromStorage(): string {
@@ -220,6 +277,15 @@ interface ParserResponse {
   ok: boolean;
   rack: string;
   log_file: string;
+  /**
+   * Which log fed each validation stage, when resolved by rack. NCCL and NeMo run as separate
+   * Slurm jobs, so each stage's numbers come from its own log; a missing key means that stage
+   * has no log for this rack yet. Absent entirely for explicit path/log_file requests.
+   */
+  stage_logs?: Partial<Record<"nccl" | "nemo", string>>;
+  job_id?: string;
+  full_rack?: boolean;
+  full_rack_nodes?: number | null;
   data: ParserData;
   error?: string;
   returncode?: number;
@@ -253,6 +319,9 @@ const LLAMA_SN_CHART_COLORS = [
 ];
 
 function LlamaReportTable({ rows }: { rows: NemotronRow[] }) {
+  // One row per sn-llama log for the rack; a long campaign leaves plenty behind. Compact pager:
+  // this lives inside a dialog, where a page-size selector would crowd the row.
+  const page = usePagedRows(rows, 10);
   if (!rows.length) return null;
   return (
     <TableContainer component={Paper} variant="outlined" sx={{ mt: 1 }}>
@@ -269,7 +338,7 @@ function LlamaReportTable({ rows }: { rows: NemotronRow[] }) {
           </TableRow>
         </TableHead>
         <TableBody>
-          {rows.map((r, i) => (
+          {page.visible.map((r, i) => (
             <TableRow key={`${r.rack}-${r.job_id}-${i}`}>
               <TableCell>{r.rack}</TableCell>
               <TableCell sx={{ fontFamily: "monospace" }}>{r.job_id}</TableCell>
@@ -282,6 +351,7 @@ function LlamaReportTable({ rows }: { rows: NemotronRow[] }) {
           ))}
         </TableBody>
       </Table>
+      <TablePager {...page} noun="logs" compact />
     </TableContainer>
   );
 }
@@ -374,6 +444,8 @@ function NcclPeakTable({ rows }: { rows: NcclRow[] }) {
             <TableCell>all_reduce</TableCell>
             <TableCell>all_gather</TableCell>
             <TableCell>alltoall</TableCell>
+            <TableCell>reduce_scatter</TableCell>
+            <TableCell>sendrecv</TableCell>
             <TableCell>OOB (AR,AG,AA)</TableCell>
             <TableCell>Peak bus_bw</TableCell>
           </TableRow>
@@ -386,6 +458,8 @@ function NcclPeakTable({ rows }: { rows: NcclRow[] }) {
               <TableCell>{r.all_reduce_gbps ?? "—"}</TableCell>
               <TableCell>{r.all_gather_gbps ?? "—"}</TableCell>
               <TableCell>{r.alltoall_gbps ?? "—"}</TableCell>
+              <TableCell>{r.reduce_scatter_gbps ?? "—"}</TableCell>
+              <TableCell>{r.sendrecv_gbps ?? "—"}</TableCell>
               <TableCell sx={{ fontSize: 12 }}>{r.oob_ar_ag_aa ?? "—"}</TableCell>
               <TableCell>{r.peak_busbw_gbps > 0 ? `${r.peak_busbw_gbps} GB/s` : "—"}</TableCell>
             </TableRow>
@@ -412,14 +486,21 @@ function NcclLog2LineCharts({ rows }: { rows: NcclRow[] }) {
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
       {rows.map((row, idx) => {
-        const raw = row.all_reduce_busbw_series || [];
-        const pts = raw
-          .map((p) => ({
-            x: p.size_bytes,
-            y: p.bus_bw_gbps,
-          }))
-          .filter((p) => Number.isFinite(p.x) && p.x > 0 && Number.isFinite(p.y))
-          .sort((a, b) => a.x - b.x);
+        const toPts = (arr: NcclPoint[]) =>
+          (arr || [])
+            .map((p) => ({ x: p.size_bytes, y: p.bus_bw_gbps }))
+            .filter((p) => Number.isFinite(p.x) && p.x > 0 && Number.isFinite(p.y))
+            .sort((a, b) => a.x - b.x);
+        // One line per collective when the parser supplied them (llmb sweeps run five);
+        // otherwise fall back to the legacy all_reduce-only series so older logs still chart.
+        const byColl = row.busbw_series_by_collective || {};
+        const collNames = Object.keys(byColl)
+          .filter((c) => (byColl[c] || []).length > 0)
+          .sort();
+        const collPts: { name: string; pts: { x: number; y: number }[] }[] = collNames.length
+          ? collNames.map((c) => ({ name: c, pts: toPts(byColl[c]) }))
+          : [{ name: "all_reduce", pts: toPts(row.all_reduce_busbw_series || []) }];
+        const pts = collPts.flatMap((c) => c.pts);
         if (!pts.length) {
           if (row.peak_busbw_gbps > 0) {
             return (
@@ -441,37 +522,46 @@ function NcclLog2LineCharts({ rows }: { rows: NcclRow[] }) {
         return (
           <Card key={idx} style={{ padding: 16 }}>
             <Flex gap="2" align="center" style={{ marginBottom: 8 }} wrap="wrap">
-              <Text kind="body/bold/md">NCCL all_reduce out-of-place bus_bw vs message size</Text>
+              <Text kind="body/bold/md">NCCL out-of-place bus_bw vs message size — {collPts.length > 1 ? `${collPts.length} collectives` : collPts[0]?.name}</Text>
               <Tag color="green" kind="solid" readOnly density="compact">
                 Peak: {row.peak_busbw_gbps} GB/s
               </Tag>
             </Flex>
             <Text kind="body/regular/sm" style={{ color: "var(--text-color-secondary)", marginBottom: 8, display: "block" }}>
-              {pts.length} points — x-axis message size (bytes, log scale), y-axis bus_bw (GB/s); job {row.job_id}
+              {pts.length} points across {collPts.length} collective{collPts.length === 1 ? "" : "s"} — x-axis message size (bytes, log scale), y-axis bus_bw (GB/s); job {row.job_id}. Best-performing sweep block per collective.
             </Text>
             <div style={{ height: 280 }}>
               <Line
                 data={{
-                  datasets: [
-                    {
-                      label: `bus_bw (GB/s) — job ${row.job_id}`,
-                      data: pts.map((p) => ({ x: p.x, y: p.y })),
-                      borderColor: "#ffb454",
-                      backgroundColor: "rgba(255, 180, 84, 0.12)",
+                  datasets: collPts.map((c, ci) => {
+                    const palette = [
+                      "#ffb454", // all_reduce
+                      "#76b900", // NVIDIA green
+                      "#4fc3f7",
+                      "#ba68c8",
+                      "#ef5350",
+                      "#26a69a",
+                    ];
+                    const color = palette[ci % palette.length];
+                    return {
+                      label: c.name,
+                      data: c.pts.map((p) => ({ x: p.x, y: p.y })),
+                      borderColor: color,
+                      backgroundColor: color,
                       borderWidth: 2,
-                      pointRadius: 3,
+                      pointRadius: 2,
                       pointHoverRadius: 5,
                       tension: 0.1,
-                      fill: true,
-                    },
-                  ],
+                      fill: false,
+                    };
+                  }),
                 }}
                 options={{
                   responsive: true,
                   maintainAspectRatio: false,
                   parsing: false,
                   plugins: {
-                    legend: { display: false },
+                    legend: { display: true, position: "bottom" },
                     tooltip: {
                       callbacks: {
                         title: (items) => {
@@ -480,7 +570,7 @@ function NcclLog2LineCharts({ rows }: { rows: NcclRow[] }) {
                           if (sz == null || !Number.isFinite(sz)) return "";
                           return `size: ${formatBytes(sz)}`;
                         },
-                        label: (ctx) => `${(ctx.parsed.y ?? 0).toFixed(2)} GB/s`,
+                        label: (ctx) => `${ctx.dataset.label}: ${(ctx.parsed.y ?? 0).toFixed(2)} GB/s`,
                       },
                     },
                   },
@@ -601,12 +691,14 @@ function StepTimeChart({ rows }: { rows: NemotronRow[] }) {
 
 function NemoReviewSection({
   rows,
+  rack,
   grafanaEmbed,
   grafanaUri,
   grafanaPort,
   parserDisplayTimezone,
 }: {
   rows: NemotronRow[];
+  rack?: string;
   grafanaEmbed: GrafanaEmbedPayload | null | undefined;
   grafanaUri?: string;
   grafanaPort?: string | number;
@@ -620,6 +712,7 @@ function NemoReviewSection({
         grafanaUri={grafanaUri}
         grafanaPort={grafanaPort}
         parserDisplayTimezone={parserDisplayTimezone}
+        rack={rack}
       />
     </Box>
   );
@@ -643,6 +736,7 @@ function SummaryTab({
   data,
   rack,
   logFile,
+  stageLogs,
   commandDisplay,
   returncode,
   stderr,
@@ -650,6 +744,7 @@ function SummaryTab({
   data: ParserData;
   rack: string;
   logFile: string;
+  stageLogs?: Partial<Record<"nccl" | "nemo", string>>;
   commandDisplay?: string;
   returncode?: number;
   stderr?: string;
@@ -677,6 +772,27 @@ function SummaryTab({
             Log path
           </Text>
           <Text kind="mono/sm" style={{ wordBreak: "break-all" }}>{logFile}</Text>
+        </Card>
+      )}
+      {/* Two stages, two jobs, two logs: name the source of each tab so a stage that has not
+          run yet reads as missing rather than as a bad result. */}
+      {stageLogs && Object.keys(stageLogs).length > 1 && (
+        <Card style={{ padding: 12 }}>
+          <Text kind="body/regular/sm" style={{ color: "var(--text-color-secondary)", display: "block", marginBottom: 4 }}>
+            Stage logs
+          </Text>
+          {(["nccl", "nemo"] as const).map((stage) =>
+            stageLogs[stage] ? (
+              <div key={stage} style={{ display: "flex", gap: 8, alignItems: "baseline" }}>
+                <Text kind="body/regular/sm" style={{ minWidth: 44, color: "var(--text-color-secondary)" }}>
+                  {stage === "nccl" ? "NCCL" : "NEMO"}
+                </Text>
+                <Text kind="mono/sm" style={{ wordBreak: "break-all" }}>
+                  {stageLogs[stage]!.split("/").pop()}
+                </Text>
+              </div>
+            ) : null,
+          )}
         </Card>
       )}
       {returncode != null && returncode !== 0 && (
@@ -761,13 +877,18 @@ export function ParserResultsDialog({
   jobId,
   logDir,
   logFileBasename,
+  logPath,
   initialTabIndex = 0,
 }: ParserResultsDialogProps) {
   const [loading, setLoading] = useState(false);
+  /** Bumped by the Refresh button and by the partial-sweep timer to re-run parser.sh. */
+  const [refreshNonce, setRefreshNonce] = useState(0);
+  const [fetchedAt, setFetchedAt] = useState<Date | null>(null);
   const [error, setError] = useState("");
   const [result, setResult] = useState<ParserResponse | null>(null);
   const [tabIndex, setTabIndex] = useState(0);
   const [chartsTz, setChartsTz] = useState(initChartsTzFromStorage);
+  const [fullRack, setFullRack] = useState(initFullRackFromStorage);
   const [nvloomPath, setNvloomPath] = useState("");
   const [nvloomContent, setNvloomContent] = useState("");
   const [nvloomLoading, setNvloomLoading] = useState(false);
@@ -776,9 +897,13 @@ export function ParserResultsDialog({
   const [clusterkitListLoading, setClusterkitListLoading] = useState(false);
   const [clusterkitListError, setClusterkitListError] = useState("");
 
+  /** Explicit path/basename skips rack resolution — full-rack filter does not apply. */
+  const rackResolveMode = !(logPath ?? "").trim() && !(logFileBasename ?? "").trim();
+
   useEffect(() => {
     if (!open) return;
     setChartsTz(initChartsTzFromStorage());
+    setFullRack(initFullRackFromStorage());
     setTabIndex(Math.min(Math.max(0, initialTabIndex), 10));
   }, [open, initialTabIndex]);
 
@@ -792,21 +917,36 @@ export function ParserResultsDialog({
     }
   };
 
+  const persistFullRack = (checked: boolean) => {
+    setFullRack(checked);
+    try {
+      localStorage.setItem(FULL_RACK_KEY, checked ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  };
+
   useEffect(() => {
     if (!open) return;
     setLoading(true);
     setError("");
     setResult(null);
+    setFetchedAt(null);
 
     const params = new URLSearchParams();
     if (logDir) params.set("log_dir", logDir);
+    const lp = (logPath ?? "").trim();
     const lf = (logFileBasename ?? "").trim();
-    if (lf) {
+    if (lp) {
+      params.set("path", lp);
+      if (rack.trim()) params.set("rack", rack.trim());
+    } else if (lf) {
       params.set("log_file", lf);
       if (rack.trim()) params.set("rack", rack.trim());
     } else {
       if (rack) params.set("rack", rack);
       if (jobId && jobId !== "-") params.set("job_id", jobId);
+      if (fullRack) params.set("full_rack", "1");
     }
     const tzApi = chartsTzForApi(chartsTz);
     if (tzApi) params.set("display_timezone", tzApi);
@@ -817,6 +957,7 @@ export function ParserResultsDialog({
         if (json.ok) {
           const data = normalizeParserPayload(json.data);
           setResult({ ...json, data });
+          setFetchedAt(new Date());
           const nvloomIdx = (data.sn_llama_nemotron?.length ?? 0) > 0 ? 4 : 3;
           setTabIndex((t) => Math.min(t, nvloomIdx));
         } else {
@@ -825,7 +966,19 @@ export function ParserResultsDialog({
       })
       .catch((err: Error) => setError(err.message))
       .finally(() => setLoading(false));
-  }, [open, rack, jobId, logDir, logFileBasename, chartsTz]);
+    // refreshNonce re-runs this effect: parser.sh is re-executed against the log, which is the
+    // only way to pick up rows written since the dialog opened.
+  }, [open, rack, jobId, logDir, logFileBasename, logPath, chartsTz, fullRack, refreshNonce]);
+
+  // While a sweep is still being written, re-parse on a timer so the chart fills in instead of
+  // sitting on a partial read until the operator notices. Stops as soon as it is complete.
+  const partialRows = partialNcclRows(result?.data?.nccl_peak_out_of_place_busbw_gbps);
+  const sweepPartial = partialRows.length > 0;
+  useEffect(() => {
+    if (!open || !sweepPartial || loading) return;
+    const t = setTimeout(() => setRefreshNonce((n) => n + 1), PARTIAL_REPARSE_MS);
+    return () => clearTimeout(t);
+  }, [open, sweepPartial, loading, refreshNonce]);
 
   useEffect(() => {
     if (!open || !(logDir || "").trim() || !rack.trim() || !result) {
@@ -926,6 +1079,10 @@ export function ParserResultsDialog({
     setTabIndex((t) => Math.min(t, maxTabIdx));
   }, [maxTabIdx]);
   const pdisp = String(result?.parser_display_timezone ?? "").trim() || "utc";
+  const displayJobId =
+    (result?.job_id && result.job_id !== "-" ? result.job_id : "") ||
+    (jobId && jobId !== "-" ? jobId : "");
+  const nodesLabel = result?.full_rack_nodes ?? 18;
 
   return (
     <Dialog open={open} onClose={onClose} maxWidth="lg" fullWidth aria-label="Parser results: NCCL and NEMO benchmark charts">
@@ -933,26 +1090,53 @@ export function ParserResultsDialog({
         <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 2, flexWrap: "wrap" }}>
           <span>
             Parser results — {rack}
-            {jobId && jobId !== "-" ? ` (job ${jobId})` : ""}
+            {displayJobId ? ` (job ${displayJobId})` : ""}
+            {result?.full_rack ? ` · full rack (${nodesLabel}N)` : ""}
           </span>
-          <FormControl size="small" sx={{ minWidth: 200 }}>
-            <InputLabel id="parser-charts-tz-label">Charts TZ</InputLabel>
-            <Select
-              labelId="parser-charts-tz-label"
-              label="Charts TZ"
-              value={chartsTz || ""}
-              onChange={(e) => persistChartsTz(String(e.target.value))}
+          <Flex align="center" gap="3" wrap="wrap">
+            <Button
+              kind="secondary"
+              size="small"
               disabled={loading}
+              onClick={() => setRefreshNonce((n) => n + 1)}
             >
-              <MenuItem value="">
-                <em>Server default</em>
-              </MenuItem>
-              <MenuItem value="browser">Browser local (IANA)</MenuItem>
-              <MenuItem value="utc">UTC</MenuItem>
-              <MenuItem value="Europe/Berlin">Europe/Berlin</MenuItem>
-              <MenuItem value="America/Los_Angeles">America/Los_Angeles</MenuItem>
-            </Select>
-          </FormControl>
+              <RefreshCw size={14} style={{ marginRight: 6 }} />
+              {loading ? "Parsing…" : "Refresh"}
+            </Button>
+            {fetchedAt && (
+              <Text kind="body/regular/sm" style={{ color: "var(--text-color-subtle)" }}>
+                {`parsed ${fetchedAt.toLocaleTimeString()}`}
+              </Text>
+            )}
+            {rackResolveMode && (
+              <Checkbox
+                checked={fullRack}
+                disabled={loading}
+                onCheckedChange={(v) => persistFullRack(v === true)}
+                slotLabel={
+                  <Text kind="body/regular/sm">Full rack validation ({nodesLabel}N)</Text>
+                }
+              />
+            )}
+            <FormControl size="small" sx={{ minWidth: 200 }}>
+              <InputLabel id="parser-charts-tz-label">Charts TZ</InputLabel>
+              <Select
+                labelId="parser-charts-tz-label"
+                label="Charts TZ"
+                value={chartsTz || ""}
+                onChange={(e) => persistChartsTz(String(e.target.value))}
+                disabled={loading}
+              >
+                <MenuItem value="">
+                  <em>Server default</em>
+                </MenuItem>
+                <MenuItem value="browser">Browser local (IANA)</MenuItem>
+                <MenuItem value="utc">UTC</MenuItem>
+                <MenuItem value="Europe/Berlin">Europe/Berlin</MenuItem>
+                <MenuItem value="America/Los_Angeles">America/Los_Angeles</MenuItem>
+              </Select>
+            </FormControl>
+          </Flex>
         </Box>
       </DialogTitle>
       <DialogContent dividers sx={{ minWidth: 0, boxSizing: "border-box" }}>
@@ -964,6 +1148,26 @@ export function ParserResultsDialog({
         {error && (
           <div style={{ marginBottom: 16 }}>
             <Banner status="error">{error}</Banner>
+          </div>
+        )}
+        {/* A sweep still being written parses to a truncated series: one data row gives a
+            one-point chart whose "peak" is whatever size happened to be flushed. Say so, rather
+            than presenting a partial read as this rack's result. Re-parses automatically. */}
+        {sweepPartial && (
+          <div style={{ marginBottom: 16 }}>
+            <Banner status="warning">
+              {(() => {
+                const r = partialRows[0];
+                const done = r?.sweep_blocks_concluded ?? 0;
+                const started = r?.sweep_blocks_started ?? 0;
+                const pts = r?.all_reduce_busbw_series?.length ?? 0;
+                return (
+                  `This sweep is still running — ${done} of ${started} block(s) finished, so the ` +
+                  `${pts} point(s) below are a partial read and the peak is not the rack's result. ` +
+                  `Re-checking every ${Math.round(PARTIAL_REPARSE_MS / 1000)}s; or press Refresh.`
+                );
+              })()}
+            </Banner>
           </div>
         )}
         {result && !loading && (
@@ -985,6 +1189,7 @@ export function ParserResultsDialog({
                 data={result.data}
                 rack={result.rack}
                 logFile={result.log_file}
+                stageLogs={result.stage_logs}
                 commandDisplay={result.command_display}
                 returncode={result.returncode}
                 stderr={result.stderr}
@@ -994,6 +1199,7 @@ export function ParserResultsDialog({
             {effectiveTab === 2 && (
               <NemoReviewSection
                 rows={nemoRows}
+                rack={rack}
                 grafanaEmbed={result.grafana_embed}
                 grafanaUri={result.grafana_uri}
                 grafanaPort={result.grafana_port}

@@ -22,11 +22,13 @@ import {
   Users,
   Terminal,
 } from "lucide-react";
+import { ConnectionStatusIndicator } from "./ConnectionStatusIndicator";
 import { SqueueDialog } from "./SqueueDialog";
 import { SinfoDialog } from "./SinfoDialog";
 import WebTerminalDialog from "./rack/WebTerminalDialog";
 import { useAuth } from "../context/AuthContext";
 import { useRackLocksContext } from "../context/RackLocksContext";
+import { ProjectSwitcher } from "./ProjectSwitcher";
 
 interface ToolbarProps {
   title: string;
@@ -38,6 +40,15 @@ interface ToolbarProps {
   onMenuToggle: () => void;
   activeUsers?: number;
   logDir?: string;
+  /** Called after the active project/cluster is switched (refresh dashboards). */
+  onClusterSwitched?: () => void;
+  /** UI ↔ backend link state for the connection indicator. */
+  backendConnected?: boolean;
+  /** Backend ↔ cluster (SSH) link state for the connection indicator. */
+  clusterReachable?: boolean;
+  execMode?: "ssh" | "local";
+  lastUpdated?: number | null;
+  onReconnect?: () => void;
 }
 
 export function Toolbar({
@@ -50,6 +61,12 @@ export function Toolbar({
   onMenuToggle,
   activeUsers,
   logDir,
+  onClusterSwitched,
+  backendConnected = true,
+  clusterReachable = true,
+  execMode = "ssh",
+  lastUpdated = null,
+  onReconnect,
 }: ToolbarProps) {
   const { user, logout } = useAuth();
   const [squeueOpen, setSqueueOpen] = useState(false);
@@ -155,9 +172,13 @@ export function Toolbar({
             </Tooltip>
           )}
 
-          <Text kind="body/bold/md" style={{ flexGrow: 1 }}>
-            {title}
-          </Text>
+          <Text kind="body/bold/md">{title}</Text>
+
+          <Box sx={{ flexGrow: 1, display: "flex", alignItems: "center", ml: 2 }}>
+            <Box sx={{ width: "33%", minWidth: 220 }}>
+              <ProjectSwitcher onSwitched={onClusterSwitched} />
+            </Box>
+          </Box>
 
           <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
             {loading && <CircularProgress size={18} color="primary" sx={{ mr: 1 }} />}
@@ -222,6 +243,14 @@ export function Toolbar({
             </Tooltip>
 
             <Divider orientation="vertical" flexItem sx={{ mx: 0.5 }} />
+
+            <ConnectionStatusIndicator
+              backendConnected={backendConnected}
+              clusterReachable={clusterReachable}
+              execMode={execMode}
+              lastUpdated={lastUpdated}
+              onReconnect={onReconnect}
+            />
 
             {activeUsers != null && activeUsers > 0 && (
               <Tooltip title="Who is doing what">

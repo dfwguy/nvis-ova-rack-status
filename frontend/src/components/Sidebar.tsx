@@ -11,6 +11,7 @@ import IconButton from "@mui/material/IconButton";
 import { Text, VerticalNav, type VerticalNavBaseItem } from "@nvidia/foundations-react-core";
 import { viewIdToPath } from "../routes";
 import { useOptionalHelpPanel } from "../context/HelpPanelContext";
+import { useActiveCluster } from "../context/ActiveClusterContext";
 import {
   LayoutDashboard,
   Layers,
@@ -35,10 +36,14 @@ import {
   Gauge,
   ScrollText,
   Bell,
+  Boxes,
+  FolderKanban,
+  CircuitBoard,
 } from "lucide-react";
 
 export type ViewId =
   | "dashboard"
+  | "nodes"
   | "singleRack"
   | "slurm"
   | "infraEthernet"
@@ -53,6 +58,9 @@ export type ViewId =
   | "tools"
   | "workflows"
   | "terminal"
+  | "projects"
+  | "platformCatalog"
+  | "toolRegistry"
   | "settings";
 
 export const DRAWER_WIDTH_OPEN = 248;
@@ -98,6 +106,7 @@ const navEntries: NavEntry[] = [
     icon: <Cpu size={ICON_SIZE} />,
     leaves: [
       { id: "dashboard", label: "Cluster overview", icon: <LayoutDashboard size={ICON_SIZE} /> },
+      { id: "nodes", label: "Nodes", icon: <CircuitBoard size={ICON_SIZE} /> },
       { id: "singleRack", label: "Racks", icon: <Server size={ICON_SIZE} /> },
       { id: "multirack", label: "Multirack operations", icon: <Layers size={ICON_SIZE} /> },
       { id: "slurm", label: "Scheduler", icon: <CalendarClock size={ICON_SIZE} /> },
@@ -146,6 +155,17 @@ const navEntries: NavEntry[] = [
       { id: "reports", label: "Reports", icon: <FileDown size={ICON_SIZE} /> },
     ],
   },
+  {
+    kind: "group",
+    id: "grp-platform",
+    label: "Platform",
+    icon: <Boxes size={ICON_SIZE} />,
+    leaves: [
+      { id: "projects", label: "Projects & Clusters", icon: <FolderKanban size={ICON_SIZE} /> },
+      { id: "platformCatalog", label: "Platform Catalog", icon: <CircuitBoard size={ICON_SIZE} /> },
+      { id: "toolRegistry", label: "Tool Registry", icon: <Wrench size={ICON_SIZE} /> },
+    ],
+  },
 ];
 
 /** All navigable leaves, flattened (used by the collapsed icon rail). */
@@ -164,8 +184,6 @@ interface SidebarProps {
   onToggle: () => void;
   activeView: ViewId;
   onNavigate: (view: ViewId) => void;
-  /** When set (from server env / overrides), shown top-left instead of "Rack Status". */
-  projectName?: string;
 }
 
 /**
@@ -227,7 +245,7 @@ function ExpandedNav({
       id: entry.id,
       children: entry.label,
       slotIcon: entry.icon,
-      defaultOpen: true,
+      defaultOpen: false,
       subItems: entry.leaves.map((leaf) => navLeafItem(leaf, activeView, onNavigate)),
     };
   });
@@ -402,9 +420,18 @@ function CollapsedRail({
   );
 }
 
-export function Sidebar({ open, onToggle, activeView, onNavigate, projectName }: SidebarProps) {
+export function Sidebar({ open, onToggle, activeView, onNavigate }: SidebarProps) {
   const width = open ? DRAWER_WIDTH_OPEN : DRAWER_WIDTH_CLOSED;
-  const brandLabel = projectName?.trim() ? projectName.trim() : "Rack Status";
+  const { projects, activeProject, activeCluster } = useActiveCluster();
+  // Match ProjectSwitcher: multi-project → "Project / Cluster", else cluster (or project) name.
+  const brandLabel = (() => {
+    const projectName = activeProject?.name?.trim() || "";
+    const clusterName = activeCluster?.name?.trim() || "";
+    if (projectName && clusterName) {
+      return projects.length > 1 ? `${projectName} / ${clusterName}` : clusterName;
+    }
+    return clusterName || projectName || "Rack Status";
+  })();
   const helpPanel = useOptionalHelpPanel();
   const openHelp = () => helpPanel?.openHelp();
 

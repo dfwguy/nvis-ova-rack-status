@@ -49,6 +49,7 @@ when logs are wall-clock local but the server env was UTC).
 """
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
 import io
@@ -63,7 +64,6 @@ import secrets
 import select
 import signal
 import shlex
-import shutil
 import socket
 import statistics
 import struct
@@ -76,14 +76,15 @@ import uuid
 import time
 import warnings
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone, tzinfo
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from flask import (
     Flask,
     Response,
+    g,
     jsonify,
     redirect,
     request,
@@ -109,6 +110,35 @@ if _app_dir_s not in sys.path:
 
 import native_status  # noqa: E402 — after sys.path so ``import native_status`` works when cwd != APP_DIR
 import nvis_id_templates  # noqa: E402
+import cluster_snapshot  # noqa: E402
+import cluster_overview_live  # noqa: E402
+
+# --- optional backend modules (added 2026-07-28) -------------------------------------
+# Both are bind-mounted read-only from the repo (docker-compose.override.yml). A missing
+# mount, a syntax error or an unavailable stdlib feature MUST degrade to the previous
+# behaviour, never stop the app booting mid cluster bring-up — hence the soft import and
+# the ``is None`` guards at every call site (``_history_enabled`` / ``_universal_enabled``).
+try:
+    import results_history  # noqa: E402 — durable run/metric history (SQLite under var/history)
+    import lake_sink  # noqa: E402 — Parquet data-lake sink (run results + provenance artifacts)
+except Exception as _rh_exc:  # pragma: no cover - defensive
+    results_history = None  # type: ignore[assignment]
+    logging.getLogger(__name__).warning("results_history unavailable: %s", _rh_exc)
+try:
+    import universal_parser as _uparse  # noqa: E402 — tool-agnostic log normaliser
+except Exception as _up_exc:  # pragma: no cover - defensive
+    _uparse = None  # type: ignore[assignment]
+    logging.getLogger(__name__).warning("universal_parser unavailable: %s", _up_exc)
+try:
+    import bringup as _bringup  # noqa: E402 — per-node Travis bring-up results
+except Exception as _bu_exc:  # pragma: no cover - defensive
+    _bringup = None  # type: ignore[assignment]
+    logging.getLogger(__name__).warning("bringup unavailable: %s", _bu_exc)
+try:
+    import node_report as _node_report  # noqa: E402 — schema-validated daily node report
+except Exception as _nr_exc:  # pragma: no cover - defensive
+    _node_report = None  # type: ignore[assignment]
+    logging.getLogger(__name__).warning("node_report unavailable: %s", _nr_exc)
 
 
 def _nvis_naming() -> nvis_id_templates.NvisNaming:
@@ -118,9 +148,29 @@ import ai_chat  # noqa: E402
 import help_content  # noqa: E402
 import workflow_engine  # noqa: E402
 import rack_locks  # noqa: E402
+import multirack_jobs  # noqa: E402
+import validation_activities  # noqa: E402
+import nvlink_preflight  # noqa: E402
 import token_vault  # noqa: E402
 import nvftp_cache_sync  # noqa: E402
 from platforms import get_platform as _get_platform  # noqa: E402
+
+# Catalog (platforms/tools/projects). Optional at import time so the app still boots if
+# the store is unavailable; all call sites degrade to the legacy env behavior.
+try:
+    from catalog import context as catalog_context  # noqa: E402
+    from catalog import seed as catalog_seed  # noqa: E402
+    from catalog import store as catalog_store  # noqa: E402
+    from catalog.api import catalog_bp  # noqa: E402
+
+    _CATALOG_AVAILABLE = True
+except Exception as _catalog_exc:  # pragma: no cover - defensive
+    logging.getLogger(__name__).warning("catalog unavailable: %s", _catalog_exc)
+    catalog_context = None  # type: ignore[assignment]
+    catalog_seed = None  # type: ignore[assignment]
+    catalog_store = None  # type: ignore[assignment]
+    catalog_bp = None  # type: ignore[assignment]
+    _CATALOG_AVAILABLE = False
 
 NVFTP_TOKENS_URL = (
     "https://nvftp.nvidia.com/workspace/1099ff0b-621c-490f-a662-c69583ccabad/tokens"
@@ -135,18 +185,69 @@ else:
     DEFAULT_LOG_DIR = REPO_ROOT / "var" / "logs"
 
 DEFAULT_SCRIPT = SCRIPTS_DIR / "rack_status.sh"
+
+
+def _scripts_dir() -> str:
+    """Directory holding ``bin/scripts`` on the host that actually runs them.
+
+    Prefers the ``scripts`` role's declared root, so a deployment can keep the
+    script tree on a different machine from the app (or from the logs). Falls back
+    to the module-level ``SCRIPTS_DIR``, which is the single-host answer derived
+    from ``RACK_REMOTE_BASE_PATH``.
+    """
+    return host_exec.role_root("scripts") or str(SCRIPTS_DIR)
+
+
+def _logs_dir_default() -> str:
+    """Default log root on the host that owns the ``logs`` role."""
+    return host_exec.role_root("logs") or str(DEFAULT_LOG_DIR)
 # Output basename for Tools → 05-download-containers.sh (must match script).
 _TOOLS_NEMO_CONTAINER_SQSH = "nemo-25.11.01.sqsh"
 
 
 def _script_exists(path: Path) -> bool:
-    """Check if a script file exists. In SSH mode, skip the check (file is on the remote host)."""
-    if host_exec.is_remote():
-        return True
-    return path.is_file()
+    """Check whether a script exists on the execution host.
+
+    Previously this returned True unconditionally for a remote target, because the
+    local check could only ever be wrong there. The connection can answer for both.
+    """
+    return host_exec.is_file(path)
 
 app = Flask(__name__, static_folder=str(REPO_ROOT / "static"), static_url_path="/static")
 _logger = logging.getLogger(__name__)
+
+# Gzip/brotli compression for static assets (the ~2.2 MB SPA bundle) and JSON API
+# payloads. The Vite bundle is served as ``text/javascript``, which is not in
+# Flask-Compress's default mimetype list, so set the list explicitly.
+try:
+    from flask_compress import Compress
+
+    # NOTE: deliberately EXCLUDE "text/plain". The live-tool log endpoints stream
+    # ``text/plain`` via a generator; Flask-Compress buffers the ENTIRE response to
+    # gzip it (consuming the generator) before sending, so streamed output only
+    # appears once the command finishes — the root cause of "logs show only at the
+    # end". (X-Accel-Buffering only affects nginx, not Flask-Compress.) The SPA bundle
+    # and JSON payloads — the responses worth compressing — stay compressed.
+    app.config["COMPRESS_MIMETYPES"] = [
+        "text/html",
+        "text/css",
+        "text/xml",
+        "text/javascript",
+        "application/json",
+        "application/javascript",
+        "application/x-javascript",
+        "application/manifest+json",
+        "image/svg+xml",
+    ]
+    app.config["COMPRESS_LEVEL"] = 6
+    app.config["COMPRESS_BR_LEVEL"] = 5
+    app.config["COMPRESS_MIN_SIZE"] = 1024
+    Compress(app)
+except Exception as _compress_exc:  # pragma: no cover - defensive
+    _logger.warning(
+        "flask-compress unavailable; responses will be uncompressed: %s",
+        _compress_exc,
+    )
 
 try:
     from flask_sock import Sock
@@ -154,6 +255,28 @@ try:
 except ImportError:
     _sock = None
     _logger.warning("flask-sock not installed; /ws/terminal will be unavailable")
+
+if _CATALOG_AVAILABLE and catalog_bp is not None:
+    app.register_blueprint(catalog_bp)
+
+# Grafana panel-embed API (/api/observability/dashboards, /dashboards/<view>, /health).
+# Optional by design: a missing bind mount or an unreadable grafana_embed_map.json must
+# not stop the app booting — the SPA renders its own "not wired yet" state instead.
+try:
+    from grafana_embeds import grafana_embeds_bp  # noqa: E402
+
+    app.register_blueprint(grafana_embeds_bp)
+    from metrics_query import metrics_query_bp  # noqa: E402
+    app.register_blueprint(metrics_query_bp)
+
+    @app.route("/api/lake/health")
+    def api_lake_health():  # noqa: ANN202
+        """Is the Parquet lake reachable and accepting run provenance writes?"""
+        if lake_sink is None:
+            return jsonify({"ok": False, "error": "lake_sink not loaded"})
+        return jsonify(lake_sink.health())
+except Exception as _ge_exc:  # pragma: no cover - observability embeds are optional
+    _logger.warning("grafana_embeds blueprint unavailable: %s", _ge_exc)
 
 _validation_jobs_lock = threading.Lock()
 _validation_jobs: dict[str, dict[str, object]] = {}
@@ -179,6 +302,12 @@ _rack_status_cache: dict[str, dict] = {}
 _rack_status_registry: set[str] = set()
 _rack_status_bg_thread_lock = threading.Lock()
 _rack_status_bg_thread: threading.Thread | None = None
+_cluster_snapshot_repo_lock = threading.Lock()
+_cluster_snapshot_repo_cache: tuple[str, cluster_snapshot.SnapshotRepository] | None = None
+_cluster_overview_live_service_lock = threading.Lock()
+_cluster_overview_live_service_cache: (
+    tuple[str, cluster_overview_live.ClusterOverviewLiveService] | None
+) = None
 
 # Dashboard Settings → job / validation env overrides (merged into subprocess env and ``_eget`` reads).
 # ``section`` groups rows in Settings (see ``JOB_ENV_SECTION_ORDER``).
@@ -262,6 +391,48 @@ JOB_ENV_UI_DEFINITIONS: list[dict[str, str]] = [
     },
     {
         "section": "external",
+        "key": "NGC_API_KEY",
+        "label": "NGC API key",
+        "description": "NGC personal API key (nvapi-…) used by Tools → Download NEMO container (enroot import). Saved in server overrides like other settings; restrict file permissions on var/cache/job_env_overrides.json. Forwarded to the cluster when running in SSH mode.",
+    },
+    {
+        "section": "jobs_cluster",
+        "key": "LLMB_INSTALL",
+        "label": "LLMB workspace (LLMB_INSTALL)",
+        "description": "dgxc-benchmarking / Exemplar WORKSPACE directory on the head node (e.g. /home/<user>/workspace/llmb) — the dir llmb-run reads/writes (.cache, workloads, experiments). Forwarded over SSH to run_llmb_nccl.sh (NCCL microbenchmark). Set this to override any stale LLMB_INSTALL inherited from the launching shell.",
+    },
+    {
+        "section": "jobs_cluster",
+        "key": "LLMB_REPO",
+        "label": "LLMB repo (llmb-run binary)",
+        "description": "Optional: dgxc-benchmarking repo dir holding the llmb-run binary (e.g. /home/<user>/workspace/dgxc-benchmarking). Auto-detected as a sibling of LLMB_INSTALL when empty; set only if the repo lives elsewhere.",
+    },
+    {
+        "section": "jobs_cluster",
+        "key": "LLMB_VENV",
+        "label": "LLMB venv (optional)",
+        "description": "Optional: virtualenv activated before llmb-run. Leave empty for uv-managed installs (the workspace's llmb-run symlink resolves the correct venv via its shebang).",
+    },
+    {
+        "section": "jobs_cluster",
+        "key": "RACK_SCRIPT_SUDO",
+        "label": "Run privileged tools with sudo",
+        "description": "Set to 1 to escalate root-requiring node tools (sysinfo, hardware checks, switch/IMEX/BMC) with sudo on the privileged 'script' route. Use when the SSH/login user is unprivileged but has sudo (e.g. cmods with passwordless sudo on the compute trays). Auto-enabled when a sudo password is set.",
+    },
+    {
+        "section": "jobs_cluster",
+        "key": "RACK_SUDO_PASSWORD",
+        "label": "Sudo password (optional)",
+        "description": "Password for sudo -S when the sudoers policy is NOT passwordless. Leave empty for NOPASSWD sudo (uses sudo -n). Stored in server overrides like other settings; restrict file permissions on var/cache/job_env_overrides.json.",
+    },
+    {
+        "section": "jobs_cluster",
+        "key": "RACK_SUDO_PRESERVE_ENV",
+        "label": "Preserve env across sudo (sudo -E)",
+        "description": "Default 1: keep the forwarded platform/site env across the sudo boundary (sudo -E). Set to 0 only if the sudoers policy rejects -E (env_reset without SETENV), in which case tools receive a clean root environment.",
+    },
+    {
+        "section": "external",
         "key": "RACK_WEB_GRAFANA_URI",
         "label": "Grafana base URL",
         "description": "Full origin without trailing slash (e.g. https://grafana.example). Empty uses same host as the app.",
@@ -289,6 +460,30 @@ JOB_ENV_UI_DEFINITIONS: list[dict[str, str]] = [
         "key": "RACK_WEB_GRAFANA_TIMEZONE",
         "label": "Grafana timezone query",
         "description": "browser, utc, or an IANA zone. When empty, the server uses the same zone as RACK_PROMETHEUS_LOG_TIMESTAMP_TZ.",
+    },
+    {
+        "section": "external",
+        "key": "RACK_WEB_GRAFANA_VAR_RACK",
+        "label": "Grafana rack variable",
+        "description": "Template variable name used to scope deep-linked dashboards by rack (default 'Rack' for BCM/NMC dashboards). Sent as var-<name>=<rack id>.",
+    },
+    {
+        "section": "external",
+        "key": "RACK_WEB_GRAFANA_VAR_HOST",
+        "label": "Grafana host variable",
+        "description": "Template variable name used to scope deep-linked dashboards by node/host (default 'hostname' for BCM/NMC dashboards). Sent as var-<name>=<node>.",
+    },
+    {
+        "section": "external",
+        "key": "RACK_WEB_GRAFANA_DEEPLINK_DASHBOARDS",
+        "label": "Grafana deep-link dashboards (JSON)",
+        "description": "JSON list of dashboards to expose as 'Open in Grafana' deep-links, e.g. [{\"id\":\"dcgm\",\"label\":\"GPU / DCGM\",\"uid\":\"...\",\"slug\":\"...\",\"scope\":\"host\"}]. scope = host|rack|cluster. Empty uses the built-in BCM/NMC GB200 catalog (DCGM, power, NVLink, health, Slurm, overview).",
+    },
+    {
+        "section": "external",
+        "key": "RACK_WEB_GRAFANA_DEEPLINK_DISABLED",
+        "label": "Disable Grafana deep-links",
+        "description": "Set to 1 to hide the 'Open in Grafana' deep-link menus in the rack table and parser results.",
     },
     {
         "section": "native_cmsh",
@@ -561,6 +756,65 @@ JOB_ENV_UI_DEFINITIONS: list[dict[str, str]] = [
     },
     {
         "section": "jobs_cluster",
+        "key": "RACK_LLMB_NCCL_SCRIPT",
+        "label": "NCCL Microbenchmark (LLMB) driver script",
+        "description": "Path to run_llmb_nccl.sh (resolves NVIS rack ids to Slurm nodes, then runs llmb-run microbenchmark_nccl).",
+    },
+    {
+        "section": "jobs_cluster",
+        "key": "RACK_LLMB_NCCL_TIMEOUT",
+        "label": "NCCL Microbenchmark (LLMB) timeout (seconds)",
+        "description": "Background job timeout for the LLMB NCCL microbenchmark wrapper (default 14400).",
+    },
+    {
+        "section": "jobs_cluster",
+        "key": "RACK_LLMB_NCCL_RESERVATION",
+        "label": "NCCL Microbenchmark (LLMB) Slurm reservation",
+        "description": "If set, run_llmb_nccl.sh passes --reservation … (omit for none).",
+    },
+    {
+        "section": "jobs_cluster",
+        "key": "RACK_NCCL_MPI_SIZE_MAX",
+        "label": "Multi-rack NCCL max message size",
+        "description": "Max all_reduce message size for the direct x-rack NCCL test (run_nccl_mpi.sh --size-max). Default 16G. Accepts nccl-tests sizes like 8, 512M, 16G.",
+    },
+    {
+        "section": "jobs_cluster",
+        "key": "NVIS_EXEMPLAR_REPO_BRANCH",
+        "label": "Exemplar/llmb repo tag",
+        "description": (
+            "git tag/branch of NVIDIA/dgxc-benchmarking for Tools > Download/Setup Exemplar. Empty "
+            "= the tool's default v25.10.01, whose nccl recipe supports gb200/b200/h100 only. "
+            "v26.06.00 adds native gb300 and b300 blocks (verified upstream 2026-07-28), which is "
+            "what a GB300 NVL72 needs. The tool's form has no field for this."
+        ),
+    },
+    {
+        "section": "jobs_cluster",
+        "key": "NVIS_EXEMPLAR_WORKLOADS",
+        "label": "Exemplar/llmb workloads to install",
+        "description": (
+            "Comma-separated llmb workloads for Tools > Download/Setup Exemplar. Empty = the stock "
+            "default 'microbenchmark_nccl,pretrain_nemotron-h'. Set to 'microbenchmark_nccl' to "
+            "install ONLY the NCCL microbenchmark and skip the NeMo container download, which is "
+            "what makes the install action take hours. Add pretrain workloads later when needed."
+        ),
+    },
+    {
+        "section": "jobs_cluster",
+        "key": "NVIS_NCCL_VERSION",
+        "label": "NCCL version (build + run)",
+        "description": (
+            "Selects the NCCL used by BOTH the workspace build and the NCCL test run. "
+            "'system' (or 2.28.9) builds/loads <workspace>/nccl/build/lib; any other X.Y.Z uses "
+            "<workspace>/nccl-X.Y.Z/nccl/build/lib. The Tools > CUDA/NCCL installer checks out tag "
+            "v<X.Y.Z>-1 and fails loudly listing real tags if it does not exist. Build the version "
+            "you intend to run: selecting a version with no build on disk makes every NCCL job exit 2 "
+            "with 'libnccl.so.2 not found'."
+        ),
+    },
+    {
+        "section": "jobs_cluster",
         "key": "NVIS_SLURM_HOSTLIST",
         "label": "Slurm sbatch -w override (comma-separated)",
         "description": "Optional. If set, run_clusterkit.sh / run_nvloom_singlerack.sh / run_mnubergemm_stress.sh use this exact NodeName list for sbatch -w instead of expanding the validation target. Use when Slurm NodeNames differ from NVIS hostnames (FQDN, prefix, or casing). Leave empty to auto-expand via scontrol.",
@@ -714,6 +968,15 @@ def _materialize_job_env_overrides_into_os_environ(ov: dict[str, str]) -> None:
                 os.environ[k] = base
             else:
                 os.environ.pop(k, None)
+    # This strips Settings-managed keys not present in the overrides; re-apply the active
+    # catalog overlay so platform/cluster-derived values (e.g. RACK_VALIDATION_CT_RANGE)
+    # survive. Only runs on cache-miss materialization, so this is infrequent.
+    _apply = globals().get("_apply_catalog_active_to_environ")
+    if callable(_apply):
+        try:
+            _apply()
+        except Exception:
+            pass
 
 
 def _job_env_status_payload_needs_rebuild(before: dict[str, str], after: dict[str, str]) -> bool:
@@ -766,6 +1029,8 @@ _TOOL_EXCLUSIVE_LOCK_FILES: dict[str, str] = {
     "install_hpcx_workspace": "tools_install_hpcx_workspace.flock",
     "install_cuda_nccl_workspace": "tools_install_cuda_nccl_workspace.flock",
     "install_nvloom_workspace": "tools_install_nvloom_workspace.flock",
+    "install_dgxc_benchmarking_workspace": "tools_install_dgxc_benchmarking_workspace.flock",
+    "install_dcgm_workspace": "tools_install_dcgm_workspace.flock",
     "launch_grafana_bright_prometheus": "tools_launch_grafana_bright_prometheus.flock",
 }
 
@@ -781,6 +1046,12 @@ _TOOL_EXCLUSIVE_LOCK_BUSY_MSG: dict[str, str] = {
     ),
     "install_nvloom_workspace": (
         "Another session is already running the nvloom workspace install. Wait for it to finish."
+    ),
+    "install_dgxc_benchmarking_workspace": (
+        "Another session is already running the Exemplar (dgxc-benchmarking) setup. Wait for it to finish."
+    ),
+    "install_dcgm_workspace": (
+        "Another session is already running the DCGM / DCGMI workspace install. Wait for it to finish."
     ),
     "launch_grafana_bright_prometheus": (
         "Another session is already running the Grafana + Prometheus launch script. Wait for it to finish."
@@ -914,9 +1185,20 @@ def _job_env_overrides_write(data: dict[str, str], *, bust_status_cache: bool = 
             f.write("\n")
         os.replace(tmp, p)
         _job_env_overrides_invalidate_cache()
-        _materialize_job_env_overrides_into_os_environ(clean)
+    # Materialize into os.environ *after* releasing the exclusive lock. Materialization
+    # calls _apply_catalog_active_to_environ() -> _job_env_overrides_load(), which acquires a
+    # *shared* lock on this same file via a new fd; doing that while still holding the
+    # exclusive lock above deadlocks (flock locks are per-open-file-description, so the
+    # shared request blocks against our own exclusive lock).
+    _materialize_job_env_overrides_into_os_environ(clean)
     try:
         native_status.invalidate_job_env_file_cache()
+    except Exception:
+        pass
+    # Rebuild the transport connection so transport-affecting settings (e.g.
+    # RACK_SCRIPT_SUDO / RACK_SUDO_PASSWORD) take effect without an app restart.
+    try:
+        host_exec.invalidate_connection()
     except Exception:
         pass
     if bust_status_cache:
@@ -925,11 +1207,45 @@ def _job_env_overrides_write(data: dict[str, str], *, bust_status_cache: bool = 
 
 
 def _eget(name: str, default: str | None = None) -> str | None:
-    """Environment getter with dashboard Settings overrides (job, validation, and dashboard keys)."""
+    """Environment getter with catalog + dashboard Settings overrides.
+
+    Precedence (highest first): active cluster identity/naming/connection (catalog
+    ``high`` overlay) > dashboard Settings overrides (``job_env_overrides.json``) >
+    process env > platform geometry/tool defaults (catalog ``low`` overlay) > *default*.
+    """
+    high: dict[str, str] = {}
+    low: dict[str, str] = {}
+    if _CATALOG_AVAILABLE and catalog_context is not None:
+        try:
+            high, low = catalog_context.overlays_for_active()
+        except Exception:
+            high, low = {}, {}
+    if name in high and high[name].strip():
+        return high[name].strip()
     ov = _job_env_overrides_load()
     if name in ov and ov[name].strip():
         return ov[name].strip()
-    return os.environ.get(name, default)
+    v = os.environ.get(name)
+    if v is not None:
+        return v
+    if name in low and low[name].strip():
+        return low[name].strip()
+    return default
+
+
+def _eget_int(name: str, default: int) -> int:
+    """Like ``_env_int`` but honors catalog overlays + Settings overrides via ``_eget``.
+
+    Used for platform-geometry-derived knobs (CT range count, GPUs/tray, nodes/rack)
+    so the active platform's geometry applies unless explicitly overridden.
+    """
+    raw = _eget(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return int(str(raw).strip(), 10)
+    except ValueError:
+        return default
 
 
 def _subprocess_env(
@@ -937,8 +1253,20 @@ def _subprocess_env(
     *,
     validation_test_if_unset: str = "nccl_all_reduce,llm",
 ) -> dict[str, str]:
-    out = os.environ.copy()
+    high: dict[str, str] = {}
+    low: dict[str, str] = {}
+    if _CATALOG_AVAILABLE and catalog_context is not None:
+        try:
+            high, low = catalog_context.overlays_for_active()
+        except Exception:
+            high, low = {}, {}
+    # Precedence (later wins): low platform defaults < process env < Settings overrides
+    # < active cluster identity < per-call updates.
+    out: dict[str, str] = {}
+    out.update(low)
+    out.update(os.environ)
     out.update(_job_env_overrides_load())
+    out.update(high)
     if updates:
         out.update(updates)
     # validation_test_env.sh treats unset as a very strict suite (all NCCL collectives + LLM), which
@@ -1013,7 +1341,7 @@ def get_physical_rf0_map() -> dict[str, str]:
         _physical_rf0_map = {}
         plat = _get_platform()
         cmd = plat.physical_rf0_cmd()
-        if not host_exec.is_remote() and not shutil.which(cmd[0]):
+        if not host_exec.which(cmd[0]):
             _physical_rf0_loaded = True
             return {}
         try:
@@ -1030,6 +1358,407 @@ def get_physical_rf0_map() -> dict[str, str]:
         return dict(_physical_rf0_map)
 
 
+def _validation_tool_and_stage() -> tuple[str, str]:
+    """Map configured validation script to activity tool + stage."""
+    name = _validation_script_path().name.lower()
+    if "llmb_nemo" in name:
+        return "llmb-nemo-combined", "combined"
+    return "singlerack", "stage2"
+
+
+def _record_validation_activity(
+    tool: str,
+    *,
+    stage: str,
+    scope: str,
+    rack: str,
+    racks: list[str],
+    log_dir: str,
+    command_display: str,
+    activity_id: str,
+    operator: str = "",
+    dry_run: bool = False,
+    scheduler: str = "slurm",
+) -> str:
+    """Persist a validation launch in the durable activities store."""
+    return validation_activities.record_activity(
+        tool,
+        stage=stage,
+        scope=scope,
+        rack=rack,
+        racks=racks,
+        log_dir=log_dir,
+        operator=operator,
+        command_display=command_display,
+        dry_run=dry_run,
+        scheduler=scheduler,
+        activity_id=activity_id,
+    )
+
+
+def _parse_scontrol_job_fields(text: str) -> tuple[str | None, str | None]:
+    """Return (JobState, StdOut path) from ``scontrol show job`` output."""
+    state_m = re.search(r"JobState=(\S+)", text or "")
+    stdout_m = _SLURM_STDOUT_RE.search(text or "")
+    state = state_m.group(1) if state_m else None
+    stdout = stdout_m.group(1) if stdout_m else None
+    if stdout in ("(none)", "/dev/null", ""):
+        stdout = None
+    return state, stdout
+
+
+_SLURM_TERMINAL_JOB_STATES = frozenset(
+    {
+        "COMPLETED",
+        "FAILED",
+        "CANCELLED",
+        "TIMEOUT",
+        "NODE_FAIL",
+        "PREEMPTED",
+        "OUT_OF_MEMORY",
+        "BOOT_FAIL",
+        "DEADLINE",
+    }
+)
+_SLURM_RUNNING_JOB_STATES = frozenset(
+    {"RUNNING", "PENDING", "COMPLETING", "CONFIGURING", "SUSPENDED"}
+)
+
+
+def _slurm_job_state_base(state: str | None) -> str:
+    return str(state or "").strip().upper().split("+")[0]
+
+
+def _task_needs_slurm_hydration(task: dict) -> bool:
+    """True when a task with a Slurm ref still needs ladder refresh."""
+    if not isinstance(task, dict):
+        return False
+    ref = str(task.get("scheduler_ref") or "").strip()
+    if not ref:
+        return False
+    jid = ref.split(".")[0]
+    if not _SLURM_SCANCEL_JOB_ID_RE.fullmatch(jid):
+        return False
+    wp = str(task.get("work_phase") or "").strip().lower()
+    if wp in validation_activities.OPEN_WORK_PHASES or not wp:
+        return True
+    if not str(task.get("stdout_path") or "").strip() and not str(task.get("results_log_path") or "").strip():
+        return True
+    base = _slurm_job_state_base(str(task.get("scheduler_state") or ""))
+    if not base:
+        return True
+    if base in _SLURM_RUNNING_JOB_STATES:
+        return True
+    # Terminal scheduler state but llmb intermediate StdOut with no results yet → keep
+    # collecting, but only until the grace period runs out. Past that the collector is
+    # never going to deliver, and re-querying Slurm forever costs an SSH round trip per poll.
+    stdout = str(task.get("stdout_path") or "")
+    if (
+        "llmb-nccl_" in stdout.replace("\\", "/")
+        and not str(task.get("results_log_path") or "").strip()
+        and not _collecting_grace_expired(task.get("collecting_since"))
+    ):
+        return True
+    return base not in _SLURM_TERMINAL_JOB_STATES
+
+
+def _query_scheduler_state_and_stdout(job_id: str) -> tuple[str | None, str | None, str]:
+    """Return (JobState, StdOut path, evidence) via scontrol, then sacct.
+
+    When both miss (purged), returns ``(None, None, \"missing\")`` — callers must fail-closed
+    rather than freeze a prior RUNNING state.
+    """
+    jid = (job_id or "").strip().split(".")[0]
+    if not jid or not _SLURM_SCANCEL_JOB_ID_RE.fullmatch(jid):
+        return None, None, "invalid"
+    try:
+        sc = _run_scontrol_show_job(jid)
+    except (OSError, ValueError):
+        sc = {"ok": False, "stdout": ""}
+    if sc.get("ok"):
+        state, stdout = _parse_scontrol_job_fields(str(sc.get("stdout") or ""))
+        if state:
+            return state, stdout, "scontrol"
+    # sacct retains history after MinJobAge; StdOut is not available from accounting.
+    try:
+        conf = os.environ.get(
+            "RACK_SLURM_CONF",
+            "/cm/shared-ubuntu2404-x86_64/apps/slurm/etc/slurm/slurm.conf",
+        )
+        sa = host_exec.run_on_host(
+            f"export SLURM_CONF={shlex.quote(conf)}; "
+            f"$(ls -1 /cm/local/apps/slurm/*/bin/sacct /cm/local/apps/slurm/current/bin/sacct "
+            f"2>/dev/null | tail -1) "
+            f"-j {shlex.quote(jid)} -X -P -n -o JobID,State,ExitCode",
+            timeout=max(10, _env_int("RACK_SACCT_TIMEOUT", 30)),
+        )
+        for line in (sa.stdout or "").strip().splitlines():
+            cols = line.split("|")
+            if len(cols) < 2:
+                continue
+            # Prefer the base job line (not .batch / .extern).
+            raw_id = cols[0].strip()
+            if raw_id.split(".")[0] != jid:
+                continue
+            if "." in raw_id and not raw_id.endswith(jid):
+                continue
+            state = cols[1].strip().split()[0] if cols[1].strip() else None
+            if state:
+                return state, None, "sacct"
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return None, None, "missing"
+
+
+def _stdout_is_llmb_intermediate(path: str | None) -> bool:
+    name = Path(str(path or "")).name.lower()
+    return name.startswith("llmb-nccl_") or "llmb-autocollect" in name
+
+
+def _find_results_log_on_exec_host(log_dir: str, job_id: str, label: str) -> str | None:
+    """Aggregated results log for *job_id*, discovered on the EXECUTION host.
+
+    The log directory belongs to the host that runs the jobs, so this lists it
+    through the transport layer (one ``find`` round trip) rather than with a
+    process-local scan. In SSH mode that scan always came back empty, so any task
+    whose results log has to be *discovered* — an llmb launch, whose Slurm StdOut is
+    the intermediate ``llmb-nccl_*.out`` rather than the aggregated file — stayed in
+    ``collecting`` forever even though the collector had written the results.
+    """
+    base = (log_dir or "").strip()
+    jid = (job_id or "").strip()
+    if not base or not jid.isdigit():
+        return None
+    try:
+        found = host_exec.stat_dir(base, patterns=(f"*-{jid}.txt",), maxdepth=1)
+    except Exception:  # noqa: BLE001 — discovery is best-effort; fall through to local
+        found = {}
+    if found:
+        by_name = {PurePosixPath(str(p)).name: str(p) for p in found}
+        picked = validation_activities.pick_results_log(list(by_name), jid, label=label)
+        if picked:
+            return by_name.get(picked)
+    # Same-host deployments (RACK_EXEC_MODE=local) where stat_dir is unavailable.
+    return validation_activities.find_results_log_for_job(base, jid, label=label)
+
+
+def _collecting_grace_expired(collecting_since: str | None) -> bool:
+    """True when a task has waited longer than the collector grace period.
+
+    Without a bound, "terminal in Slurm but no aggregated log yet" is a state with
+    no exit: the UI shows the run as unfinished forever and the refresh loop keeps
+    paying for Slurm round trips. A collector that has not produced anything within
+    the grace period is not going to, so the task resolves on the scheduler's
+    verdict instead. ``RACK_VALIDATION_COLLECT_GRACE_SEC`` (default 900) tunes it.
+    """
+    raw = str(collecting_since or "").strip()
+    if not raw:
+        return False
+    try:
+        started = datetime.fromisoformat(raw)
+    except ValueError:
+        return False
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    grace = max(60, _env_int("RACK_VALIDATION_COLLECT_GRACE_SEC", 900))
+    return (datetime.now(timezone.utc) - started).total_seconds() > grace
+
+
+def _derive_task_work_phase(
+    *,
+    scheduler_state: str | None,
+    evidence: str,
+    stdout_path: str | None,
+    results_log_path: str | None,
+    label: str,
+    collecting_since: str | None = None,
+) -> str:
+    """Map ladder evidence → tasks[].work_phase."""
+    base = _slurm_job_state_base(scheduler_state)
+    if evidence == "squeue" or base in _SLURM_RUNNING_JOB_STATES:
+        return "running"
+    if results_log_path:
+        if base in ("FAILED", "CANCELLED", "NODE_FAIL", "OUT_OF_MEMORY", "BOOT_FAIL"):
+            return "failed"
+        return "done"
+    if base in _SLURM_TERMINAL_JOB_STATES:
+        # Terminal Slurm but aggregated result not bound yet — llmb collector lag.
+        if _stdout_is_llmb_intermediate(stdout_path) or (
+            (label or "").lower() in ("nccl", "nemo") and not results_log_path
+        ):
+            if base in ("FAILED", "CANCELLED", "NODE_FAIL", "OUT_OF_MEMORY", "BOOT_FAIL"):
+                return "failed"
+            # Waited long enough for a collector that never delivered: take the
+            # scheduler's verdict rather than showing the run as unfinished forever.
+            if _collecting_grace_expired(collecting_since):
+                return "done" if base == "COMPLETED" else "failed"
+            return "collecting"
+        if base == "COMPLETED":
+            return "done"
+        return "failed"
+    if evidence == "missing":
+        return "unknown"
+    return "submitted"
+
+
+def _hydrate_activity_task_logs(activity_id: str, rec: dict | None = None) -> None:
+    """Evidence ladder: squeue → scontrol/sacct → result artefacts; fail-closed on purge."""
+    aid = (activity_id or "").strip()
+    if not aid:
+        return
+    if rec is None:
+        rec = validation_activities.get_activity(aid)
+    if not rec:
+        return
+    log_dir = str(rec.get("log_dir") or "")
+    tasks = [t for t in (rec.get("tasks") or []) if isinstance(t, dict)]
+    # Batch squeue lookup for all refs that still need refresh.
+    want_ids = [
+        str(t.get("scheduler_ref") or "").strip().split(".")[0]
+        for t in tasks
+        if _task_needs_slurm_hydration(t)
+    ]
+    running: set[str] = set()
+    job_times: dict[str, str] = {}
+    if want_ids:
+        try:
+            running, job_times = native_status.load_squeue_jobs_map()
+            native_status.augment_running_set_for_job_ids(running, job_times, want_ids)
+        except Exception:  # noqa: BLE001 — hydration is best-effort
+            running, job_times = set(), {}
+
+    for task in tasks:
+        if not _task_needs_slurm_hydration(task):
+            continue
+        ref = str(task.get("scheduler_ref") or "").strip().split(".")[0]
+        label = str(task.get("label") or "validation")
+        stdout_path = str(task.get("stdout_path") or "").strip() or None
+        results_path = str(task.get("results_log_path") or "").strip() or None
+        evidence = "none"
+        state: str | None = None
+
+        if ref in running:
+            state = "RUNNING"
+            evidence = "squeue"
+        else:
+            state, sc_stdout, evidence = _query_scheduler_state_and_stdout(ref)
+            if sc_stdout:
+                stdout_path = sc_stdout
+
+        # Bind aggregated result log when possible (and promote intermediate StdOut).
+        if not results_path:
+            found = _find_results_log_on_exec_host(log_dir, ref, label)
+            if found:
+                results_path = found
+        if stdout_path and not _stdout_is_llmb_intermediate(stdout_path):
+            low = Path(stdout_path).name.lower()
+            if "nccl-1rack" in low or "nemo-1rack" in low:
+                results_path = results_path or stdout_path
+
+        if evidence == "missing" and not results_path:
+            # Fail-closed: do not keep a stale RUNNING after scontrol/sacct purge.
+            prev = _slurm_job_state_base(str(task.get("scheduler_state") or ""))
+            if prev in _SLURM_RUNNING_JOB_STATES or not prev:
+                state = "UNKNOWN"
+            else:
+                state = prev or "UNKNOWN"
+
+        collecting_since = str(task.get("collecting_since") or "").strip() or None
+        work_phase = _derive_task_work_phase(
+            scheduler_state=state,
+            evidence=evidence,
+            stdout_path=stdout_path,
+            results_log_path=results_path,
+            label=label,
+            collecting_since=collecting_since,
+        )
+        # Stamp the clock on entry so the grace period is measured from when the
+        # task first started waiting on a collector, not from the latest refresh.
+        if work_phase == "collecting":
+            collecting_since = collecting_since or datetime.now(timezone.utc).isoformat()
+        else:
+            collecting_since = ""  # empty string clears the stored value
+        task_phase = str(task.get("phase") or "")
+        if work_phase == "running":
+            task_phase = "running"
+        elif work_phase in ("done", "failed"):
+            task_phase = "done" if work_phase == "done" else "error"
+
+        validation_activities.add_or_update_task(
+            aid,
+            ordinal=int(task.get("ordinal") or 1),
+            label=label,
+            task_id=str(task.get("task_id") or ""),
+            scheduler_state=state,
+            stdout_path=stdout_path,
+            results_log_path=results_path,
+            work_phase=work_phase,
+            evidence=evidence,
+            phase=task_phase or None,
+            collecting_since=collecting_since,
+        )
+        task["scheduler_state"] = state
+        if stdout_path is not None:
+            task["stdout_path"] = stdout_path
+        if results_path is not None:
+            task["results_log_path"] = results_path
+        task["work_phase"] = work_phase
+        task["evidence"] = evidence
+        task["collecting_since"] = collecting_since or None
+        if task_phase:
+            task["phase"] = task_phase
+
+    rec["work_phase"] = validation_activities.rollup_work_phase(tasks)
+
+
+def _update_validation_activity(activity_id: str, **kwargs: object) -> None:
+    """Persist activity fields and hydrate Slurm task logs when wrapper stdout carries job ids."""
+    validation_activities.update_activity(activity_id, **kwargs)
+    _hydrate_activity_task_logs(activity_id)
+
+
+def _refresh_validation_activities_lazy(rows: list[dict]) -> None:
+    """Best-effort evidence-ladder refresh for tasks that still need hydration."""
+    if os.environ.get("RACK_VALIDATION_ACTIVITIES_REFRESH_DISABLED", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return
+    for rec in rows:
+        aid = str(rec.get("activity_id") or rec.get("job_id") or "")
+        if not aid:
+            continue
+        tasks = rec.get("tasks") or []
+        if not any(_task_needs_slurm_hydration(t) for t in tasks if isinstance(t, dict)):
+            # Still refresh rollup for legacy rows missing work_phase.
+            if tasks and not rec.get("work_phase"):
+                rec["work_phase"] = validation_activities.rollup_work_phase(
+                    [t for t in tasks if isinstance(t, dict)]
+                )
+            continue
+        _hydrate_activity_task_logs(aid, rec)
+
+
+def _maybe_adopt_validation_log(log_path: Path, log_dir: Path, rack: str) -> None:
+    """Assign an activity_id when an external validation log is first accessed."""
+    if os.environ.get("RACK_VALIDATION_ACTIVITIES_ADOPT_DISABLED", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return
+    try:
+        validation_activities.adopt_log(
+            str(log_path),
+            log_dir=str(log_dir),
+            rack=rack,
+            operator=_operator_from_request() or "external",
+        )
+    except Exception as e:
+        _logger.debug("validation log adopt skipped for %s: %s", log_path, e)
+
+
 def _validation_job_purge_later(job_id: str, delay_sec: int = 900) -> None:
     """Drop finished job metadata after a delay (avoids unbounded memory)."""
 
@@ -1041,21 +1770,43 @@ def _validation_job_purge_later(job_id: str, delay_sec: int = 900) -> None:
     threading.Thread(target=_purge, daemon=True).start()
 
 
-def _validation_worker(job_id: str, cmd: list[str], cwd: str, timeout: int, display_cmd: str) -> None:
-    """Run validation bash in a background thread; update _validation_jobs[job_id]."""
+def _validation_worker(
+    job_id: str,
+    cmd: list[str],
+    cwd: str,
+    timeout: int,
+    display_cmd: str,
+    *,
+    env_updates: dict[str, str] | None = None,
+) -> None:
+    """Run validation bash in a background thread; update _validation_jobs[job_id].
+
+    ``env_updates`` carries per-launch env knobs (NCCL debug + custom vars) from the launch
+    modal; they are merged into the subprocess env and forwarded to the remote over SSH.
+    """
 
     def _patch(**kwargs: object) -> None:
+        finished = None
         with _validation_jobs_lock:
             row = _validation_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+                if str(kwargs.get("phase") or "") in ("done", "error"):
+                    finished = dict(row)
+        _update_validation_activity(job_id, **kwargs)
+        if finished is not None:
+            _lake_push_job(job_id, finished)
 
     try:
         _patch(
             phase="running",
             started_running_at=datetime.now(timezone.utc).isoformat(),
         )
-        hp = host_exec.popen_on_host(cmd, cwd=cwd, env=_subprocess_env())
+        # NeMo/validation launchers run on the privileged "script" target (root@slogin):
+        # they pdsh-rsync the .sqsh into root-owned /raid/data on compute nodes and submit
+        # via sbatch — neither possible as the unprivileged control-plane user on the head.
+        hp = host_exec.popen_on_host(cmd, cwd=cwd, env=_subprocess_env(env_updates),
+                                     profile="script", env_extra=env_updates)
         try:
             out, err = hp.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -1120,21 +1871,30 @@ def _stress_worker(
     *,
     error_label: str = "mnubergemm stress script",
     env_updates: dict[str, str] | None = None,
+    profile: str = "control",
+    persist: bool = False,
 ) -> None:
-    """Run a stress-style bash driver (mnubergemm, nvloom, …) in a background thread; update _stress_jobs[job_id]."""
+    """Run a stress-style bash driver (mnubergemm, nvloom, …) in a background thread; update _stress_jobs[job_id].
+
+    When *persist* is set, phase transitions are also mirrored into the durable
+    ``multirack_jobs`` store so the launch survives restarts / other sessions.
+    """
 
     def _patch(**kwargs: object) -> None:
         with _stress_jobs_lock:
             row = _stress_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+        if persist:
+            _update_validation_activity(job_id, **kwargs)
 
     try:
         _patch(
             phase="running",
             started_running_at=datetime.now(timezone.utc).isoformat(),
         )
-        hp = host_exec.popen_on_host(cmd, cwd=cwd, env=_subprocess_env(env_updates))
+        hp = host_exec.popen_on_host(cmd, cwd=cwd, env=_subprocess_env(env_updates),
+                                     profile=profile, env_extra=env_updates)
         try:
             out, err = hp.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -1190,21 +1950,39 @@ def _xrack_job_purge_later(job_id: str, delay_sec: int = 900) -> None:
     threading.Thread(target=_purge, daemon=True).start()
 
 
-def _xrack_worker(job_id: str, cmd: list[str], cwd: str, timeout: int, display_cmd: str) -> None:
-    """Run run-nemo-xrack.sh in a background thread; update _xrack_jobs[job_id]."""
+def _xrack_worker(
+    job_id: str,
+    cmd: list[str],
+    cwd: str,
+    timeout: int,
+    display_cmd: str,
+    *,
+    env_updates: dict[str, str] | None = None,
+) -> None:
+    """Run run-nemo-xrack.sh in a background thread; update _xrack_jobs[job_id].
+
+    Phase transitions are mirrored into the durable ``multirack_jobs`` store so the launch
+    is visible across sessions / restarts. ``env_updates`` carries per-launch env knobs
+    (NCCL debug + custom vars) from the launch modal, merged into the subprocess env.
+    """
 
     def _patch(**kwargs: object) -> None:
         with _xrack_jobs_lock:
             row = _xrack_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+        _update_validation_activity(job_id, **kwargs)
 
     try:
         _patch(
             phase="running",
             started_running_at=datetime.now(timezone.utc).isoformat(),
         )
-        hp = host_exec.popen_on_host(cmd, cwd=cwd, env=_subprocess_env())
+        # NeMo/validation launchers run on the privileged "script" target (root@slogin):
+        # they pdsh-rsync the .sqsh into root-owned /raid/data on compute nodes and submit
+        # via sbatch — neither possible as the unprivileged control-plane user on the head.
+        hp = host_exec.popen_on_host(cmd, cwd=cwd, env=_subprocess_env(env_updates),
+                                     profile="script", env_extra=env_updates)
         try:
             out, err = hp.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -1268,13 +2046,17 @@ def _llama_worker(job_id: str, cmd: list[str], cwd: str, timeout: int, display_c
             row = _llama_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+        _update_validation_activity(job_id, **kwargs)
 
     try:
         _patch(
             phase="running",
             started_running_at=datetime.now(timezone.utc).isoformat(),
         )
-        hp = host_exec.popen_on_host(cmd, cwd=cwd, env=_subprocess_env())
+        # NeMo/validation launchers run on the privileged "script" target (root@slogin):
+        # they pdsh-rsync the .sqsh into root-owned /raid/data on compute nodes and submit
+        # via sbatch — neither possible as the unprivileged control-plane user on the head.
+        hp = host_exec.popen_on_host(cmd, cwd=cwd, env=_subprocess_env(), profile="script")
         try:
             out, err = hp.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -1338,10 +2120,16 @@ def _power_reset_worker(job_id: str, specs: list[str]) -> None:
     """Run cmsh power cycle in a background thread."""
 
     def _patch(**kwargs: object) -> None:
+        finished = None
         with _reset_jobs_lock:
             row = _reset_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+                # Snapshot inside the lock; push outside it so the lake call never holds the mutex.
+                if str(kwargs.get("phase") or "") in ("done", "error"):
+                    finished = dict(row)
+        if finished is not None:
+            _lake_push_job(job_id, finished)
 
     sleep_sec = max(0, _env_int("RACK_POWER_RESET_SLEEP_SEC", 10))
     try:
@@ -1498,10 +2286,16 @@ def _services_restart_worker(job_id: str, pdsh_w: str) -> None:
     """Run services-restart pdsh in a background thread."""
 
     def _patch(**kwargs: object) -> None:
+        finished = None
         with _reset_jobs_lock:
             row = _reset_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+                # Snapshot inside the lock; push outside it so the lake call never holds the mutex.
+                if str(kwargs.get("phase") or "") in ("done", "error"):
+                    finished = dict(row)
+        if finished is not None:
+            _lake_push_job(job_id, finished)
 
     try:
         _patch(
@@ -1540,10 +2334,16 @@ def _gpu_reset_worker(job_id: str, pdsh_w: str) -> None:
     """Run gpu_reset.sh in a background thread."""
 
     def _patch(**kwargs: object) -> None:
+        finished = None
         with _reset_jobs_lock:
             row = _reset_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+                # Snapshot inside the lock; push outside it so the lake call never holds the mutex.
+                if str(kwargs.get("phase") or "") in ("done", "error"):
+                    finished = dict(row)
+        if finished is not None:
+            _lake_push_job(job_id, finished)
 
     try:
         _patch(
@@ -1781,7 +2581,9 @@ def _auth_mode() -> str:
     explicit = (os.environ.get("RACK_WEB_AUTH_MODE") or "").strip().lower()
     if explicit in ("pam", "token"):
         return explicit
-    return "token" if host_exec.is_remote() else "pam"
+    # PAM authenticates against *this* machine's accounts, so it is only meaningful
+    # when the app runs on the target host; a remote target has no such mapping.
+    return "pam" if host_exec.exec_kind() == "local" else "token"
 
 
 def _auth_token() -> str | None:
@@ -1853,6 +2655,119 @@ def _configure_session(app: Flask) -> None:
 
 
 _configure_session(app)
+
+
+# Keys we materialized into os.environ from the catalog, with their pre-existing value
+# (or None if absent) so a project switch can restore the baseline before re-applying.
+_catalog_env_saved: dict[str, str | None] = {}
+_catalog_status_context_fingerprint: str | None = None
+
+
+def _catalog_restore_environ_baseline() -> None:
+    for key, orig in list(_catalog_env_saved.items()):
+        if orig is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = orig
+    _catalog_env_saved.clear()
+
+
+def _catalog_set_environ(key: str, val: str) -> None:
+    if key not in _catalog_env_saved:
+        _catalog_env_saved[key] = os.environ.get(key)
+    os.environ[key] = val
+
+
+def _apply_catalog_active_to_environ() -> None:
+    """Materialize the active cluster's overlay into ``os.environ``.
+
+    ``_eget``/``_subprocess_env`` already consult the catalog overlays, but several
+    modules read ``os.environ`` directly (``nvis_id_templates``, ``host_exec`` SSH
+    forwarding, ``native_status``, workflow steps). Pushing the overlay into
+    ``os.environ`` keeps them consistent. The previous materialization is restored
+    first so switching projects never leaves stale values behind.
+
+    Precedence preserved: the *high* overlay (cluster identity/naming/connection) wins
+    and is always written; the *low* overlay (platform geometry/tool defaults) only
+    fills keys that have no explicit env/Settings value.
+    """
+    global _catalog_status_context_fingerprint
+    if not (_CATALOG_AVAILABLE and catalog_context is not None):
+        return
+    try:
+        _catalog_restore_environ_baseline()
+        high, low = catalog_context.overlays_for_active()
+        active = catalog_context.get_active()
+        fingerprint = json.dumps(
+            {
+                "active": active,
+                "status_high": {k: high.get(k, "") for k in sorted(_STATUS_ROW_ENV_KEYS)},
+                "status_low": {k: low.get(k, "") for k in sorted(_STATUS_ROW_ENV_KEYS)},
+                "connection": {
+                    k: high.get(k, "")
+                    for k in (
+                        "RACK_EXEC_MODE",
+                        "RACK_PLATFORM",
+                        "RACK_REMOTE_BASE_PATH",
+                        "RACK_SSH_HOST",
+                        "RACK_SSH_USER",
+                    )
+                },
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for key, val in high.items():
+            if val and val.strip():
+                _catalog_set_environ(key, val.strip())
+        ov = _job_env_overrides_load()
+        for key, val in low.items():
+            if not val or not val.strip():
+                continue
+            if (os.environ.get(key) or "").strip():
+                continue
+            if (ov.get(key) or "").strip():
+                continue
+            _catalog_set_environ(key, val.strip())
+        # Reset naming/status caches so the new cluster's templates are picked up.
+        try:
+            nvis_id_templates.clear_nvis_naming_cache()
+        except Exception:
+            pass
+        try:
+            native_status.invalidate_job_env_file_cache()
+        except Exception:
+            pass
+        if (
+            _catalog_status_context_fingerprint is not None
+            and fingerprint != _catalog_status_context_fingerprint
+        ):
+            _rack_status_cache_clear_all()
+        _catalog_status_context_fingerprint = fingerprint
+    except Exception:
+        _logger.exception("catalog: applying active context to environ failed")
+
+
+def _bootstrap_catalog_at_startup() -> None:
+    """Seed/migrate the catalog and apply the active project/cluster to the environment."""
+    if not (_CATALOG_AVAILABLE and catalog_seed is not None and catalog_store is not None):
+        return
+    try:
+        repo = catalog_store.get_repo()
+        summary = catalog_seed.migrate(repo)
+        if summary.get("platforms_added") or summary.get("tools_added") or summary.get(
+            "default_project_created"
+        ):
+            _logger.info("catalog seeded: %s", summary)
+        # Re-materialize on any later catalog change (active switch or doc edits).
+        catalog_context.add_change_hook(_apply_catalog_active_to_environ)
+        # The cluster document also carries the connection topology, so a catalog
+        # change can move where commands run. Drop the composed transport with it,
+        # or the app keeps talking to the previous cluster's hosts.
+        catalog_context.add_change_hook(host_exec.invalidate_connection)
+        _apply_catalog_active_to_environ()
+    except Exception:
+        _logger.exception("catalog bootstrap failed; continuing with legacy env behavior")
 
 
 def _bootstrap_nvftp_sync_at_startup() -> None:
@@ -1998,12 +2913,12 @@ def _api_json_no_store(response):
 
 def _script_path() -> Path:
     p = _eget("RACK_STATUS_SCRIPT", str(DEFAULT_SCRIPT)) or str(DEFAULT_SCRIPT)
-    return _resolve_path(Path(p))
+    return _rpath(Path(p))
 
 
 def _parser_path() -> Path:
     p = _eget("RACK_PARSER_SCRIPT", str(SCRIPTS_DIR / "parser.sh")) or str(SCRIPTS_DIR / "parser.sh")
-    return _resolve_path(Path(p))
+    return _rpath(Path(p))
 
 
 def _parser_extra_args() -> list[str]:
@@ -2021,47 +2936,25 @@ def _parser_export_glob() -> str:
     return raw
 
 
+# Log-basename classification lives in nvis_id_templates so this module, native_status and
+# the shell probes cannot drift apart on which table a log belongs to. These wrappers exist
+# only to bind the caller's NvisNaming instance; keep them free of logic.
+
+
 def _nemo_nccl_in_log_basename(name: str) -> bool:
-    """Logs with NEMO or NCCL in the basename (multirack tab, exports, legacy shell table)."""
-    low = name.lower()
-    if "nemo" in low or "nccl" in low:
-        return True
-    return _nvis_naming().auxiliary_single_rack_log_basename(name)
+    return nvis_id_templates.nemo_nccl_in_log_basename(name, _nvis_naming())
 
 
 def _nemo_single_rack_log_basename(name: str) -> bool:
-    """Single-rack NEMO validation logs for the dashboard table / Open Log (not NCCL-only sweeps)."""
-    low = name.lower()
-    if "nemo" in low:
-        return True
-    return _nvis_naming().auxiliary_single_rack_log_basename(name)
-
-
-_MULTIRACK_N_RACK_RE = re.compile(r"(?:[2-9]|[1-9]\d{1,3})rack", re.IGNORECASE)
+    return nvis_id_templates.nemo_single_rack_log_basename(name, _nvis_naming())
 
 
 def _jobid_from_nemo_log_basename(name: str) -> str | None:
-    """Slurm job id from NEMO/NCCL/LLAMA log basenames (aligned with ``rack_status.sh`` ``jobid_from_fname``)."""
-    m = re.search(r"NEMO-LLAMA3_8B-1N-.+-(\d+)\.txt$", name, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    m2 = re.search(r"N-(\d+)\.txt$", name, re.IGNORECASE)
-    return m2.group(1) if m2 else None
+    return nvis_id_templates.job_id_from_log_basename(name)
 
 
 def _is_multirack_log_basename(name: str) -> bool:
-    """True for multi-rack NEMO/NCCL logs (excluded from rack_status single-rack table; listed in multirack tab)."""
-    if not _nemo_nccl_in_log_basename(name):
-        return False
-    if _MULTIRACK_N_RACK_RE.search(name):
-        return True
-    low = name.lower()
-    # run-nemo-xrack.sh: root-NEMO-p5-r[…]-ct[…],p5-r[…]-ct[…]-<n>N-<jid>.txt
-    if (low.startswith("root-nemo-") or low.startswith("root-nccl-")) and _nvis_naming().multirack_comma_after_rack_re().search(
-        low
-    ):
-        return True
-    return len(_nvis_naming().find_rack_ids_in_string(name)) >= 2
+    return nvis_id_templates.is_multirack_log_basename(name, _nvis_naming())
 
 
 def _multirack_site_prefix() -> str:
@@ -2096,14 +2989,7 @@ def _expand_r_inner_to_rack_nums(inner: str) -> list[int]:
 
 
 def _multirack_node_count_suffix(name: str) -> str:
-    """Return `` (36N)`` when basename contains ``-36N-`` / ``-36N.`` style node count."""
-    m = re.search(r"-(\d+)N-\d", name, re.IGNORECASE)
-    if m:
-        return f" ({m.group(1)}N)"
-    m2 = re.search(r"-(\d+)N\.txt$", name, re.IGNORECASE)
-    if m2:
-        return f" ({m2.group(1)}N)"
-    return ""
+    return nvis_id_templates.node_count_suffix_from_basename(name)
 
 
 def multirack_display_rack_from_basename(name: str) -> str:
@@ -2161,16 +3047,17 @@ def _resolve_nemo_log_basename_in_dir(log_dir: Path, basename: str) -> Path | No
         return None
     if not _nemo_nccl_in_log_basename(bn):
         return None
-    root = log_dir.resolve()
+    # The log dir belongs to the execution host, so existence is asked of the
+    # connection. Doing it locally used to make every lookup on a remote target
+    # return "log file not found" for files that plainly existed.
+    root = _rpath(log_dir)
     for sub in (root, root / "failed", root / "sn-llama"):
-        if not sub.is_dir():
-            continue
-        cand = (sub / bn).resolve()
+        cand = _rpath(sub / bn)
         try:
             cand.relative_to(root)
         except ValueError:
             continue
-        if cand.is_file():
+        if host_exec.is_file(cand):
             return cand
     return None
 
@@ -2186,32 +3073,35 @@ def _rack_id_from_log_basename(name: str) -> str | None:
 
 
 def _nemo_log_file_looks_successful(path: Path) -> bool:
-    """Match parser.sh llm_label: exclude Slurm hard-fail; require LLM step markers (OK path)."""
-    grep_exe = shutil.which("grep")
-    if not grep_exe:
-        return True
-    lp = str(path.resolve())
+    """Match parser.sh llm_label: exclude Slurm hard-fail; require a completed-run marker (OK path).
+
+    Accepts either a NEMO training run (``train_step_timing`` / ``MODEL_TFLOP/s/GPU``) or a completed
+    NCCL sweep (``Avg bus bandwidth`` is printed by ``all_reduce_perf`` only after every message size
+    finishes) so multi-rack NCCL logs (``nccl-mpi_*.out`` / ``llmb-nccl_*.out``) surface in the
+    Multirack analytics. An aborted NCCL run never reaches the ``Avg bus bandwidth`` line, so it's
+    still excluded.
+
+    Host-aware: runs ``grep`` through ``host_exec`` so it works whether the log is on the local fs
+    (app on the head node) or on a remote head (app on a laptop over SSH). A remote path is passed
+    verbatim (no local ``.resolve()``, which would break on a ``PurePosixPath``).
+    """
+    lp = str(_rpath(path))
     timeout = max(30, _env_int("RACK_EXPORT_SUCCESS_GREP_TIMEOUT", 180))
     try:
-        fail = subprocess.run(
-            [grep_exe, "-E", "-q", r"srun:.*error:.*Exited|error:.*SIGNAL", lp],
-            capture_output=True,
-            timeout=timeout,
+        fail = host_exec.run_on_host(
+            ["grep", "-E", "-q", r"srun:.*error:.*Exited|error:.*SIGNAL", lp], timeout=timeout
         )
-        if fail.returncode == 0:
+        if getattr(fail, "returncode", 1) == 0:
             return False
-        ok = subprocess.run(
+        ok = host_exec.run_on_host(
             [
-                grep_exe,
-                "-E",
-                "-q",
-                r"train_step_timing.*consumed_samples|Step Time.*MODEL_TFLOP/s/GPU",
+                "grep", "-E", "-q",
+                r"train_step_timing.*consumed_samples|Step Time.*MODEL_TFLOP/s/GPU|Avg bus bandwidth",
                 lp,
             ],
-            capture_output=True,
             timeout=timeout,
         )
-        return ok.returncode == 0
+        return getattr(ok, "returncode", 1) == 0
     except (subprocess.TimeoutExpired, OSError):
         return False
 
@@ -2222,14 +3112,14 @@ def _multirack_txt_paths_under_failed(log_dir: Path, pat: str) -> list[Path]:
     Multirack jobs often write logs only under ``failed/``; include them in Excel/zip export so
     parser results match the Multirack tab.
     """
-    root = log_dir.resolve()
-    failed = root / "failed"
-    if not failed.is_dir():
-        return []
+    failed = _rpath(log_dir) / "failed"
     out: list[Path] = []
-    for p in failed.glob(pat):
-        if p.is_file() and _nemo_nccl_in_log_basename(p.name) and _is_multirack_log_basename(p.name):
-            out.append(p)
+    # One listing through the connection: the directory lives on the execution
+    # host, and stat_dir already returns regular files only (absent dir -> {}).
+    for path_s in host_exec.stat_dir(failed, patterns=(pat,)):
+        p = PurePosixPath(path_s)
+        if _nemo_nccl_in_log_basename(p.name) and _is_multirack_log_basename(p.name):
+            out.append(p)  # type: ignore[arg-type]
     return out
 
 
@@ -2248,12 +3138,16 @@ def list_log_txt_paths_for_export(
     passes false so nothing under ``failed/`` is included.
     """
     pat = _parser_export_glob()
-    root = log_dir.resolve()
     root_files: list[Path] = []
-    if root.is_dir():
-        for p in root.glob(pat):
-            if p.is_file() and _nemo_nccl_in_log_basename(p.name):
-                root_files.append(p)
+    # One directory listing through the connection. Listing locally used to yield
+    # ZERO files against a remote log dir, which is why the Logs page reported
+    # "1 of 1" while 13 real logs sat in the directory.
+    root = _rpath(log_dir)
+    root_stats = host_exec.stat_dir(root, patterns=(pat,))
+    for path_s in root_stats:
+        name = PurePosixPath(path_s).name
+        if name and _nemo_nccl_in_log_basename(name):
+            root_files.append(PurePosixPath(path_s))  # type: ignore[arg-type]
 
     done_racks: frozenset[str] | None = None
     if not _truthy_env("RACK_LOG_EXPORT_SKIP_NEMO_DONE_FILTER"):
@@ -2275,10 +3169,9 @@ def list_log_txt_paths_for_export(
         successful = [p for p in paths if _nemo_log_file_looks_successful(p)]
         if not successful:
             continue
-        try:
-            best = max(successful, key=lambda x: x.stat().st_mtime)
-        except OSError:
-            continue
+        # mtimes come from the listing above; the files are on the execution host,
+        # so p.stat() would be a local call against a path that is not local.
+        best = max(successful, key=lambda x: root_stats[str(x)].mtime)
         selected_rack.append(best)
 
     tail_failed = (
@@ -2286,7 +3179,9 @@ def list_log_txt_paths_for_export(
     )
     merged: dict[str, Path] = {}
     for p in others + selected_rack + tail_failed:
-        merged[str(p.resolve())] = p
+        # Already absolute and normalised by _rpath/stat_dir, so dedupe on the
+        # string; .resolve() is a local-filesystem call and these are exec-host paths.
+        merged[str(p)] = p
     out = sorted(merged.values(), key=lambda p: p.name.lower())
     return out
 
@@ -2300,26 +3195,28 @@ def find_log_paths_for_rack(log_dir: Path, rack: str) -> list[Path]:
     """
     rk = _normalize_rack_id(rack)
     naming = _nvis_naming()
-    out: list[Path] = []
+    # Route log discovery through host_exec (SSH when remote, local when on-node) so parser-results
+    # works whether the app runs on a laptop (SSH) or on the head node — same abstraction as scripts.
+    base_root = str(native_status._host_resolve(log_dir)).rstrip("/")
     seen: set[str] = set()
-    for base in (log_dir, log_dir / "failed"):
-        if not base.is_dir():
-            continue
-        for p in sorted(base.glob("*.txt"), key=lambda x: x.name.lower()):
-            if not p.is_file() or not _nemo_single_rack_log_basename(p.name):
+    scored: list[tuple[float, Path]] = []
+    for base in (base_root, base_root + "/failed"):
+        for path, mtime_ns, _size in native_status._host_log_entries(base):
+            name = os.path.basename(path)
+            if not _nemo_single_rack_log_basename(name):
                 continue
-            if naming.is_llama_slurm_stdout_basename(p.name):
+            if naming.is_llama_slurm_stdout_basename(name):
                 continue
-            if _is_multirack_log_basename(p.name):
+            if _is_multirack_log_basename(name):
                 continue
-            if naming.rack_id_from_log_basename(p.name) != rk:
+            if naming.rack_id_from_log_basename(name) != rk:
                 continue
-            key = str(p.resolve())
-            if key not in seen:
-                seen.add(key)
-                out.append(p)
-    out.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return out
+            if path in seen:
+                continue
+            seen.add(path)
+            scored.append((mtime_ns / 1_000_000_000, native_status._host_path(path)))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [p for _m, p in scored]
 
 
 def find_nvloom_log_paths_for_rack(log_dir: Path, rack: str) -> list[Path]:
@@ -2329,28 +3226,237 @@ def find_nvloom_log_paths_for_rack(log_dir: Path, rack: str) -> list[Path]:
     except ValueError:
         return []
     pat = f"*NVLOOM-{rk}-*.txt"
-    out: list[Path] = []
-    for base in (log_dir / "nvloom", log_dir / "nvloom" / "failed"):
-        if base.is_dir():
-            out.extend(p for p in base.glob(pat) if p.is_file())
-    out.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return out
+    root = _rpath(log_dir)
+    # mtime comes back with the listing, so ordering costs no extra round trip.
+    scored: list[tuple[float, Path]] = []
+    for base in (root / "nvloom", root / "nvloom" / "failed"):
+        for path_s, st in host_exec.stat_dir(base, patterns=(pat,)).items():
+            scored.append((st.mtime, PurePosixPath(path_s)))  # type: ignore[arg-type]
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [p for _m, p in scored]
 
 
 _NVLOOM_HEATMAPS_LOG_MAX_BYTES = 40 * 1024 * 1024
 
 
-def pick_log_for_rack(log_dir: Path, rack: str, job_id: str | None) -> Path | None:
+_FULL_RACK_NODES_RE = re.compile(r"-(\d+)N-", re.IGNORECASE)
+
+
+def _node_count_from_log_basename(name: str) -> int | None:
+    """Slurm node count from ``…-<N>N-<jobid>.txt`` (e.g. ``18`` from ``…-18N-75270.txt``)."""
+    m = _FULL_RACK_NODES_RE.search(name or "")
+    if not m:
+        return None
+    try:
+        return int(m.group(1), 10)
+    except ValueError:
+        return None
+
+
+def _full_rack_expected_nodes() -> int:
+    """Expected full-rack Slurm node count for parser ``full_rack`` filtering (default 18 / NVL72)."""
+    raw = (_eget("RACK_FULL_RACK_NODES") or "").strip()
+    if raw.isdigit():
+        n = int(raw, 10)
+        if n > 0:
+            return n
+    return 18
+
+
+def pick_log_for_rack(
+    log_dir: Path,
+    rack: str,
+    job_id: str | None,
+    *,
+    full_rack: bool = False,
+    full_rack_nodes: int | None = None,
+) -> Path | None:
+    """Pick a single-rack validation log for *rack*.
+
+    Default: newest matching log (by mtime); if *job_id* is set, prefer that job's file.
+
+    When *full_rack* is true, only consider logs whose basename encodes the full-rack
+    node count (``-18N-`` by default / ``RACK_FULL_RACK_NODES``). A row job_id that
+    points at a partial run (e.g. ``-1N-``) is ignored so the dialog can still surface
+    the latest full-rack acceptance log.
+    """
     cands = find_log_paths_for_rack(log_dir, rack)
     if not cands:
         return None
+    if full_rack:
+        need = int(full_rack_nodes) if full_rack_nodes and full_rack_nodes > 0 else _full_rack_expected_nodes()
+        cands = [p for p in cands if _node_count_from_log_basename(p.name) == need]
+        if not cands:
+            return None
     j = (job_id or "").strip()
     if j.isdigit():
         suf = f"N-{j}.txt"
         for p in cands:
             if p.name.endswith(suf):
                 return p
+        # full_rack: job_id may be a partial (1N) sweep — fall through to newest full-rack log
+        if not full_rack:
+            return cands[0]
     return cands[0]
+
+
+def pick_logs_for_rack(
+    log_dir: Path,
+    rack: str,
+    job_id: str | None,
+    *,
+    full_rack: bool = False,
+    full_rack_nodes: int | None = None,
+) -> dict[str, Path]:
+    """One log per validation stage for *rack*: ``{"nccl": path, "nemo": path}``.
+
+    Since the move to llmb-run, stage 1 (NCCL) and stage 2 (NeMo) are separate Slurm jobs
+    writing separate logs, so a single job id can only ever address ONE of them. Picking one
+    file for the whole dialog therefore guaranteed that one stage's tab was built from the
+    other stage's log — which is how a NeMo log came to be charted as an NCCL result.
+
+    An *job_id* pins the stage whose log carries it; the other stage still resolves to its own
+    newest log. On the older combined format (one job, both stages in one file) both keys
+    resolve to the SAME path, and the caller is expected to parse it once — see
+    ``_parser_stage_sources``.
+
+    Stages are identified by ``native_status._stage_kind_of_log_bn`` so this and the dashboard
+    can never disagree about which file speaks for which stage.
+    """
+    cands = find_log_paths_for_rack(log_dir, rack)
+    if not cands:
+        return {}
+    if full_rack:
+        need = int(full_rack_nodes) if full_rack_nodes and full_rack_nodes > 0 else _full_rack_expected_nodes()
+        cands = [p for p in cands if _node_count_from_log_basename(p.name) == need]
+        if not cands:
+            return {}
+
+    j = (job_id or "").strip()
+    suf = f"N-{j}.txt" if j.isdigit() else None
+    out: dict[str, Path] = {}
+    # cands is newest-first, so the first hit per stage is that stage's newest log.
+    for p in cands:
+        kind = native_status._stage_kind_of_log_bn(p.name)
+        if kind and kind not in out:
+            out[kind] = p
+    # An explicit job_id outranks "newest" for its own stage only.
+    if suf:
+        for p in cands:
+            if p.name.endswith(suf):
+                kind = native_status._stage_kind_of_log_bn(p.name)
+                if kind:
+                    out[kind] = p
+                break
+    if out:
+        return out
+    # Nothing carried a stage marker in its name (foreign or legacy naming). Fall back to the
+    # single-log behaviour so those callers keep working exactly as before.
+    one = pick_log_for_rack(log_dir, rack, job_id, full_rack=full_rack, full_rack_nodes=full_rack_nodes)
+    return {"nemo": one} if one else {}
+
+
+# Which parser.sh table each stage is the authority for. A stage's rows are taken from that
+# stage's own log and nowhere else, so a NeMo log can never contribute NCCL numbers.
+_PARSER_STAGE_TABLES = {
+    "nccl": "nccl_peak_out_of_place_busbw_gbps",
+    "nemo": "nemotron_5h_56b_train_window",
+}
+
+# Scalar/series fields that carry an actual measurement, per stage table. A row holding none of
+# these is parser.sh's all-"---" placeholder rather than a result.
+_PARSER_TABLE_VALUE_FIELDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "nccl_peak_out_of_place_busbw_gbps": (
+        ("all_reduce_gbps", "all_gather_gbps", "alltoall_gbps"),
+        ("all_reduce_busbw_series",),
+    ),
+    "nemotron_5h_56b_train_window": (
+        ("step_s", "tflops_per_gpu", "step_time_std", "perf_std", "mfu_percent"),
+        ("step_series",),
+    ),
+}
+
+
+def _parser_row_has_measurement(row: object, table: str) -> bool:
+    """True when *row* carries at least one real number for *table*.
+
+    parser.sh emits a fully-formed placeholder row (every field ``"-"``/``"---"``, status UNK or
+    FAIL, empty series) for whatever file it is handed, whether or not that file is the kind the
+    table describes. Parsing an NCCL log therefore still yields a Nemotron row. Mirrors the
+    abstention already applied in ``results_history.records_from_parser_json``.
+    """
+    if not isinstance(row, Mapping):
+        return False
+    scalars, series_keys = _PARSER_TABLE_VALUE_FIELDS.get(table, ((), ()))
+    for key in scalars:
+        raw = row.get(key)
+        if raw is None or isinstance(raw, bool):
+            continue
+        try:
+            float(str(raw).strip())
+        except (TypeError, ValueError):
+            continue
+        return True
+    return any(row.get(key) for key in series_keys)
+
+
+def _drop_parser_placeholder_rows(data: dict[str, object]) -> dict[str, list[str]]:
+    """Strip placeholder rows from every stage table in *data*, in place.
+
+    Returns ``{table: [rack…]}`` for what was dropped, so a rack with no run for a stage reads as
+    an empty table (the truth) instead of a UNK row keyed to the *other* stage's job id. Without
+    this, j15/j16 — NCCL-only racks with no NeMo log at all — rendered a Nemotron row carrying the
+    NCCL job id, which reads as "NeMo ran and was inconclusive" when NeMo never ran.
+    """
+    dropped: dict[str, list[str]] = {}
+    for table in _PARSER_STAGE_TABLES.values():
+        rows = data.get(table)
+        if not isinstance(rows, list) or not rows:
+            continue
+        keep = [r for r in rows if _parser_row_has_measurement(r, table)]
+        if len(keep) == len(rows):
+            continue
+        gone = [
+            str((r or {}).get("rack") or (r or {}).get("job_id") or "?")
+            for r in rows
+            if not _parser_row_has_measurement(r, table)
+        ]
+        data[table] = keep
+        dropped[table] = gone
+    return dropped
+
+
+def _primary_stage_log(stage_paths: dict[str, Path], job_id: str | None) -> Path | None:
+    """The log the request is 'about': the one carrying *job_id*, else NeMo, else NCCL.
+
+    Everything that can only sensibly take one log (the Grafana time window, sn-llama, history
+    ingest, log adoption) uses this, so adding the second stage cannot change their behaviour.
+    """
+    if not stage_paths:
+        return None
+    j = (job_id or "").strip()
+    if j.isdigit():
+        suf = f"N-{j}.txt"
+        for p in stage_paths.values():
+            if p.name.endswith(suf):
+                return p
+    return stage_paths.get("nemo") or stage_paths.get("nccl")
+
+
+def _parser_secondary_stages(stage_paths: dict[str, Path], primary: Path) -> list[tuple[str, Path]]:
+    """Stages whose log is a DIFFERENT file from *primary*, so they need their own parse.
+
+    On the older combined format both stages resolve to the same file, which yields an empty
+    list — the primary parse already produced both tables and must not be run twice.
+    """
+    seen = {str(primary)}
+    out: list[tuple[str, Path]] = []
+    for stage, path in stage_paths.items():
+        if str(path) in seen:
+            continue
+        seen.add(str(path))
+        out.append((stage, path))
+    return out
 
 
 def _slurm_job_base_id(job_raw: str | None) -> str | None:
@@ -2396,6 +3502,73 @@ def _dedupe_hostnames_preserve_spelling(hosts: list[str]) -> list[str]:
         if k not in out_map:
             out_map[k] = t
     return sorted(out_map.values(), key=str.casefold)
+
+
+# --- Live inventory (Slurm NodeNames) -------------------------------------------------
+# The authoritative list of *real* node hostnames for node-targeting tools (sysinfo,
+# pdsh, validation). Using inventory instead of a generated ``<rack>-<ctNN>`` template
+# makes targets correct on any site naming scheme (e.g. Boston's
+# ``bos01-a07-13-s1-dgx-03-c03`` under rack ``bos01-a07``). Short TTL cache so repeated
+# target builds in one request don't re-run ``sinfo``.
+_slurm_nodenames_cache: tuple[float, list[str]] = (0.0, [])
+_slurm_nodenames_lock = threading.Lock()
+
+
+def _all_slurm_nodenames() -> list[str]:
+    """All real Slurm ``NodeName`` values (``sinfo -N``), deduped; short TTL cache.
+
+    Returns the last cached value (possibly empty) when Slurm is unavailable.
+    """
+    global _slurm_nodenames_cache
+    ttl = max(0, _env_int("RACK_INVENTORY_NODENAMES_TTL_SEC", 60))
+    ts, cached = _slurm_nodenames_cache
+    if cached and (time.monotonic() - ts) < ttl:
+        return cached
+    with _slurm_nodenames_lock:
+        ts, cached = _slurm_nodenames_cache
+        if cached and (time.monotonic() - ts) < ttl:
+            return cached
+        try:
+            proc = _run_bash_slurm_prefix(
+                'sinfo -N -h -o "%N"',
+                timeout=max(20, _env_int("RACK_SINFO_NODES_TIMEOUT", 60)),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return cached
+        if proc.returncode != 0:
+            return cached
+        hosts = _dedupe_hostnames_preserve_spelling(
+            [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+        )
+        if hosts:
+            _slurm_nodenames_cache = (time.monotonic(), hosts)
+            return hosts
+        return cached
+
+
+def _rack_node_hostnames_from_inventory(rack: str) -> list[str]:
+    """Real node hostnames belonging to *rack*, derived from live Slurm inventory.
+
+    Nodes are matched to the rack id by prefix (rack id followed by a separator), so
+    this is **template-free** and works where the hostname is not ``<rack>-<ctNN>``.
+    Returns ``[]`` when inventory is unavailable or nothing matches.
+    """
+    rid = (rack or "").strip()
+    if not rid:
+        return []
+    hosts = _all_slurm_nodenames()
+    if not hosts:
+        return []
+    rid_cf = rid.casefold()
+    seps = ("-", "_", ".", ":", "/")
+    matched: list[str] = []
+    for h in hosts:
+        hcf = h.casefold()
+        if hcf == rid_cf:
+            matched.append(h)
+        elif hcf.startswith(rid_cf) and len(h) > len(rid) and h[len(rid)] in seps:
+            matched.append(h)
+    return matched
 
 
 def _split_pdsh_w_top_level_commas(w: str) -> list[str]:
@@ -2698,22 +3871,43 @@ def _parse_ts_unix(raw_ts: str, tz: tzinfo) -> float | None:
     return dt.timestamp()
 
 
+def _host_read_text(path: Path, *, max_bytes: int = 0) -> str | None:
+    """Read a file's text from the execution host. ``None`` on error.
+
+    ``max_bytes>0`` caps the read at the head of the file (the historical
+    ``head -c`` semantics); 0 means "no cap", expressed as a very large head.
+    """
+    cap = max_bytes if max_bytes > 0 else (1 << 62)
+    text, meta = host_exec.read_text(
+        path,
+        head_bytes=cap,
+        tail_bytes=0,
+        whole_bytes=cap,
+        timeout=max(30, _job_env_int("RACK_HOST_READ_TIMEOUT", 90)),
+    )
+    if meta.get("read_error"):
+        return None
+    return text
+
+
+_LLM_WALL_MAX_BYTES = 64 * 1024 * 1024
+
+
 def _llm_wall_times_from_log(path: Path, tz_override: str | None = None) -> list[float]:
     tz = _zoneinfo_for_log_parsing(tz_override)
     times: list[float] = []
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if not _LLM_LINE_MARK_RE.search(line):
-                    continue
-                m = _LOG_TS_SEARCH_RE.search(line)
-                if not m:
-                    continue
-                u = _parse_ts_unix(m.group("ts"), tz)
-                if u is not None:
-                    times.append(u)
-    except OSError:
+    content = _host_read_text(path, max_bytes=_LLM_WALL_MAX_BYTES)
+    if content is None:
         return []
+    for line in content.splitlines():
+        if not _LLM_LINE_MARK_RE.search(line):
+            continue
+        m = _LOG_TS_SEARCH_RE.search(line)
+        if not m:
+            continue
+        u = _parse_ts_unix(m.group("ts"), tz)
+        if u is not None:
+            times.append(u)
     return times
 
 
@@ -2826,6 +4020,122 @@ def _rack_web_grafana_uri() -> str:
 def _rack_web_grafana_port() -> str:
     p = (_eget("RACK_WEB_GRAFANA_PORT") or "3000").strip() or "3000"
     return p
+
+
+# --- Grafana deep-links (open full BCM/NMC dashboards in a new tab, scoped by rack/host) --------
+#
+# Unlike the /d-solo/ *embeds* (which need GF_SECURITY_ALLOW_EMBEDDING and a homegrown 2-panel
+# dashboard), deep-links open a full Grafana dashboard in a new tab. On a BCM 11 / Mission Control
+# (NMC) head node these dashboards already exist and are scoped by the ``$Rack`` / ``$hostname``
+# template variables — so we just build ``/d/<uid>/<slug>?var-<Rack>=..&var-<hostname>=..`` URLs.
+# The catalog below defaults to the stock NMC GB200 dashboards but is fully overridable via
+# ``RACK_WEB_GRAFANA_DEEPLINK_DASHBOARDS`` (JSON) so this is not hardwired to any one site.
+
+_GRAFANA_DEEPLINK_DEFAULT: list[dict[str, str]] = [
+    {
+        "id": "dcgm",
+        "label": "GPU / DCGM",
+        "uid": "f4f4474d-f3e1-4e73-a2dc-33c52cb07bd4",
+        "slug": "02-dgx-gb200-dcgm-dashboard",
+        "scope": "host",
+        "desc": "GPU util, temp, power, NVLink BW, XID errors, HBM (per node/GPU).",
+    },
+    {
+        "id": "power",
+        "label": "Rack power & thermal",
+        "uid": "2394651a-f07b-42d4-b0ff-affa31d0a254",
+        "slug": "05-dgx-gb200-rack-power-analysis",
+        "scope": "rack",
+        "desc": "Rack-level power draw and thermal analysis.",
+    },
+    {
+        "id": "nvlink",
+        "label": "NVLink",
+        "uid": "0f0286bc-b007-4a38-a359-8384ee11a90a",
+        "slug": "10-dgx-gb200-nvlink-dashboard",
+        "scope": "host",
+        "desc": "NVLink / NVSwitch fabric bandwidth and errors.",
+    },
+    {
+        "id": "health",
+        "label": "Health status",
+        "uid": "16a8973d-e9fd-4cdf-9649-b2041705a810",
+        "slug": "04-dgx-gb200-health-status",
+        "scope": "rack",
+        "desc": "GB200 node/GPU health status roll-up.",
+    },
+    {
+        "id": "slurm",
+        "label": "Slurm",
+        "uid": "006a04e0-fd06-4ba4-9d44-251394198796",
+        "slug": "06-slurm-dashboard",
+        "scope": "cluster",
+        "desc": "Slurm queue, allocation and node-state overview.",
+    },
+    {
+        "id": "overall",
+        "label": "SuperPOD overview",
+        "uid": "b0dfdff4-f570-47a9-949a-3ab535474c2b",
+        "slug": "01-superpod-overall-dashboard",
+        "scope": "cluster",
+        "desc": "Cluster-wide overview (all racks).",
+    },
+]
+
+
+def _grafana_var_rack() -> str:
+    return (_eget("RACK_WEB_GRAFANA_VAR_RACK") or "Rack").strip() or "Rack"
+
+
+def _grafana_var_host() -> str:
+    return (_eget("RACK_WEB_GRAFANA_VAR_HOST") or "hostname").strip() or "hostname"
+
+
+def _grafana_deeplinks_enabled() -> bool:
+    """Deep-links are enabled unless explicitly disabled; a base URL is required to be useful."""
+    if _truthy_env("RACK_WEB_GRAFANA_DEEPLINK_DISABLED"):
+        return False
+    return True
+
+
+def _grafana_deeplink_dashboards() -> list[dict[str, str]]:
+    """Parsed deep-link dashboard catalog.
+
+    Override with ``RACK_WEB_GRAFANA_DEEPLINK_DASHBOARDS`` = JSON list of objects, each with
+    ``uid`` (required), ``label``, ``slug``, ``scope`` (``host``|``rack``|``cluster``) and
+    ``desc``. Invalid JSON or a non-list falls back to the built-in NMC catalog.
+    """
+    raw = (_eget("RACK_WEB_GRAFANA_DEEPLINK_DASHBOARDS") or "").strip()
+    if not raw:
+        return [dict(d) for d in _GRAFANA_DEEPLINK_DEFAULT]
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        _logger.warning("RACK_WEB_GRAFANA_DEEPLINK_DASHBOARDS is not valid JSON; using defaults")
+        return [dict(d) for d in _GRAFANA_DEEPLINK_DEFAULT]
+    if not isinstance(parsed, list):
+        return [dict(d) for d in _GRAFANA_DEEPLINK_DEFAULT]
+    out: list[dict[str, str]] = []
+    for i, item in enumerate(parsed):
+        if not isinstance(item, dict):
+            continue
+        uid = str(item.get("uid") or "").strip()
+        if not uid:
+            continue
+        scope = str(item.get("scope") or "rack").strip().lower()
+        if scope not in ("host", "rack", "cluster"):
+            scope = "rack"
+        out.append(
+            {
+                "id": str(item.get("id") or f"dash{i}").strip() or f"dash{i}",
+                "label": str(item.get("label") or uid).strip() or uid,
+                "uid": uid,
+                "slug": str(item.get("slug") or "d").strip() or "d",
+                "scope": scope,
+                "desc": str(item.get("desc") or "").strip(),
+            }
+        )
+    return out or [dict(d) for d in _GRAFANA_DEEPLINK_DEFAULT]
 
 
 def _iso_utc_z(ts: float) -> str:
@@ -2974,38 +4284,65 @@ def _validation_ct_inner() -> str:
     return s
 
 
-def _resolve_path(p: Path) -> Path:
-    """Resolve a filesystem path; skip .resolve() in SSH mode (paths refer to the remote host)."""
-    p = p.expanduser()
-    if host_exec.is_remote():
-        return p
-    return p.resolve()
+def _rpath(p: object) -> PurePosixPath:
+    """The single path resolver: canonicalise *p* against the execution host.
+
+    Returns a :class:`PurePosixPath` deliberately. The path names a file on the
+    execution host, which is not necessarily this machine, so local filesystem
+    calls on it are a category error — and an inert path type makes that a loud
+    ``AttributeError`` at the call site instead of a silently wrong answer.
+    Ask the connection instead: ``host_exec.is_file`` / ``stat`` / ``read_text``.
+
+    Replaces the three overlapping resolvers this module used to carry
+    (``_resolve_path``, ``_lp_resolve``, and the inline
+    ``str(x) if is_remote() else str(x.resolve())`` idiom).
+    """
+    return PurePosixPath(host_exec.resolve(p))
 
 
 def _validation_script_path() -> Path:
     p = _eget("RACK_VALIDATION_SCRIPT", str(SCRIPTS_DIR / "run_singlerack.sh")) or str(
         SCRIPTS_DIR / "run_singlerack.sh"
     )
-    return _resolve_path(Path(p))
+    return _rpath(Path(p))
 
 
 def _mnubergemm_stress_script_path() -> Path:
     p = _eget("RACK_MNUBERGEMM_STRESS_SCRIPT", str(SCRIPTS_DIR / "run_mnubergemm_stress.sh")) or str(
         SCRIPTS_DIR / "run_mnubergemm_stress.sh"
     )
-    return _resolve_path(Path(p))
+    return _rpath(Path(p))
 
 
 def _nvloom_singlerack_script_path() -> Path:
     p = _eget("RACK_NVLOOM_SINGLERACK_SCRIPT", str(SCRIPTS_DIR / "run_nvloom_singlerack.sh")) or str(
         SCRIPTS_DIR / "run_nvloom_singlerack.sh"
     )
-    return _resolve_path(Path(p))
+    return _rpath(Path(p))
 
 
 def _clusterkit_script_path() -> Path:
     p = _eget("RACK_CLUSTERKIT_SCRIPT", str(SCRIPTS_DIR / "run_clusterkit.sh")) or str(SCRIPTS_DIR / "run_clusterkit.sh")
-    return _resolve_path(Path(p))
+    return _rpath(Path(p))
+
+
+def _run_llmb_nccl_script_path() -> Path:
+    p = _eget("RACK_LLMB_NCCL_SCRIPT", str(SCRIPTS_DIR / "run_llmb_nccl.sh")) or str(SCRIPTS_DIR / "run_llmb_nccl.sh")
+    return _rpath(Path(p))
+
+
+def _run_nccl_mpi_script_path() -> Path:
+    """Direct-NCCL launcher: resolves racks → nodes → submits nccl_allreduce.sbatch
+    (host nccl-tests + mpirun over IB; no llmb-run/container/UCX-verbs guesswork)."""
+    p = _eget("RACK_NCCL_MPI_SCRIPT", str(SCRIPTS_DIR / "run_nccl_mpi.sh")) or str(SCRIPTS_DIR / "run_nccl_mpi.sh")
+    return _rpath(Path(p))
+
+
+def _nccl_fullrack_script_path() -> Path:
+    p = _eget("RACK_NCCL_FULLRACK_SCRIPT", str(SCRIPTS_DIR / "nccl_fullrack_rounds.sh")) or str(
+        SCRIPTS_DIR / "nccl_fullrack_rounds.sh"
+    )
+    return _rpath(Path(p))
 
 
 def _clusterkit_product_line_for_job(body: dict) -> str:
@@ -3030,54 +4367,54 @@ def _nvis_workspace_dir_effective() -> str:
 
 def _sysinfo_script_path() -> Path:
     p = _eget("RACK_SYSINFO_SCRIPT", str(SCRIPTS_DIR / "sysinfo.sh")) or str(SCRIPTS_DIR / "sysinfo.sh")
-    return _resolve_path(Path(p))
+    return _rpath(Path(p))
 
 
 def _nvswitches_rack_audit_script_path() -> Path:
     p = _eget("RACK_NVSWITCH_AUDIT_SCRIPT", str(SCRIPTS_DIR / "nvswitches_rack_audit.sh")) or str(
         SCRIPTS_DIR / "nvswitches_rack_audit.sh"
     )
-    return _resolve_path(Path(p))
+    return _rpath(Path(p))
 
 
 def _nvswitch_sdn_reset_script_path() -> Path:
     p = _eget("RACK_NVSWITCH_SDN_RESET_SCRIPT", str(SCRIPTS_DIR / "nvswitch_sdn_reset.sh")) or str(
         SCRIPTS_DIR / "nvswitch_sdn_reset.sh"
     )
-    return _resolve_path(Path(p))
+    return _rpath(Path(p))
 
 
 def _nvswitch_system_reset_script_path() -> Path:
     p = _eget("RACK_NVSWITCH_SYSTEM_RESET_SCRIPT", str(SCRIPTS_DIR / "nvswitch_system_reset.sh")) or str(
         SCRIPTS_DIR / "nvswitch_system_reset.sh"
     )
-    return _resolve_path(Path(p))
+    return _rpath(Path(p))
 
 
 def _imex_reset_script_path() -> Path:
     p = _eget("RACK_IMEX_RESET_SCRIPT", str(SCRIPTS_DIR / "imex_reset.sh")) or str(
         SCRIPTS_DIR / "imex_reset.sh"
     )
-    return _resolve_path(Path(p))
+    return _rpath(Path(p))
 
 
 def _imex_check_script_path() -> Path:
     p = _eget("RACK_IMEX_CHECK_SCRIPT", str(SCRIPTS_DIR / "imex_check.sh")) or str(
         SCRIPTS_DIR / "imex_check.sh"
     )
-    return _resolve_path(Path(p))
+    return _rpath(Path(p))
 
 
 def _nemo_xrack_script_path() -> Path:
     p = _eget("RACK_NEMO_XRACK_SCRIPT", str(SCRIPTS_DIR / "run-nemo-xrack.sh")) or str(
         SCRIPTS_DIR / "run-nemo-xrack.sh"
     )
-    return _resolve_path(Path(p))
+    return _rpath(Path(p))
 
 
 def _run_llama_script_path() -> Path:
     p = _eget("RACK_LLAMA_SCRIPT", str(SCRIPTS_DIR / "run-llama.sh")) or str(SCRIPTS_DIR / "run-llama.sh")
-    return _resolve_path(Path(p))
+    return _rpath(Path(p))
 
 
 def _job_env_effective_values() -> dict[str, str]:
@@ -3092,6 +4429,10 @@ def _job_env_effective_values() -> dict[str, str]:
         "RACK_WEB_GRAFANA_DASH_UID": _grafana_dash_uid(),
         "RACK_WEB_GRAFANA_DASH_SLUG": _grafana_dash_slug(),
         "RACK_WEB_GRAFANA_TIMEZONE": (_eget("RACK_WEB_GRAFANA_TIMEZONE") or "").strip(),
+        "RACK_WEB_GRAFANA_VAR_RACK": _grafana_var_rack(),
+        "RACK_WEB_GRAFANA_VAR_HOST": _grafana_var_host(),
+        "RACK_WEB_GRAFANA_DEEPLINK_DASHBOARDS": (_eget("RACK_WEB_GRAFANA_DEEPLINK_DASHBOARDS") or "").strip(),
+        "RACK_WEB_GRAFANA_DEEPLINK_DISABLED": (_eget("RACK_WEB_GRAFANA_DEEPLINK_DISABLED") or "").strip(),
         "RACK_PROMETHEUS_BASIC_AUTH_USER": (_eget("RACK_PROMETHEUS_BASIC_AUTH_USER") or "").strip(),
         "RACK_PROMETHEUS_BASIC_AUTH_PASSWORD": (_eget("RACK_PROMETHEUS_BASIC_AUTH_PASSWORD") or "").strip(),
         "RACK_WEB_PROJECT_NAME": (_eget("RACK_WEB_PROJECT_NAME") or "").strip(),
@@ -3132,6 +4473,9 @@ def _job_env_effective_values() -> dict[str, str]:
         "RACK_CLUSTERKIT_CUDA_MAJOR": (
             _eget("RACK_CLUSTERKIT_CUDA_MAJOR") or _eget("RACK_NVLOOM_CUDA_MAJOR") or "13"
         ).strip(),
+        "RACK_LLMB_NCCL_SCRIPT": str(_run_llmb_nccl_script_path()),
+        "RACK_LLMB_NCCL_TIMEOUT": str(max(120, _job_env_int("RACK_LLMB_NCCL_TIMEOUT", 14400))),
+        "RACK_LLMB_NCCL_RESERVATION": (_eget("RACK_LLMB_NCCL_RESERVATION") or "").strip(),
         "NVIS_WORKSPACE_DIR": _nvis_workspace_dir_effective(),
         "RACK_WORKSPACE_DIR": (_eget("RACK_WORKSPACE_DIR") or "").strip(),
         "RACK_NVLOOM_CUDA_MAJOR": (_eget("RACK_NVLOOM_CUDA_MAJOR") or "13").strip(),
@@ -3173,46 +4517,89 @@ def _normalize_llama_nodes_spec(raw: object) -> str:
 
 
 def validation_target_for_rack(rack: str, override: str | None) -> str:
-    """Build validation target for run_singlerack.sh / sysinfo (pattern from NVIS_* templates)."""
+    """Build the node target for run_singlerack.sh / sysinfo / pdsh.
+
+    Override precedence:
+
+    1. An override that is a **plain comma-list of real node hostnames** (no ``[`` range
+       syntax) is honored as an explicit node selection — e.g. the UI sends the selected
+       trays directly when the site's hostnames don't fold into ``<rack><joiner>[NN]``
+       (Boston: ``bos01-b07-11-s1-dgx-07-c01``). The list is intersected with live Slurm
+       inventory for the rack when available (drops typos / foreign hosts); if inventory
+       is unavailable the tokens are trusted as-is.
+    2. An override in ``<rack><joiner>[ranges]`` template form is validated/normalized by
+       the naming schema.
+    3. With no override, the target is the **full rack** from live Slurm inventory (real
+       ``NodeName`` values), falling back to the ``NVIS_*`` template when inventory is
+       unavailable. Set ``RACK_TARGET_FROM_INVENTORY=0`` to force the template path.
+    """
+    ov = (override or "").strip()
+    inventory_on = (
+        os.environ.get("RACK_TARGET_FROM_INVENTORY", "1").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
+    if ov and "[" not in ov:
+        # Plain (non-range) override → treat as an explicit hostname selection.
+        tokens = [t.strip() for t in ov.split(",") if t.strip()]
+        if tokens:
+            inv = _rack_node_hostnames_from_inventory(rack) if inventory_on else []
+            if inv:
+                inv_cf = {h.casefold(): h for h in inv}
+                chosen = [inv_cf[t.casefold()] for t in tokens if t.casefold() in inv_cf]
+                if chosen:
+                    # de-dup, preserve request order
+                    seen: set[str] = set()
+                    out = [h for h in chosen if not (h in seen or seen.add(h))]
+                    return ",".join(out)
+                # None matched inventory: fall through to template validation so a bad
+                # override surfaces as an error instead of silently targeting the rack.
+            else:
+                # Inventory unavailable — trust the explicit hostname tokens.
+                return ",".join(tokens)
+    if not ov and inventory_on:
+        hosts = _rack_node_hostnames_from_inventory(rack)
+        if hosts:
+            return ",".join(hosts)
     return _nvis_naming().build_validation_target(
         rack, _validation_ct_inner(), override
     )
 
 
-def _default_log_dir() -> Path:
-    p = os.environ.get("RACK_STATUS_LOG_DIR", str(DEFAULT_LOG_DIR))
-    path = Path(p)
-    if host_exec.is_remote():
-        return path
-    return path.resolve()
+def _default_log_dir() -> PurePosixPath:
+    return _rpath(os.environ.get("RACK_STATUS_LOG_DIR", str(DEFAULT_LOG_DIR)))
 
 
-def _allowed_roots() -> list[Path]:
+def _allowed_roots() -> list[PurePosixPath]:
     raw = os.environ.get("RACK_STATUS_ALLOWED_PREFIXES", "")
     if not raw.strip():
         return []
-    remote = host_exec.is_remote()
-    return [Path(x.strip()) if remote else Path(x.strip()).resolve() for x in raw.split(",") if x.strip()]
+    return [_rpath(x.strip()) for x in raw.split(",") if x.strip()]
 
 
-def _resolve_log_dir(raw: str | None) -> Path:
-    base = Path(raw or _default_log_dir()).expanduser()
-    if host_exec.is_remote():
-        s = str(base)
-        _MACOS_FIRMLINK = "/System/Volumes/Data"
-        if s.startswith(_MACOS_FIRMLINK + "/"):
-            s = s[len(_MACOS_FIRMLINK):]
-        log_dir = Path(s)
-    else:
-        log_dir = base.resolve()
+def _resolve_log_dir(raw: str | None) -> PurePosixPath:
+    # No macOS firmlink fixup any more: that existed to undo a local .resolve()
+    # applied to a head-node path, and the connection never resolves a remote path
+    # against this filesystem in the first place.
+    log_dir = _rpath(raw or _default_log_dir())
     roots = _allowed_roots()
     if roots:
         ok = any(str(log_dir).startswith(str(r) + os.sep) or log_dir == r for r in roots)
         if not ok:
             raise ValueError(f"log_dir must be under one of: {[str(r) for r in roots]}")
-    if not host_exec.is_remote() and not log_dir.is_dir():
+    if not host_exec.is_dir(log_dir):
         raise ValueError(f"not a directory: {log_dir}")
     return log_dir
+
+
+def _host_job_cwd(log_dir: Path) -> str:
+    """Working-directory string for a launched job's ``cd`` (popen_on_host).
+
+    In SSH mode *log_dir* is a **remote** path, so ``Path.resolve()`` must NOT run: on macOS
+    it rewrites ``/home/...`` to ``/System/Volumes/Data/home/...`` (firmlink), which does not
+    exist on the head node and makes the remote ``cd`` fail before the script runs. Resolve
+    only when executing locally.
+    """
+    return str(_rpath(log_dir))
 
 
 def _tools_check_destination_allowed(p: Path) -> None:
@@ -3237,20 +4624,21 @@ def _resolve_tools_destination(raw: str) -> Path:
     s = (raw or "").strip()
     if not s:
         raise ValueError("destination is required")
-    p = Path(s).expanduser()
-    if not p.is_absolute():
+    if not PurePosixPath(s).is_absolute():
         raise ValueError("destination must be an absolute path")
-    try:
-        p = p.resolve()
-    except (OSError, RuntimeError):
-        p = Path(os.path.abspath(str(p)))
-    try:
-        if p.is_file():
-            raise ValueError("destination must be a directory, not a file")
-        if not p.is_dir() and p.suffix.lower() == ".sqsh":
-            raise ValueError("destination must be a directory path, not a .sqsh file path")
-    except OSError as e:
-        raise ValueError(f"destination is not usable: {e}") from e
+    # The destination lives on the execution host, so existence is asked of the
+    # connection rather than stat-ed locally.
+    p = _rpath(s)
+    # host_exec.is_file() is really "exists": transport/base.py implements it as
+    # `stat(path) is not None`, so it returns True for a DIRECTORY too (is_dir
+    # correctly uses `test -d`). Testing it alone rejected every existing
+    # workspace with "destination must be a directory, not a file" and made the
+    # Exemplar/llmb install unreachable. Exclude directories explicitly here
+    # rather than change is_file(), which has ~46 call sites.
+    if host_exec.is_file(p) and not host_exec.is_dir(p):
+        raise ValueError("destination must be a directory, not a file")
+    if not host_exec.is_dir(p) and p.suffix.lower() == ".sqsh":
+        raise ValueError("destination must be a directory path, not a .sqsh file path")
     _tools_check_destination_allowed(p)
     return p
 
@@ -3260,18 +4648,16 @@ def _tools_destination_dir_for_status_probe(raw: str) -> Path:
     s = (raw or "").strip()
     if not s:
         raise ValueError("destination is required")
-    p = Path(s).expanduser()
-    if not p.is_absolute():
+    if not PurePosixPath(s).is_absolute():
         raise ValueError("destination must be an absolute path")
-    try:
-        p = p.resolve()
-    except (OSError, RuntimeError):
-        p = Path(os.path.abspath(str(p)))
-    try:
-        is_dir = p.is_dir()
-        is_file = p.is_file()
-    except OSError as e:
-        raise ValueError(f"destination is not usable: {e}") from e
+    # The container is downloaded to the cluster, so the destination is an
+    # execution-host directory: it is normalised textually and inspected over the
+    # connection. This is the path that expanduser/.resolve() used to rewrite
+    # through the local filesystem (on macOS turning /home into
+    # /System/Volumes/Data/home) -- see docs/EXECUTION_ARCHITECTURE.md 4.
+    p = _rpath(s)
+    is_dir = host_exec.is_dir(p)
+    is_file = host_exec.is_file(p)
     if is_file and p.suffix.lower() != ".sqsh":
         raise ValueError("destination must be a directory or a NEMO .sqsh file path")
     if (is_file and p.suffix.lower() == ".sqsh") or (not is_dir and p.suffix.lower() == ".sqsh"):
@@ -3309,12 +4695,12 @@ def _tools_find_existing_sqsh_for_skip(dest_dir: Path) -> tuple[Path | None, lis
             if hit:
                 return hit, checked
         try:
-            nemo = _resolve_path(Path(raw))
+            nemo = _rpath(Path(raw))
         except (OSError, ValueError, RuntimeError):
             nemo = None
         if nemo is not None and nemo.suffix.lower() == ".sqsh":
             try:
-                if nemo.parent.resolve() == dest_dir.resolve():
+                if _rpath(nemo.parent) == _rpath(dest_dir):
                     hit = try_path(nemo)
                     if hit:
                         return hit, checked
@@ -3325,17 +4711,20 @@ def _tools_find_existing_sqsh_for_skip(dest_dir: Path) -> tuple[Path | None, lis
 
 
 def _tools_download_destination_default() -> str:
-    """Directory default for Tools → download containers: parent of ``NEMO_SQSH_SRC`` when it is a .sqsh path."""
+    """Directory default for Tools → download containers: parent of ``NEMO_SQSH_SRC`` when it is a .sqsh path.
+
+    Intentionally avoids ``Path.resolve()``: in SSH mode the path refers to the *remote*
+    cluster filesystem, so resolving it against the local dashboard host is wrong. On macOS
+    that rewrites ``/home/cmods`` to ``/System/Volumes/Data/home/cmods`` via firmlinks.
+    Use a pure-path parent so the remote path is preserved verbatim.
+    """
     raw = (_eget("NEMO_SQSH_SRC") or "").strip()
     if not raw:
         return ""
-    p = Path(raw).expanduser()
-    try:
-        p = p.resolve()
-    except OSError:
-        p = Path(raw).expanduser()
+    p = PurePosixPath(raw)
     if p.suffix.lower() == ".sqsh":
-        return str(p.parent) if str(p.parent) not in ("", ".") else ""
+        parent = str(p.parent)
+        return parent if parent not in ("", ".") else ""
     return str(p)
 
 
@@ -3777,7 +5166,7 @@ def _merge_live_native_workers_into_status(out: dict, log_dir: Path) -> None:
     """
     if _truthy_env("RACK_STATUS_USE_SHELL_TABLE"):
         return
-    ld = log_dir.resolve()
+    ld = _rpath(log_dir)
     snap = native_status.worker_snapshot_for_log_dir(ld)
     if snap is not None:
         out["native_workers"] = snap
@@ -3910,7 +5299,7 @@ def _try_populate_cmsh_rack_list_file() -> None:
             return
         plat = _get_platform()
         cmd = plat.list_racks_cmd()
-        if not host_exec.is_remote() and not shutil.which(cmd[0]):
+        if not host_exec.which(cmd[0]):
             _CMSH_RACK_LIST_STATE = "failed"
             return
         try:
@@ -4024,7 +5413,7 @@ def run_rack_status(log_dir: Path, include_raw: bool = False) -> dict:
         return out
 
     out = native_status.build_native_rack_status(
-        log_dir.resolve(),
+        log_dir,
         include_raw,
         _probe_log_json_via_rack_status,
     )
@@ -4047,14 +5436,150 @@ def _rack_status_background_interval_sec() -> int:
     return max(5, _job_env_int("RACK_STATUS_BACKGROUND_INTERVAL_SEC", 30))
 
 
+def _cluster_snapshot_db_path() -> Path:
+    configured = (os.environ.get("RACK_CLUSTER_SNAPSHOT_DB") or "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (REPO_ROOT / "var" / "cache" / "cluster_snapshots.sqlite3").resolve()
+
+
+def _cluster_snapshot_repository() -> cluster_snapshot.SnapshotRepository:
+    global _cluster_snapshot_repo_cache
+    path = str(_cluster_snapshot_db_path())
+    with _cluster_snapshot_repo_lock:
+        if _cluster_snapshot_repo_cache is None or _cluster_snapshot_repo_cache[0] != path:
+            _cluster_snapshot_repo_cache = (
+                path,
+                cluster_snapshot.SnapshotRepository(path),
+            )
+        return _cluster_snapshot_repo_cache[1]
+
+
+def _cluster_snapshot_identity() -> str:
+    """Stable, non-secret active cluster identity used in the shared snapshot key."""
+    if _CATALOG_AVAILABLE and catalog_context is not None:
+        try:
+            active = catalog_context.get_active()
+            project_id = str(active.get("project") or "").strip()
+            cluster_id = str(active.get("cluster") or "").strip()
+            if project_id or cluster_id:
+                return f"catalog:{project_id}/{cluster_id}"
+        except Exception:
+            pass
+    configured = (
+        os.environ.get("RACK_CLUSTER_ID")
+        or os.environ.get("RACK_CLUSTER_NAME")
+        or os.environ.get("CLUSTER_NAME")
+        or os.environ.get("RACK_SSH_HOST")
+        or ""
+    ).strip()
+    return f"cluster:{configured or socket.gethostname()}"
+
+
+def _cluster_overview_live_db_path() -> Path:
+    """SQLite path for progressive overview live probes (sibling of inventory snapshot DB)."""
+    configured = (os.environ.get("RACK_CLUSTER_OVERVIEW_LIVE_DB") or "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (_cluster_snapshot_db_path().parent / "cluster_overview_live.sqlite3").resolve()
+
+
+def _live_collect_bcm_version() -> str:
+    value, err = _cluster_probe_bcm_cmsh_version()
+    err_s = (err or "").strip()
+    val_s = (value or "").strip()
+    if err_s or not val_s:
+        raise RuntimeError(err_s or "empty bcm version")
+    return val_s
+
+
+def _live_collect_slurm_version() -> str:
+    value, err = _cluster_probe_slurm_version()
+    err_s = (err or "").strip()
+    val_s = (value or "").strip()
+    if err_s or not val_s:
+        raise RuntimeError(err_s or "empty slurm version")
+    return val_s
+
+
+def _live_collect_queue() -> dict[str, object]:
+    block = _cluster_squeue_overview_block()
+    if not isinstance(block, dict):
+        raise RuntimeError("invalid squeue overview block")
+    if not block.get("ok"):
+        raise RuntimeError(str(block.get("error") or "squeue failed"))
+    return block
+
+
+def _get_cluster_overview_live_service() -> cluster_overview_live.ClusterOverviewLiveService:
+    """Lazy singleton keyed by live DB path so Gunicorn workers share one SQLite file."""
+    global _cluster_overview_live_service_cache
+    path = str(_cluster_overview_live_db_path())
+    with _cluster_overview_live_service_lock:
+        if (
+            _cluster_overview_live_service_cache is None
+            or _cluster_overview_live_service_cache[0] != path
+        ):
+            _cluster_overview_live_service_cache = (
+                path,
+                cluster_overview_live.ClusterOverviewLiveService(
+                    path,
+                    collectors={
+                        "bcm": _live_collect_bcm_version,
+                        "slurm": _live_collect_slurm_version,
+                        "queue": _live_collect_queue,
+                    },
+                    ttls={"bcm": 3600, "slurm": 3600, "queue": 15},
+                ),
+            )
+        return _cluster_overview_live_service_cache[1]
+
+
+def _collect_canonical_rack_status(log_dir: Path) -> dict:
+    """Collect inventory before it becomes a persisted snapshot.
+
+    ``run_rack_status`` / ``build_native_rack_status`` already produce rows and
+    ``native_workers``. Do not call ``_merge_live_native_workers_into_status``
+    here — that rebuilds the table and re-runs ``squeue``.
+    """
+    return run_rack_status(log_dir, include_raw=False)
+
+
+def get_cluster_snapshot(
+    log_dir: Path,
+    *,
+    force_refresh: bool = False,
+    wait: bool = True,
+) -> cluster_snapshot.ClusterSnapshot:
+    """Return the canonical cross-process inventory snapshot for both APIs."""
+    log_root = _rack_status_cache_key(log_dir)
+    _register_rack_status_log_dir(log_dir)
+    service = cluster_snapshot.ClusterSnapshotService(
+        _cluster_snapshot_repository(),
+        collector=lambda: _collect_canonical_rack_status(log_dir),
+        lease_seconds=max(30, _env_int("RACK_STATUS_TIMEOUT", 300) + 30),
+    )
+    return service.get_cluster_snapshot(
+        _cluster_snapshot_identity(),
+        log_root,
+        max_age_seconds=_rack_status_background_interval_sec(),
+        force_refresh=force_refresh,
+        wait=wait,
+    )
+
+
 def _rack_status_cache_clear_all() -> None:
-    """Invalidate cached native payloads so the next ``/api/status`` uses current job-env overrides."""
+    """Shared invalidation entry point for status-affecting configuration changes."""
+    _cluster_snapshot_repository().bump_configuration_generation()
     with _rack_status_cache_lock:
         _rack_status_cache.clear()
 
 
 def _rack_status_cache_key(log_dir: Path) -> str:
-    return str(log_dir.resolve())
+    # Do NOT local-resolve in SSH mode: the background loop uses this key as the actual log_dir,
+    # and resolving a remote path on the app host corrupts it (/home/... -> /System/Volumes/Data/...),
+    # so the SSH `find` would look for a nonexistent path and every rack stays "pending".
+    return str(_rpath(log_dir))
 
 
 def _register_rack_status_log_dir(log_dir: Path) -> str:
@@ -4065,13 +5590,14 @@ def _register_rack_status_log_dir(log_dir: Path) -> str:
 
 
 def _cached_rack_status_copy(log_dir: Path) -> dict | None:
-    """Return a shallow copy of the cached /api/status payload for *log_dir*, or ``None``."""
-    if not _rack_status_background_enabled():
-        return None
-    key = _rack_status_cache_key(log_dir)
-    with _rack_status_cache_lock:
-        hit = _rack_status_cache.get(key)
-    return dict(hit) if hit else None
+    """Compatibility reader backed by SQLite, including background-disabled mode."""
+    repository = _cluster_snapshot_repository()
+    snapshot = repository.get(
+        _cluster_snapshot_identity(),
+        _rack_status_cache_key(log_dir),
+        repository.configuration_generation(),
+    )
+    return dict(snapshot.payload) if snapshot is not None and snapshot.payload is not None else None
 
 
 def _ensure_rack_status_background_thread() -> None:
@@ -4099,13 +5625,17 @@ def _ensure_rack_status_background_thread() -> None:
 
 
 def _rack_status_background_loop() -> None:
-    """Refresh cached rack_status for every registered ``log_dir``; one subprocess at a time."""
-    first = True
+    """Periodically refresh shared snapshots; SQLite leases coordinate workers."""
     while True:
-        if not first:
-            interval = max(5, _rack_status_background_interval_sec())
-            time.sleep(float(interval))
-        first = False
+        if not _rack_status_background_enabled():
+            return
+        interval = max(5, _rack_status_background_interval_sec())
+        time.sleep(float(interval))
+        if not _rack_status_background_enabled():
+            return
+        # Skip slow inventory collects during SSH/VPN outages (local mode is always reachable).
+        if not host_exec.cluster_reachable():
+            continue
         try:
             with _rack_status_cache_lock:
                 dirs = sorted(_rack_status_registry)
@@ -4114,16 +5644,11 @@ def _rack_status_background_loop() -> None:
             for d in dirs:
                 p = Path(d)
                 try:
-                    with _rack_status_exec_lock:
-                        payload = run_rack_status(p, include_raw=False)
-                    with _rack_status_cache_lock:
-                        _rack_status_cache[_rack_status_cache_key(p)] = payload
-                except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
-                    continue
+                    get_cluster_snapshot(p, force_refresh=True)
                 except Exception:
-                    continue
+                    _logger.exception("cluster snapshot background refresh failed")
         except Exception:
-            continue
+            _logger.exception("cluster snapshot background loop failed")
 
 
 def _nemo_done_rack_ids_from_rack_status(log_dir: Path) -> frozenset[str] | None:
@@ -4133,14 +5658,10 @@ def _nemo_done_rack_ids_from_rack_status(log_dir: Path) -> frozenset[str] | None
     Returns an empty frozenset if the table loaded but no rack is ``done``.
     """
     try:
-        cached = _cached_rack_status_copy(log_dir)
-        if cached is not None:
-            data = cached
-        elif _rack_status_background_enabled():
-            with _rack_status_exec_lock:
-                data = run_rack_status(log_dir, include_raw=False)
-        else:
-            data = run_rack_status(log_dir, include_raw=False)
+        snapshot = get_cluster_snapshot(log_dir)
+        if snapshot.payload is None:
+            return None
+        data = snapshot.payload
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
         return None
     except Exception:
@@ -4336,8 +5857,8 @@ def api_power_on_async():
 def _gpu_reset_script_path() -> Path:
     raw = (_eget("RACK_GPU_RESET_SCRIPT") or "").strip()
     if raw:
-        return _resolve_path(Path(raw))
-    return _resolve_path(SCRIPTS_DIR / "gpu_reset.sh")
+        return _rpath(Path(raw))
+    return _rpath(SCRIPTS_DIR / "gpu_reset.sh")
 
 
 def run_gpu_reset(pdsh_w: str) -> dict:
@@ -4474,15 +5995,15 @@ _HOSTNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$", re.IGNORECASE)
 def _bmc_recovery_script_path() -> Path:
     raw = (_eget("RACK_BMC_RECOVERY_SCRIPT") or "").strip()
     if raw:
-        return _resolve_path(Path(raw))
-    return _resolve_path(SCRIPTS_DIR / "bmc-recovery.sh")
+        return _rpath(Path(raw))
+    return _rpath(SCRIPTS_DIR / "bmc-recovery.sh")
 
 
 def _macswap_script_path() -> Path:
     raw = (_eget("RACK_MACSWAP_SCRIPT") or "").strip()
     if raw:
-        return _resolve_path(Path(raw))
-    return _resolve_path(SCRIPTS_DIR / "macswap" / "macswap")
+        return _rpath(Path(raw))
+    return _rpath(SCRIPTS_DIR / "macswap" / "macswap")
 
 
 def _macswap_python_module() -> str:
@@ -4576,10 +6097,16 @@ def _bmc_recovery_worker(job_id: str, nodes: list[str], iface: str) -> None:
     """Run bmc-recovery.sh against each selected node serially; aggregate into _reset_jobs."""
 
     def _patch(**kwargs: object) -> None:
+        finished = None
         with _reset_jobs_lock:
             row = _reset_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+                # Snapshot inside the lock; push outside it so the lake call never holds the mutex.
+                if str(kwargs.get("phase") or "") in ("done", "error"):
+                    finished = dict(row)
+        if finished is not None:
+            _lake_push_job(job_id, finished)
 
     results: list[dict] = []
     try:
@@ -4772,10 +6299,16 @@ def _mac_change_worker(
     """Run macswap once (single node) and aggregate into _reset_jobs."""
 
     def _patch(**kwargs: object) -> None:
+        finished = None
         with _reset_jobs_lock:
             row = _reset_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+                # Snapshot inside the lock; push outside it so the lake call never holds the mutex.
+                if str(kwargs.get("phase") or "") in ("done", "error"):
+                    finished = dict(row)
+        if finished is not None:
+            _lake_push_job(job_id, finished)
 
     try:
         _patch(
@@ -4995,22 +6528,17 @@ _BUG_REPORT_SUBDIR_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
 
 
 def _bug_report_local_base_path() -> Path:
-    return _resolve_path(Path(_bug_report_remote_dir()))
+    return _rpath(Path(_bug_report_remote_dir()))
 
 
 def _ensure_bug_report_local_base_dir() -> tuple[Path, str | None]:
-    """Create ``RACK_BUG_REPORT_REMOTE_DIR`` when missing (local dashboard host only)."""
+    """Create ``RACK_BUG_REPORT_REMOTE_DIR`` on the execution host when missing."""
     base = _bug_report_local_base_path()
-    if host_exec.is_remote():
+    if host_exec.is_dir(base):
         return base, None
-    if base.exists():
-        if not base.is_dir():
-            return base, f"not a directory: {base}"
-        return base, None
-    try:
-        base.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        return base, f"could not create reports directory {base}: {e}"
+    err = host_exec.makedirs(base)
+    if err:
+        return base, f"could not create reports directory {base}: {err}"
     return base, f"created reports directory: {base}"
 
 
@@ -5021,104 +6549,42 @@ def _local_bug_report_inventory() -> tuple[list[dict[str, str]], str | None]:
         return [], ensure_notice
     if ensure_notice and ensure_notice.startswith("could not create"):
         return [], ensure_notice
+    # One listing of the whole reports tree on the execution host. This replaced
+    # five globs per hostname subdirectory, each of which was a round trip and a
+    # local-filesystem call against a path that lives on the remote host.
+    base_p = PurePosixPath(str(base))
+    entries = host_exec.stat_dir(
+        base_p,
+        patterns=("nvidia-bug-report*.log.gz", "nvlmapper.*.zip", "*.csv", "*.xls", "*.xlsx"),
+        maxdepth=2,
+    )
+
+    def _wanted(name: str) -> bool:
+        if name.startswith("nvidia-bug-report") and name.endswith(".log.gz"):
+            return True
+        if name.endswith(".zip"):
+            return bool(_NVLMAPPER_ZIP_BASENAME_RE.fullmatch(name))
+        if name.endswith((".csv", ".xls")):
+            return bool(_NVLMAPPER_TABLE_BASENAME_RE.fullmatch(name))
+        if name.endswith(".xlsx"):
+            return bool(_REPORT_EXCEL_BASENAME_RE.fullmatch(name))
+        return False
+
     items: list[dict[str, str]] = []
-    try:
-        for sub in sorted(base.iterdir(), key=lambda p: p.name.lower()):
-            if not sub.is_dir():
+    for path_s in entries:
+        f = PurePosixPath(path_s)
+        if not _wanted(f.name):
+            continue
+        if f.parent == base_p:
+            # Workbooks placed directly under the reports base, not under a hostname subdir.
+            if not f.name.endswith(".xlsx"):
                 continue
-            if not _BUG_REPORT_SUBDIR_RE.fullmatch(sub.name):
-                continue
-            try:
-                for f in sorted(
-                    sub.glob("nvidia-bug-report*.log.gz"),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                ):
-                    if not f.is_file():
-                        continue
-                    try:
-                        f.resolve().relative_to(base)
-                    except ValueError:
-                        continue
-                    items.append({"host": sub.name, "name": f.name})
-                for f in sorted(
-                    sub.glob("nvlmapper.*.zip"),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                ):
-                    if not f.is_file():
-                        continue
-                    if not _NVLMAPPER_ZIP_BASENAME_RE.fullmatch(f.name):
-                        continue
-                    try:
-                        f.resolve().relative_to(base)
-                    except ValueError:
-                        continue
-                    items.append({"host": sub.name, "name": f.name})
-                for f in sorted(
-                    sub.glob("*.csv"),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                ):
-                    if not f.is_file():
-                        continue
-                    if not _NVLMAPPER_TABLE_BASENAME_RE.fullmatch(f.name):
-                        continue
-                    try:
-                        f.resolve().relative_to(base)
-                    except ValueError:
-                        continue
-                    items.append({"host": sub.name, "name": f.name})
-                for f in sorted(
-                    sub.glob("*.xls"),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                ):
-                    if not f.is_file():
-                        continue
-                    if not _NVLMAPPER_TABLE_BASENAME_RE.fullmatch(f.name):
-                        continue
-                    try:
-                        f.resolve().relative_to(base)
-                    except ValueError:
-                        continue
-                    items.append({"host": sub.name, "name": f.name})
-                for f in sorted(
-                    sub.glob("*.xlsx"),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                ):
-                    if not f.is_file():
-                        continue
-                    if not _REPORT_EXCEL_BASENAME_RE.fullmatch(f.name):
-                        continue
-                    try:
-                        f.resolve().relative_to(base)
-                    except ValueError:
-                        continue
-                    items.append({"host": sub.name, "name": f.name})
-            except OSError:
-                continue
-        # Workbooks placed directly under the reports base (not under a hostname subdir).
-        try:
-            for f in sorted(
-                base.glob("*.xlsx"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            ):
-                if not f.is_file():
-                    continue
-                if not _REPORT_EXCEL_BASENAME_RE.fullmatch(f.name):
-                    continue
-                try:
-                    f.resolve().relative_to(base.resolve())
-                except ValueError:
-                    continue
-                items.append({"host": _BUG_REPORT_EXCEL_ROOT_HOST, "name": f.name})
-        except OSError:
-            pass
-    except OSError as e:
-        return [], str(e)
+            items.append({"host": _BUG_REPORT_EXCEL_ROOT_HOST, "name": f.name})
+            continue
+        # Containment: exactly one level down, under a well-formed hostname dir.
+        if f.parent.parent != base_p or not _BUG_REPORT_SUBDIR_RE.fullmatch(f.parent.name):
+            continue
+        items.append({"host": f.parent.name, "name": f.name})
     items.sort(key=lambda x: (x["host"].lower(), x["name"].lower()))
     notice = ensure_notice if ensure_notice and ensure_notice.startswith("created ") else None
     return items, notice
@@ -5178,10 +6644,16 @@ def _bug_report_worker(job_id: str, pdsh_w: str) -> None:
     """Run pdsh nvidia-bug-report.sh, then discover .log.gz paths per host."""
 
     def _patch(**kwargs: object) -> None:
+        finished = None
         with _reset_jobs_lock:
             row = _reset_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+                # Snapshot inside the lock; push outside it so the lake call never holds the mutex.
+                if str(kwargs.get("phase") or "") in ("done", "error"):
+                    finished = dict(row)
+        if finished is not None:
+            _lake_push_job(job_id, finished)
 
     try:
         _patch(
@@ -5350,15 +6822,18 @@ def api_bug_report_file():
     ):
         return jsonify({"ok": False, "error": "invalid file name"}), 400
     base = _bug_report_local_base_path()
+    # Reports live on the execution host, so containment is checked on the
+    # normalised path text (which still collapses "..") rather than by resolving
+    # against this container's filesystem, and existence is asked of that host.
     if host == _BUG_REPORT_EXCEL_ROOT_HOST:
-        path = (base / name).resolve()
+        path = _rpath(base / name)
     else:
-        path = (base / host / name).resolve()
+        path = _rpath(base / host / name)
     try:
-        path.relative_to(base.resolve())
+        path.relative_to(_rpath(base))
     except ValueError:
         return jsonify({"ok": False, "error": "path outside reports directory"}), 400
-    if not path.is_file():
+    if not host_exec.is_file(path):
         return jsonify({"ok": False, "error": "file not found"}), 404
     is_zip = bool(_NVLMAPPER_ZIP_BASENAME_RE.fullmatch(name))
     is_xlsx = bool(_REPORT_EXCEL_BASENAME_RE.fullmatch(name))
@@ -5467,6 +6942,23 @@ _HW_CHECK_PRESETS: dict[str, list[str]] = {
     "with_imex_spx": ["-i", "1", "-x", "1"],
     "with_process": ["-p", "1"],
     "sys_only": ["-e", "0", "-s", "1", "-g", "0", "-i", "0", "-b", "0", "-x", "0", "-p", "0"],
+    # --- NscaleTX validation presets (MOP GB300 §7.1.1 / FastTrack §7) ---
+    # dcgmi diag standardised on -r 3 (2026-07-26). Long-running: minutes per node.
+    "dcgm_diag": ["-e", "0", "-s", "0", "-g", "0", "-i", "0", "-b", "0", "-x", "0",
+                  "-p", "0", "-D", "1", "-L", "3"],
+    "nvbandwidth": ["-e", "0", "-s", "0", "-g", "0", "-i", "0", "-b", "0", "-x", "0",
+                    "-p", "0", "-N", "1"],
+    # BOM / inventory: nvidia-smi -L, ECC, nvlink -s, fabric state, topo -p2p n
+    "bom_inventory": ["-e", "0", "-s", "0", "-g", "1", "-i", "0", "-b", "0", "-x", "0", "-p", "0"],
+    # Job-launch stack: slurmd, munge, Prolog/Epilog (incl. a dry execution), pyxis SPANK
+    # plugin, enroot runtime dirs. Added 2026-07-28 after job 63850 was CANCELLED with
+    # Reason=Prolog while every GPU/NVLink/CUDA check on the tray passed — nothing here
+    # covered the launch path, so a tray that could not start a job still reported healthy.
+    "slurm_stack": ["-e", "0", "-s", "0", "-g", "0", "-i", "0", "-b", "0", "-x", "0",
+                    "-p", "0", "-S", "1"],
+    # Full MOP pre-flight: BOM + dcgmi diag -r 3 + nvbandwidth + launch stack
+    "mop_preflight": ["-e", "1", "-s", "1", "-g", "1", "-i", "0", "-b", "1", "-x", "0",
+                      "-p", "0", "-D", "1", "-L", "3", "-N", "1", "-S", "1"],
 }
 
 _HW_CHECK_ARG_TOKEN_RE = re.compile(r"^[-a-zA-Z0-9_=.,]+$")
@@ -5505,8 +6997,8 @@ def _hw_check_argv_from_custom_string(raw: str) -> list[str]:
 def _hw_check_pdsh_script_path() -> Path:
     raw = (_eget("RACK_HW_CHECK_SCRIPT") or "").strip()
     if raw:
-        return _resolve_path(Path(raw))
-    return _resolve_path(SCRIPTS_DIR / "hw_check_pdsh.sh")
+        return _rpath(Path(raw))
+    return _rpath(SCRIPTS_DIR / "hw_check_pdsh.sh")
 
 
 def _hw_check_argv_for_preset(preset: str) -> list[str]:
@@ -5538,11 +7030,14 @@ def run_hw_check(pdsh_w: str, checker_argv: list[str]) -> dict:
             "pdsh_w": w,
         }
     try:
-        proc = subprocess.run(
+        # Route through the privileged script profile (root@slogin) like sysinfo:
+        # hw_check_pdsh.sh pdsh's to compute nodes and needs root on each node, and
+        # the script lives on the cluster filesystem (not the dashboard host).
+        proc = host_exec.run_on_host(
             cmd,
-            capture_output=True,
-            text=True,
             timeout=timeout,
+            env=_subprocess_env(),
+            profile="script",
         )
     except FileNotFoundError:
         raise OSError("bash executable not found") from None
@@ -5567,24 +7062,36 @@ def _prepare_hw_check(body: dict) -> tuple[dict[str, object] | None, tuple[objec
     if os.environ.get("RACK_HW_CHECK_DISABLED", "").strip().lower() in ("1", "true", "yes"):
         return None, (jsonify({"ok": False, "error": "HW check disabled (RACK_HW_CHECK_DISABLED)"}), 403)
     specs_raw = body.get("specs")
-    if not isinstance(specs_raw, list) or not specs_raw:
-        return None, (
-            jsonify(
-                {
-                    "ok": False,
-                    "error": (
-                        'send JSON {"specs": [...], "preset": "…"} and/or optional "checker_args": "-d …" or ["-d","…"]'
-                    ),
-                }
-            ),
-            400,
-        )
-    try:
-        specs = merge_ct_individuals_for_power([str(x) for x in specs_raw])
-    except ValueError as e:
-        return None, (jsonify({"ok": False, "error": str(e)}), 400)
-    if not specs:
-        return None, (jsonify({"ok": False, "error": "no valid tray specs after merge"}), 400)
+    pdsh_w = ""
+    if isinstance(specs_raw, list) and specs_raw:
+        try:
+            specs = merge_ct_individuals_for_power([str(x) for x in specs_raw])
+        except ValueError as e:
+            return None, (jsonify({"ok": False, "error": str(e)}), 400)
+        if not specs:
+            return None, (jsonify({"ok": False, "error": "no valid tray specs after merge"}), 400)
+        pdsh_w = ",".join(specs)
+    else:
+        # Fallback: derive the whole-rack node list from live inventory (real Slurm
+        # NodeNames) when the client sent no tray specs. Keeps hw-check working on
+        # sites where the dashboard tray parse is naming-template dependent (e.g.
+        # Boston's bos01-aRR-NN-s1-dgx-GG-cNN hostnames).
+        rack = (body.get("rack") or "").strip()
+        hosts = _rack_node_hostnames_from_inventory(rack) if rack else []
+        if hosts:
+            pdsh_w = ",".join(hosts)
+        else:
+            return None, (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": (
+                            'send JSON {"specs": [...], "preset": "…"} and/or optional "checker_args": "-d …" or ["-d","…"]'
+                        ),
+                    }
+                ),
+                400,
+            )
 
     checker_args_display: str | None = None
     argv: list[str]
@@ -5626,7 +7133,6 @@ def _prepare_hw_check(body: dict) -> tuple[dict[str, object] | None, tuple[objec
         except ValueError as e:
             return None, (jsonify({"ok": False, "error": str(e)}), 400)
 
-    pdsh_w = ",".join(specs)
     return {
         "pdsh_w": pdsh_w,
         "preset": preset,
@@ -5639,10 +7145,16 @@ def _hw_check_worker(job_id: str, pdsh_w: str, preset: str, checker_argv: list[s
     """Run hw_check_pdsh.sh in a background thread."""
 
     def _patch(**kwargs: object) -> None:
+        finished = None
         with _reset_jobs_lock:
             row = _reset_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+                # Snapshot inside the lock; push outside it so the lake call never holds the mutex.
+                if str(kwargs.get("phase") or "") in ("done", "error"):
+                    finished = dict(row)
+        if finished is not None:
+            _lake_push_job(job_id, finished)
 
     try:
         _patch(
@@ -5718,7 +7230,7 @@ def api_hw_check_async():
 
 def _checker_script_path() -> Path:
     """Bundled checker.sh (same directory as hw_check_pdsh.sh)."""
-    return _resolve_path(SCRIPTS_DIR / "checker.sh")
+    return _rpath(SCRIPTS_DIR / "checker.sh")
 
 
 @app.route("/api/hw-check-presets", methods=["GET"])
@@ -5741,13 +7253,20 @@ def api_hw_check_help():
     env = _subprocess_env({"RACK_WEB_PRINT_HELP": "1"})
     timeout = max(5, _env_int("RACK_HW_CHECK_HELP_TIMEOUT", 20))
     try:
-        proc = subprocess.run(
+        # The script and its working directory belong to the scripts role, which may
+        # be a different host from the app. Running this locally only worked while
+        # the two happened to coincide.
+        #
+        # RACK_WEB_PRINT_HELP goes through env_extra, not env: env is a local-only
+        # subprocess argument, so over ssh the flag that skips checker.sh's root
+        # check would be dropped and --help would fail with "Please run as root".
+        proc = host_exec.run_on_host(
             ["bash", str(script), "--help"],
-            cwd=str(SCRIPTS_DIR),
+            cwd=_scripts_dir(),
             env=env,
-            capture_output=True,
-            text=True,
+            env_extra={"RACK_WEB_PRINT_HELP": "1"},
             timeout=timeout,
+            role="scripts",
         )
     except subprocess.TimeoutExpired:
         return jsonify({"ok": False, "error": "checker.sh --help timed out", "help": ""}), 504
@@ -5793,10 +7312,16 @@ def _nvswitch_fix_async_worker(job_id: str, log_dir: Path, cmd: list[str], displ
     """Run ``nvswitches_rack_audit.sh --fix`` in a background thread (cwd = log_dir)."""
 
     def _patch(**kwargs: object) -> None:
+        finished = None
         with _reset_jobs_lock:
             row = _reset_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+                # Snapshot inside the lock; push outside it so the lake call never holds the mutex.
+                if str(kwargs.get("phase") or "") in ("done", "error"):
+                    finished = dict(row)
+        if finished is not None:
+            _lake_push_job(job_id, finished)
 
     timeout_sec = max(60, _env_int("RACK_NVSWITCH_AUDIT_TIMEOUT", 7200))
     try:
@@ -5804,13 +7329,15 @@ def _nvswitch_fix_async_worker(job_id: str, log_dir: Path, cmd: list[str], displ
             phase="running",
             started_running_at=datetime.now(timezone.utc).isoformat(),
         )
-        proc = subprocess.run(
+        # A cluster script with the log dir as cwd: both belong to the execution
+        # host, so this goes through the connection on the privileged route (see
+        # docs/EXECUTION_ARCHITECTURE.md 1.2) rather than a local subprocess.
+        proc = host_exec.run_on_host(
             cmd,
             cwd=str(log_dir),
             env=_subprocess_env(),
-            capture_output=True,
-            text=True,
             timeout=timeout_sec,
+            role="script",
         )
         ok = proc.returncode == 0
         _patch(
@@ -5857,7 +7384,10 @@ def api_nvswitch_fix_async():
         return err[0], err[1]
     assert prep is not None
     log_dir = prep["log_dir"]
-    assert isinstance(log_dir, Path)
+    # PurePosixPath is NOT a subclass of Path, and ``_resolve_log_dir()`` returns one whenever the
+    # log dir lives on a remote host. Asserting Path alone raised AssertionError -> HTTP 500 on
+    # every call to this route and the six sibling async routes below. Accept either flavour.
+    assert isinstance(log_dir, (Path, PurePosixPath))
     rack = str(prep["rack"])
     cmd = list(prep["cmd"])
     assert isinstance(cmd, list)
@@ -5909,10 +7439,16 @@ def _nvswitch_sdn_reset_async_worker(job_id: str, log_dir: Path, cmd: list[str],
     """Run ``nvswitch_sdn_reset.sh RACK`` in a background thread."""
 
     def _patch(**kwargs: object) -> None:
+        finished = None
         with _reset_jobs_lock:
             row = _reset_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+                # Snapshot inside the lock; push outside it so the lake call never holds the mutex.
+                if str(kwargs.get("phase") or "") in ("done", "error"):
+                    finished = dict(row)
+        if finished is not None:
+            _lake_push_job(job_id, finished)
 
     timeout_sec = max(60, _env_int("RACK_NVSWITCH_SDN_RESET_TIMEOUT", 1800))
     try:
@@ -5920,35 +7456,42 @@ def _nvswitch_sdn_reset_async_worker(job_id: str, log_dir: Path, cmd: list[str],
             phase="running",
             started_running_at=datetime.now(timezone.utc).isoformat(),
         )
-        proc = subprocess.run(
-            cmd,
-            cwd=str(log_dir),
-            env=_subprocess_env(),
-            capture_output=True,
-            text=True,
-            timeout=timeout_sec,
+        # profile="script" routes to the privileged node-operational SSH target
+        # (RACK_SCRIPT_SSH_*, root+nmxc) when configured, else falls back to control.
+        hp = host_exec.popen_on_host(
+            cmd, cwd=_host_job_cwd(log_dir), env=_subprocess_env(), profile="script"
         )
-        ok = proc.returncode == 0
+        try:
+            out, err = hp.communicate(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            hp.kill()
+            try:
+                hp.communicate(timeout=15)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            _patch(
+                phase="error",
+                ok=False,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                returncode=-1,
+                stdout="",
+                stderr=f"timeout after {timeout_sec}s",
+                command_display=display_cmd,
+                error=f"NVLink SDN reset timed out after {timeout_sec}s",
+            )
+            _reset_job_purge_later(job_id)
+            return
+        rc = hp.returncode if hp.returncode is not None else -1
+        ok = rc == 0
         _patch(
             phase="done" if ok else "error",
             ok=ok,
             finished_at=datetime.now(timezone.utc).isoformat(),
-            returncode=proc.returncode,
-            stdout=(proc.stdout or "").strip(),
-            stderr=(proc.stderr or "").strip(),
+            returncode=rc,
+            stdout=(out or "").strip(),
+            stderr=(err or "").strip(),
             command_display=display_cmd,
             error=None if ok else "nvswitch_sdn_reset.sh exited non-zero (see stdout/stderr)",
-        )
-    except subprocess.TimeoutExpired:
-        _patch(
-            phase="error",
-            ok=False,
-            finished_at=datetime.now(timezone.utc).isoformat(),
-            returncode=-1,
-            stdout="",
-            stderr=f"timeout after {timeout_sec}s",
-            command_display=display_cmd,
-            error=f"NVLink SDN reset timed out after {timeout_sec}s",
         )
     except Exception as e:
         _patch(
@@ -5973,7 +7516,7 @@ def api_nvswitch_sdn_reset_async():
         return err[0], err[1]
     assert prep is not None
     log_dir = prep["log_dir"]
-    assert isinstance(log_dir, Path)
+    assert isinstance(log_dir, (Path, PurePosixPath))
     rack = str(prep["rack"])
     cmd = list(prep["cmd"])
     assert isinstance(cmd, list)
@@ -6030,10 +7573,16 @@ def _nvswitch_system_reset_async_worker(job_id: str, log_dir: Path, cmd: list[st
     """Run ``nvswitch_system_reset.sh RACK NVSWITCH_HOST`` in a background thread."""
 
     def _patch(**kwargs: object) -> None:
+        finished = None
         with _reset_jobs_lock:
             row = _reset_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+                # Snapshot inside the lock; push outside it so the lake call never holds the mutex.
+                if str(kwargs.get("phase") or "") in ("done", "error"):
+                    finished = dict(row)
+        if finished is not None:
+            _lake_push_job(job_id, finished)
 
     timeout_sec = max(60, _env_int("RACK_NVSWITCH_SYSTEM_RESET_TIMEOUT", 1800))
     try:
@@ -6041,35 +7590,42 @@ def _nvswitch_system_reset_async_worker(job_id: str, log_dir: Path, cmd: list[st
             phase="running",
             started_running_at=datetime.now(timezone.utc).isoformat(),
         )
-        proc = subprocess.run(
-            cmd,
-            cwd=str(log_dir),
-            env=_subprocess_env(),
-            capture_output=True,
-            text=True,
-            timeout=timeout_sec,
+        # profile="script" routes to the privileged node-operational SSH target
+        # (RACK_SCRIPT_SSH_*, root+nmxc) when configured, else falls back to control.
+        hp = host_exec.popen_on_host(
+            cmd, cwd=_host_job_cwd(log_dir), env=_subprocess_env(), profile="script"
         )
-        ok = proc.returncode == 0
+        try:
+            out, err = hp.communicate(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            hp.kill()
+            try:
+                hp.communicate(timeout=15)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            _patch(
+                phase="error",
+                ok=False,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                returncode=-1,
+                stdout="",
+                stderr=f"timeout after {timeout_sec}s",
+                command_display=display_cmd,
+                error=f"NVLink system reset timed out after {timeout_sec}s",
+            )
+            _reset_job_purge_later(job_id)
+            return
+        rc = hp.returncode if hp.returncode is not None else -1
+        ok = rc == 0
         _patch(
             phase="done" if ok else "error",
             ok=ok,
             finished_at=datetime.now(timezone.utc).isoformat(),
-            returncode=proc.returncode,
-            stdout=(proc.stdout or "").strip(),
-            stderr=(proc.stderr or "").strip(),
+            returncode=rc,
+            stdout=(out or "").strip(),
+            stderr=(err or "").strip(),
             command_display=display_cmd,
             error=None if ok else "nvswitch_system_reset.sh exited non-zero (see stdout/stderr)",
-        )
-    except subprocess.TimeoutExpired:
-        _patch(
-            phase="error",
-            ok=False,
-            finished_at=datetime.now(timezone.utc).isoformat(),
-            returncode=-1,
-            stdout="",
-            stderr=f"timeout after {timeout_sec}s",
-            command_display=display_cmd,
-            error=f"NVLink system reset timed out after {timeout_sec}s",
         )
     except Exception as e:
         _patch(
@@ -6105,7 +7661,7 @@ def api_nvswitch_system_reset_async():
         return err[0], err[1]
     assert prep is not None
     log_dir = prep["log_dir"]
-    assert isinstance(log_dir, Path)
+    assert isinstance(log_dir, (Path, PurePosixPath))
     rack = str(prep["rack"])
     cmd = list(prep["cmd"])
     assert isinstance(cmd, list)
@@ -6167,10 +7723,16 @@ def _imex_reset_async_worker(job_id: str, log_dir: Path, cmd: list[str], display
     """Run ``imex_reset.sh RACK`` in a background thread."""
 
     def _patch(**kwargs: object) -> None:
+        finished = None
         with _reset_jobs_lock:
             row = _reset_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+                # Snapshot inside the lock; push outside it so the lake call never holds the mutex.
+                if str(kwargs.get("phase") or "") in ("done", "error"):
+                    finished = dict(row)
+        if finished is not None:
+            _lake_push_job(job_id, finished)
 
     timeout_sec = max(60, _env_int("RACK_IMEX_RESET_TIMEOUT", 1800))
     try:
@@ -6178,35 +7740,42 @@ def _imex_reset_async_worker(job_id: str, log_dir: Path, cmd: list[str], display
             phase="running",
             started_running_at=datetime.now(timezone.utc).isoformat(),
         )
-        proc = subprocess.run(
-            cmd,
-            cwd=str(log_dir),
-            env=_subprocess_env(),
-            capture_output=True,
-            text=True,
-            timeout=timeout_sec,
+        # profile="script" routes to the privileged node-operational SSH target
+        # (RACK_SCRIPT_SSH_*, root+nmxc) when configured, else falls back to control.
+        hp = host_exec.popen_on_host(
+            cmd, cwd=_host_job_cwd(log_dir), env=_subprocess_env(), profile="script"
         )
-        ok = proc.returncode == 0
+        try:
+            out, err = hp.communicate(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            hp.kill()
+            try:
+                hp.communicate(timeout=15)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            _patch(
+                phase="error",
+                ok=False,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                returncode=-1,
+                stdout="",
+                stderr=f"timeout after {timeout_sec}s",
+                command_display=display_cmd,
+                error=f"IMEX reset timed out after {timeout_sec}s",
+            )
+            _reset_job_purge_later(job_id)
+            return
+        rc = hp.returncode if hp.returncode is not None else -1
+        ok = rc == 0
         _patch(
             phase="done" if ok else "error",
             ok=ok,
             finished_at=datetime.now(timezone.utc).isoformat(),
-            returncode=proc.returncode,
-            stdout=(proc.stdout or "").strip(),
-            stderr=(proc.stderr or "").strip(),
+            returncode=rc,
+            stdout=(out or "").strip(),
+            stderr=(err or "").strip(),
             command_display=display_cmd,
             error=None if ok else "imex_reset.sh exited non-zero (see stdout/stderr)",
-        )
-    except subprocess.TimeoutExpired:
-        _patch(
-            phase="error",
-            ok=False,
-            finished_at=datetime.now(timezone.utc).isoformat(),
-            returncode=-1,
-            stdout="",
-            stderr=f"timeout after {timeout_sec}s",
-            command_display=display_cmd,
-            error=f"IMEX reset timed out after {timeout_sec}s",
         )
     except Exception as e:
         _patch(
@@ -6230,8 +7799,13 @@ def api_imex_reset_async():
     if err is not None:
         return err[0], err[1]
     assert prep is not None
+    # `_resolve_log_dir()` returns a **PurePosixPath** in ssh mode (the log dir lives on the head
+    # node), and PurePosixPath is NOT a subclass of Path — so `assert isinstance(log_dir, Path)`
+    # raised AssertionError -> HTTP 500 on EVERY call. This route has never worked in ssh mode.
+    # Same bug class as the log readers fixed earlier (see the comment at api_rack_log_content);
+    # this handler never got the memo. Accept either flavour.
     log_dir = prep["log_dir"]
-    assert isinstance(log_dir, Path)
+    assert isinstance(log_dir, (Path, PurePosixPath))
     rack = str(prep["rack"])
     cmd = list(prep["cmd"])
     assert isinstance(cmd, list)
@@ -6256,8 +7830,10 @@ def api_imex_reset_async():
 
 
 def _nvlmapper_reports_base() -> Path:
+    # An execution-host directory: expanduser/resolve would answer with this
+    # process's home and filesystem, which is not where the reports are written.
     raw = (_eget("RACK_NVLMAPPER_REPORTS_BASE") or "/home/cmsupport/reports").strip()
-    return Path(os.path.expanduser(raw or "/home/cmsupport/reports")).resolve()
+    return _rpath(raw or "/home/cmsupport/reports")
 
 
 def _prepare_nvlmapper_async(body: dict) -> tuple[dict[str, object] | None, tuple[object, int] | None]:
@@ -6290,49 +7866,55 @@ def _prepare_nvlmapper_async(body: dict) -> tuple[dict[str, object] | None, tupl
 
 def _nvlmapper_zip_path_allowed(path: Path, rack: str) -> bool:
     """Legacy: allow only a finished-job zip under ``reports/<rack>/`` (new runs no longer create zips)."""
-    base = (_nvlmapper_reports_base() / rack).resolve()
+    base = _rpath(_nvlmapper_reports_base() / rack)
     try:
-        path.resolve().relative_to(base)
+        _rpath(path).relative_to(base)
     except ValueError:
         return False
     name = path.name
     if not name.startswith(f"nvlmapper.{rack}.") or not name.lower().endswith(".zip"):
         return False
-    return path.is_file()
+    return host_exec.is_file(path)
 
 
 def _nvlmapper_stage_cleanup_keep_outputs(work: Path, rack: str) -> None:
     """Remove staged ``nvlmapper`` binary and ``run_nvlmapper.sh``; drop generated YAML with credentials.
 
     CSV / XLS / XLSX (and other outputs) remain under *work* for operators to copy from ``reports/<rack>/``.
+
+    Runs on the execution host: the staging directory is wherever the tool ran,
+    which is also the only place the credential-bearing YAML exists. Deleting it
+    locally would leave the real one in place.
     """
-    for name in ("nvlmapper", "run_nvlmapper.sh"):
-        p = work / name
-        try:
-            if p.is_file():
-                p.unlink(missing_ok=True)
-        except OSError:
-            pass
-    for yaml_name in (f"config-{rack}.yaml", f"config_{rack}.yaml"):
-        p = work / yaml_name
-        try:
-            if p.is_file():
-                p.unlink(missing_ok=True)
-        except OSError:
-            pass
+    doomed = [
+        f"{work}/{name}"
+        for name in ("nvlmapper", "run_nvlmapper.sh", f"config-{rack}.yaml", f"config_{rack}.yaml")
+    ]
+    # -f so an absent file is not an error; the YAML only exists on some runs.
+    host_exec.run_on_host(
+        "rm -f " + " ".join(shlex.quote(p) for p in doomed),
+        timeout=60,
+        role="scripts",
+    )
 
 
 def _nvlmapper_async_worker(job_id: str, rack: str) -> None:
     """Stage ``nvlmapper`` + ``run_nvlmapper.sh``, run ``./run_nvlmapper.sh``, then clean staging only (keep outputs)."""
 
     def _patch(**kwargs: object) -> None:
+        finished = None
         with _reset_jobs_lock:
             row = _reset_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+                # Snapshot inside the lock; push outside it so the lake call never holds the mutex.
+                if str(kwargs.get("phase") or "") in ("done", "error"):
+                    finished = dict(row)
+        if finished is not None:
+            _lake_push_job(job_id, finished)
 
     timeout_sec = max(120, _env_int("RACK_NVLMAPPER_TIMEOUT", 14400))
-    work = (_nvlmapper_reports_base() / rack).resolve()
+    work = _rpath(_nvlmapper_reports_base() / rack)
     display_cmd = f"(cd {shlex.quote(str(work))} && ./run_nvlmapper.sh {shlex.quote(rack)})"
     env = _subprocess_env()
     work_dir_s = str(work)
@@ -6344,18 +7926,32 @@ def _nvlmapper_async_worker(job_id: str, rack: str) -> None:
             command_display=display_cmd,
             nvlmapper_work_dir=work_dir_s,
         )
-        work.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(SCRIPTS_DIR / "nvlmapper", work / "nvlmapper")
-        shutil.copy2(SCRIPTS_DIR / "run_nvlmapper.sh", work / "run_nvlmapper.sh")
-        (work / "nvlmapper").chmod(0o755)
-        (work / "run_nvlmapper.sh").chmod(0o755)
-        proc = subprocess.run(
+        # Stage on the execution host, not here: the nvlmapper binary lives in the
+        # scripts tree over there and the work dir is where the tool must run, so
+        # a local mkdir/copy staged the files onto the wrong machine and then ran
+        # nothing. One command keeps the copy on the far side of the connection.
+        scripts_root = _scripts_dir()
+        staged = [f"{work_dir_s}/nvlmapper", f"{work_dir_s}/run_nvlmapper.sh"]
+        stage_cmd = " && ".join(
+            [
+                f"mkdir -p {shlex.quote(work_dir_s)}",
+                f"cp -f {shlex.quote(scripts_root + '/nvlmapper')} {shlex.quote(staged[0])}",
+                f"cp -f {shlex.quote(scripts_root + '/run_nvlmapper.sh')} {shlex.quote(staged[1])}",
+                "chmod 755 " + " ".join(shlex.quote(p) for p in staged),
+            ]
+        )
+        stage_proc = host_exec.run_on_host(stage_cmd, timeout=180, role="scripts")
+        if stage_proc.returncode != 0:
+            raise OSError(
+                f"could not stage nvlmapper in {work_dir_s}: "
+                f"{(stage_proc.stderr or '').strip()[:300]}"
+            )
+        proc = host_exec.run_on_host(
             ["./run_nvlmapper.sh", rack],
-            cwd=str(work),
+            cwd=work_dir_s,
             env=env,
-            capture_output=True,
-            text=True,
             timeout=timeout_sec,
+            role="scripts",
         )
         out = (proc.stdout or "").strip()
         err = (proc.stderr or "").strip()
@@ -6424,7 +8020,7 @@ def api_nvlmapper_async():
             "phase": "starting",
             "created_at": created,
             "nvlmapper_zip": "",
-            "nvlmapper_work_dir": str((_nvlmapper_reports_base() / rack).resolve()),
+            "nvlmapper_work_dir": str(_rpath(_nvlmapper_reports_base() / rack)),
         }
     threading.Thread(
         target=_nvlmapper_async_worker,
@@ -6489,10 +8085,16 @@ def _precheck_async_worker(job_id: str, log_dir: Path, cmd: list[str], display_c
     """Run async precheck via sysinfo.sh in a background thread."""
 
     def _patch(**kwargs: object) -> None:
+        finished = None
         with _reset_jobs_lock:
             row = _reset_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+                # Snapshot inside the lock; push outside it so the lake call never holds the mutex.
+                if str(kwargs.get("phase") or "") in ("done", "error"):
+                    finished = dict(row)
+        if finished is not None:
+            _lake_push_job(job_id, finished)
 
     timeout_sec = max(30, _job_env_int("RACK_SYSINFO_TIMEOUT", 1800))
     try:
@@ -6500,13 +8102,15 @@ def _precheck_async_worker(job_id: str, log_dir: Path, cmd: list[str], display_c
             phase="running",
             started_running_at=datetime.now(timezone.utc).isoformat(),
         )
-        proc = subprocess.run(
+        # A cluster script with the log dir as cwd: both belong to the execution
+        # host, so this goes through the connection on the privileged route (see
+        # docs/EXECUTION_ARCHITECTURE.md 1.2) rather than a local subprocess.
+        proc = host_exec.run_on_host(
             cmd,
             cwd=str(log_dir),
             env=_subprocess_env(),
-            capture_output=True,
-            text=True,
             timeout=timeout_sec,
+            role="script",
         )
         ok = proc.returncode == 0
         _patch(
@@ -6553,7 +8157,7 @@ def api_precheck_async():
         return err[0], err[1]
     assert prep is not None
     log_dir = prep["log_dir"]
-    assert isinstance(log_dir, Path)
+    assert isinstance(log_dir, (Path, PurePosixPath))
     rack = str(prep["rack"])
     cmd = list(prep["cmd"])
     assert isinstance(cmd, list)
@@ -6601,10 +8205,16 @@ def _nvswitch_check_async_worker(
     """Run async nvswitch check (nvswitches_rack_audit.sh without --fix)."""
 
     def _patch(**kwargs: object) -> None:
+        finished = None
         with _reset_jobs_lock:
             row = _reset_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+                # Snapshot inside the lock; push outside it so the lake call never holds the mutex.
+                if str(kwargs.get("phase") or "") in ("done", "error"):
+                    finished = dict(row)
+        if finished is not None:
+            _lake_push_job(job_id, finished)
 
     timeout_sec = max(60, _env_int("RACK_NVSWITCH_AUDIT_TIMEOUT", 7200))
     try:
@@ -6612,13 +8222,15 @@ def _nvswitch_check_async_worker(
             phase="running",
             started_running_at=datetime.now(timezone.utc).isoformat(),
         )
-        proc = subprocess.run(
+        # A cluster script with the log dir as cwd: both belong to the execution
+        # host, so this goes through the connection on the privileged route (see
+        # docs/EXECUTION_ARCHITECTURE.md 1.2) rather than a local subprocess.
+        proc = host_exec.run_on_host(
             cmd,
             cwd=str(log_dir),
             env=_subprocess_env(),
-            capture_output=True,
-            text=True,
             timeout=timeout_sec,
+            role="script",
         )
         ok = proc.returncode == 0
         _patch(
@@ -6665,7 +8277,7 @@ def api_nvswitch_check_async():
         return err[0], err[1]
     assert prep is not None
     log_dir = prep["log_dir"]
-    assert isinstance(log_dir, Path)
+    assert isinstance(log_dir, (Path, PurePosixPath))
     rack = str(prep["rack"])
     cmd = list(prep["cmd"])
     assert isinstance(cmd, list)
@@ -6712,10 +8324,16 @@ def _imex_check_async_worker(job_id: str, log_dir: Path, cmd: list[str], display
     """Run async IMEX check in a background thread."""
 
     def _patch(**kwargs: object) -> None:
+        finished = None
         with _reset_jobs_lock:
             row = _reset_jobs.get(job_id)
             if row is not None:
                 row.update(kwargs)
+                # Snapshot inside the lock; push outside it so the lake call never holds the mutex.
+                if str(kwargs.get("phase") or "") in ("done", "error"):
+                    finished = dict(row)
+        if finished is not None:
+            _lake_push_job(job_id, finished)
 
     timeout_sec = max(30, _job_env_int("RACK_SYSINFO_TIMEOUT", 1800))
     try:
@@ -6723,13 +8341,15 @@ def _imex_check_async_worker(job_id: str, log_dir: Path, cmd: list[str], display
             phase="running",
             started_running_at=datetime.now(timezone.utc).isoformat(),
         )
-        proc = subprocess.run(
+        # A cluster script with the log dir as cwd: both belong to the execution
+        # host, so this goes through the connection on the privileged route (see
+        # docs/EXECUTION_ARCHITECTURE.md 1.2) rather than a local subprocess.
+        proc = host_exec.run_on_host(
             cmd,
             cwd=str(log_dir),
             env=_subprocess_env(),
-            capture_output=True,
-            text=True,
             timeout=timeout_sec,
+            role="script",
         )
         ok = proc.returncode == 0
         _patch(
@@ -6776,7 +8396,7 @@ def api_imex_check_async():
         return err[0], err[1]
     assert prep is not None
     log_dir = prep["log_dir"]
-    assert isinstance(log_dir, Path)
+    assert isinstance(log_dir, (Path, PurePosixPath))
     rack = str(prep["rack"])
     cmd = list(prep["cmd"])
     assert isinstance(cmd, list)
@@ -6798,6 +8418,197 @@ def api_imex_check_async():
         daemon=True,
     ).start()
     return jsonify({"ok": True, "job_id": job_id, "kind": "imex_check", "rack": rack})
+
+
+def _nvlink_preflight_script_path() -> Path:
+    raw = (_eget("RACK_NVLINK_PREFLIGHT_SCRIPT") or "").strip()
+    if raw:
+        return _rpath(Path(raw))
+    return _rpath(SCRIPTS_DIR / "nvlink_preflight.sh")
+
+
+def run_nvlink_preflight_pdsh(pdsh_w: str, *, quick: bool) -> dict:
+    """pdsh ``nvlink_preflight.sh`` across *pdsh_w*; returns per-node rows plus raw output.
+
+    The script runs ON each node, so the deployed copy must be readable there (it lives under
+    the shared RACK_REMOTE_BASE_PATH, which is NFS on BCM). Unlike hw-check there is no wrapper
+    script doing the fan-out, so the pdsh command is built here.
+    """
+    script = _nvlink_preflight_script_path()
+    if not _script_exists(script):
+        raise OSError(f"nvlink_preflight.sh not found: {script}")
+    w = _expand_pdsh_w_slurm_nodenames((pdsh_w or "").strip())
+    if not w:
+        raise ValueError("empty pdsh -w pattern")
+    # Expand brackets rather than splitting on commas: this site's tray range CONTAINS a comma
+    # (``[11-18,28-37]``), and scontrol expansion above is best-effort, so ``w`` may still be
+    # bracketed. A naive split produced "r-[11-18" and "28-37]" and reported a healthy 18-node
+    # rack as "2 nodes did not respond".
+    expected = nvlink_preflight.expand_pdsh_w(w)
+    # The functional probe alone allows 120s per node; pdsh fans out in parallel, so the wall
+    # clock is roughly one node's worth plus scheduling. Quick mode skips it entirely.
+    default_timeout = 600 if quick else 1800
+    timeout = max(60, _env_int("RACK_NVLINK_PREFLIGHT_TIMEOUT", default_timeout))
+    remote = f"bash {shlex.quote(str(script))}" + (" --quick" if quick else " --full")
+    plat = _get_platform()
+    cmd = plat.pdsh_cmd(w, remote)
+    # Force the ssh transport. pdsh on this fleet defaults to rsh, which the compute nodes refuse
+    # with "rcmd: socket: Permission denied" — every pdsh script in bin/scripts sets both of these
+    # for that reason, but Platform.pdsh_cmd() does not, so a direct caller has to.
+    if "pdsh" in (cmd[0] if cmd else "") and "-R" not in cmd:
+        cmd = [cmd[0], "-R", "ssh", *cmd[1:]]
+    env = _subprocess_env()
+    env["PDSH_RCMD_TYPE"] = "ssh"
+    cmd_display = " ".join(shlex.quote(c) for c in cmd)
+    try:
+        proc = host_exec.run_on_host(
+            cmd,
+            timeout=timeout,
+            env=env,
+            profile="script",
+        )
+    except FileNotFoundError as e:
+        raise OSError(f"pdsh not available on the execution host: {e}") from e
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    rows = nvlink_preflight.parse_nvlink_preflight_output(out, err, expected)
+    summary = nvlink_preflight.summarize(rows)
+    # pdsh exits non-zero when ANY node's command failed, and nvlink_preflight.sh exits 1 on a
+    # FAIL verdict — so a non-zero rc here is the normal "some node is not ready" case, not a
+    # tooling error. The verdict comes from the parsed rows, never from the exit code.
+    return {
+        "returncode": proc.returncode,
+        "stdout": out,
+        "stderr": err,
+        "command_display": cmd_display,
+        "pdsh_w": w,
+        "quick": quick,
+        "rows": rows,
+        "summary": summary,
+    }
+
+
+def _nvlink_preflight_worker(job_id: str, pdsh_w: str, quick: bool, rack: str) -> None:
+    """Run the NVLink preflight in a background thread; patches ``_reset_jobs[job_id]``."""
+
+    def _patch(**kwargs: object) -> None:
+        finished = None
+        with _reset_jobs_lock:
+            row = _reset_jobs.get(job_id)
+            if row is not None:
+                row.update(kwargs)
+                if str(kwargs.get("phase") or "") in ("done", "error"):
+                    finished = dict(row)
+        if finished is not None:
+            _lake_push_job(job_id, finished)
+
+    try:
+        _patch(phase="running", started_running_at=datetime.now(timezone.utc).isoformat())
+        result = run_nvlink_preflight_pdsh(pdsh_w, quick=quick)
+        summary = result.get("summary") or {}
+        ready = bool(summary.get("ready"))
+        _patch(
+            # "done" means the check completed and every node is ready; anything else is
+            # surfaced as an error phase so the UI cannot paint an un-ready rack green.
+            #
+            # ``phase`` and ``summary.ready`` are the verdict. Do NOT read ``ok`` from
+            # /api/reset-job-status: that route sets ok=True to mean "status query succeeded"
+            # and overwrites whatever the worker stored here.
+            phase="done" if ready else "error",
+            ok=ready,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            returncode=result.get("returncode"),
+            stdout=result.get("stdout", ""),
+            stderr=result.get("stderr", ""),
+            command_display=result.get("command_display", ""),
+            pdsh_w=result.get("pdsh_w", ""),
+            quick=quick,
+            rows=result.get("rows", []),
+            summary=summary,
+            error=None if ready else _nvlink_preflight_error_text(summary),
+        )
+    except (OSError, ValueError) as e:
+        _patch(
+            phase="error",
+            ok=False,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            error=str(e),
+        )
+    finally:
+        _reset_job_purge_later(job_id)
+
+
+def _nvlink_preflight_error_text(summary: dict) -> str:
+    """One line naming what is not ready, so the operator does not have to read the table.
+
+    Only blocking conditions appear here. Skipped checks and warnings are reported in the payload
+    (``nodes_with_skips`` / ``nodes_with_warnings``) but never make a rack not-ready.
+    """
+    bits: list[str] = []
+    if summary.get("failed"):
+        bits.append(f"{summary['failed']} node(s) FAILED")
+    if summary.get("incomplete"):
+        bits.append(f"{summary['incomplete']} incomplete")
+    if summary.get("no_response"):
+        bits.append(f"{summary['no_response']} did not respond")
+    return "NVLink preflight: " + (", ".join(bits) if bits else "rack not ready")
+
+
+@app.route("/api/nvlink-preflight-async", methods=["POST"])
+def api_nvlink_preflight_async():
+    """POST ``{"rack": …, "specs"|"target": …, "quick": bool}`` — NVLink/NVLS readiness gate.
+
+    Async because the full gate runs a 120s forced-NVLink probe per node. Poll the shared
+    ``/api/reset-job-status?job_id=…``; the finished job carries ``rows`` and ``summary``.
+    """
+    if os.environ.get("RACK_NVLINK_PREFLIGHT_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        return jsonify({"ok": False, "error": "NVLink preflight disabled (RACK_NVLINK_PREFLIGHT_DISABLED)"}), 403
+    body = request.get_json(silent=True) or {}
+    rack_raw = body.get("rack")
+    if not isinstance(rack_raw, str) or not rack_raw.strip():
+        return jsonify({"ok": False, "error": "rack is required"}), 400
+    try:
+        rack = _normalize_rack_id(rack_raw)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+    # Prefer the operator's node selection; fall back to the whole rack.
+    pdsh_w = ""
+    target_raw = body.get("target")
+    if isinstance(target_raw, str) and target_raw.strip():
+        pdsh_w = target_raw.strip()
+    else:
+        specs_raw = body.get("specs")
+        if isinstance(specs_raw, list) and specs_raw:
+            pdsh_w = ",".join(str(x).strip() for x in specs_raw if str(x).strip())
+    if not pdsh_w:
+        try:
+            pdsh_w = validation_target_for_rack(rack, None)
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+
+    quick = bool(body.get("quick", False))
+    script = _nvlink_preflight_script_path()
+    if not _script_exists(script):
+        return jsonify({"ok": False, "error": f"nvlink_preflight.sh not found: {script}"}), 500
+
+    job_id = str(uuid.uuid4())
+    with _reset_jobs_lock:
+        _reset_jobs[job_id] = {
+            "job_id": job_id,
+            "kind": "nvlink_preflight",
+            "operator": _operator_from_request(),
+            "rack": rack,
+            "quick": quick,
+            "phase": "starting",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    threading.Thread(
+        target=_nvlink_preflight_worker,
+        args=(job_id, pdsh_w, quick, rack),
+        daemon=True,
+    ).start()
+    return jsonify({"ok": True, "job_id": job_id, "kind": "nvlink_preflight", "rack": rack, "pdsh_w": pdsh_w})
 
 
 @app.route("/api/rack-uptime", methods=["POST"])
@@ -6935,8 +8746,22 @@ def api_slurm_drain():
         return jsonify({"ok": False, "error": str(e)}), 500
     ok = bool(result.get("ok"))
     payload: dict = {"ok": ok, "rack": _normalize_rack_id((body.get("rack") or "").strip()), "target": target, **result}
-    if not ok:
-        payload["error"] = "scontrol update failed (see stdout/stderr)"
+    if ok:
+        payload["message"] = f"Undrain (state=resume) applied to {len(target.split(','))} node(s)."
+    else:
+        err = f"{result.get('stderr') or ''} {result.get('stdout') or ''}".strip()
+        # Say WHAT went wrong, not just "see stdout/stderr" — the operator cannot act on that.
+        if "Invalid node state" in err:
+            payload["error"] = (
+                "scontrol rejected the state change — usually because none of these nodes are "
+                "drained or down, so there is nothing to undrain. Check Slurm state first "
+                "(sinfo -R). No change was made.")
+        elif "Invalid node name" in err:
+            payload["error"] = "scontrol did not recognise one or more node names. No change was made."
+        elif "Access/permission denied" in err or "Invalid user" in err:
+            payload["error"] = "scontrol denied the update — the service account lacks Slurm operator rights."
+        else:
+            payload["error"] = f"scontrol update failed: {err[:300] or 'no output'}"
     return jsonify(payload), (200 if ok else 502)
 
 
@@ -6950,15 +8775,78 @@ def api_slurm_undrain():
     if err:
         return jsonify({"ok": False, "error": err}), 400
     rk_for_lock = (body.get("rack") or "").strip()
+    rk_norm = _normalize_rack_id((body.get("rack") or "").strip())
+
+    # Ask Slurm WHICH of these nodes is actually drained/down before touching anything.
+    # Slurm rejects BOTH `state=idle` and `state=resume` with "Invalid node state specified" when
+    # the target set contains no drained/down node — an operator clicking Undrain on a healthy rack
+    # got a red "scontrol update failed" that looked like a broken cluster. Nothing was ever wrong.
+    drained: list[str] = []
+    state_err = ""
+    try:
+        # Resolve `sinfo` through the platform layer, exactly as _run_sinfo_r() does. A
+        # bare `sinfo` is not enough: a site may set RACK_SLURM_SKIP_MODULE_LOAD=1 and pin
+        # RACK_SLURM_SINFO to an absolute path, leaving nothing to put it on PATH. The
+        # probe then died with "sinfo: command not found" and its empty stdout read as
+        # "no drained nodes", so Undrain returned a green 200 having done nothing.
+        plat = _get_platform()
+        probe = host_exec.run_slurm_on_host(
+            plat.sinfo_cmd(f"-h -N -o '%N %t' -n {shlex.quote(target)}"),
+            timeout=max(5, _env_int("RACK_SLURM_SCONTROL_TIMEOUT", 120)),
+        )
+        # A probe that FAILED is not evidence that every node is healthy. Treat a
+        # non-zero return as unknown and fall through to the update below, rather than
+        # reporting "nothing to undrain" -- a check that cannot read its input must
+        # never report a healthy state.
+        if probe.returncode != 0:
+            state_err = (
+                f"sinfo probe failed (rc={probe.returncode}): "
+                f"{(probe.stderr or '').strip()[:200]}"
+            )
+        for line in (probe.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and any(
+                k in parts[1].lower() for k in ("drain", "down", "fail", "inval")
+            ):
+                drained.append(parts[0])
+    except Exception as e:  # noqa: BLE001 - fall through to the plain update
+        state_err = str(e)
+
+    if not drained and not state_err:
+        # Nothing to do, and saying so is the honest answer — not an error.
+        return jsonify({
+            "ok": True, "rack": rk_norm, "target": target, "changed": 0,
+            "message": (
+                f"Nothing to undrain — all {len(target.split(','))} node(s) are already "
+                "schedulable (no drain/down state). No change was made."
+            ),
+        }), 200
+
+    apply_to = ",".join(drained) if drained else target
     try:
         with _track_sync_op(rk_for_lock, "slurm_undrain", _operator_from_request()):
-            result = _run_scontrol_node_update(target, ["state=idle"])
+            # `state=resume` is the canonical verb for returning a DOWN/DRAINED node to service.
+            result = _run_scontrol_node_update(apply_to, ["state=resume"])
     except OSError as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
     ok = bool(result.get("ok"))
-    payload: dict = {"ok": ok, "rack": _normalize_rack_id((body.get("rack") or "").strip()), "target": target, **result}
-    if not ok:
-        payload["error"] = "scontrol update failed (see stdout/stderr)"
+    payload: dict = {"ok": ok, "rack": rk_norm, "target": apply_to,
+                     "changed": len(drained), **result}
+    if ok:
+        payload["message"] = (
+            f"Undrained {len(drained) or 'all targeted'} node(s): {apply_to[:200]}")
+    else:
+        err = f"{result.get('stderr') or ''} {result.get('stdout') or ''}".strip()
+        if "Invalid node state" in err:
+            payload["error"] = ("Slurm rejected the state change — none of these nodes are "
+                                "drained or down. No change was made.")
+        elif "Invalid node name" in err:
+            payload["error"] = "Slurm did not recognise one or more node names. No change was made."
+        elif "denied" in err.lower():
+            payload["error"] = "Slurm denied the update — the service account lacks operator rights."
+        else:
+            payload["error"] = f"scontrol update failed: {err[:300] or 'no output'}"
     return jsonify(payload), (200 if ok else 502)
 
 
@@ -7037,6 +8925,149 @@ def api_slurm_squeue():
     except OSError as e:
         return jsonify({"ok": False, "error": str(e)}), 500
     return jsonify(result)
+
+
+_SACCT_FIELD_ORDER = (
+    "job_id", "name", "partition", "nnodes", "nodelist", "start", "end", "elapsed", "state", "exit_code",
+)
+_SLURM_STDOUT_RE = re.compile(r"StdOut=(\S+)")
+# Terminal (finished) job states — what the Scheduler "recent jobs" panel shows so a
+# job that has left squeue (success OR failure) is still visible with its log.
+_SACCT_TERMINAL_STATES = frozenset({
+    "COMPLETED", "FAILED", "TIMEOUT", "CANCELLED", "NODE_FAIL",
+    "OUT_OF_MEMORY", "PREEMPTED", "BOOT_FAIL", "DEADLINE",
+})
+
+
+def _run_sacct_recent(limit: int = 10, state: str = "COMPLETED") -> dict:
+    """Recent finished Slurm jobs from ``sacct`` — the accounting DB retains history
+    that ``squeue`` drops the instant a job ends (the "blink and you miss it" gap).
+
+    Allocation rows only (``-X``), pipe-parseable (``-P``), newest-first, capped to *limit*.
+    """
+    plat = _get_platform()
+    st = (state or "COMPLETED").strip().upper()
+    if not re.fullmatch(r"[A-Z_,]+", st):
+        st = "COMPLETED"
+    since = (_eget("RACK_SLURM_SACCT_SINCE") or "now-7days").strip() or "now-7days"
+    if not re.fullmatch(r"[A-Za-z0-9:_+\-]+", since):
+        since = "now-7days"
+    # NB: do NOT pass sacct --state=… : with only -S it returns nothing on this Slurm
+    # even though the same jobs report State=COMPLETED. Fetch all and filter in Python.
+    fmt = "JobID,JobName,Partition,NNodes,NodeList,Start,End,Elapsed,State,ExitCode"
+    args = f"-X -n -P -S {shlex.quote(since)} -o {shlex.quote(fmt)}"
+    shell_cmd = plat.sacct_cmd(args)
+    timeout = max(5, _env_int("RACK_SLURM_SACCT_TIMEOUT", 60))
+    try:
+        proc = host_exec.run_slurm_on_host(shell_cmd, timeout=timeout)
+    except FileNotFoundError:
+        raise OSError("sacct executable not found; ensure Slurm accounting (sacct) is available") from None
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False, "returncode": -1, "stdout": "", "stderr": f"timeout after {timeout}s",
+            "command_display": shell_cmd, "jobs": [],
+        }
+    if st == "ALL":
+        want_states: set[str] = set()
+    elif st in ("FINISHED", "TERMINAL"):
+        want_states = set(_SACCT_TERMINAL_STATES)
+    else:
+        want_states = {s for s in st.split(",") if s}
+    jobs: list[dict] = []
+    for line in (proc.stdout or "").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|")
+        if len(parts) < len(_SACCT_FIELD_ORDER):
+            continue
+        row = dict(zip(_SACCT_FIELD_ORDER, [p.strip() for p in parts]))
+        if not _slurm_job_base_id(row.get("job_id")):
+            continue
+        # State can carry a suffix, e.g. "CANCELLED by 12345"; match the leading token.
+        row_state = (row.get("state") or "").split()[0].upper() if (row.get("state") or "").strip() else ""
+        if want_states and row_state not in want_states:
+            continue
+        jobs.append(row)
+    # Newest first: End is ISO-ish (sorts lexically); tie-break on numeric job id.
+    jobs.sort(key=lambda r: (r.get("end") or "", int(_slurm_job_base_id(r.get("job_id")) or 0)), reverse=True)
+    jobs = jobs[: max(1, limit)]
+    return {
+        "ok": proc.returncode == 0, "returncode": proc.returncode,
+        "stdout": (proc.stdout or "").strip(), "stderr": (proc.stderr or "").strip(),
+        "command_display": shell_cmd, "jobs": jobs,
+    }
+
+
+@app.route("/api/slurm-sacct-recent", methods=["GET"])
+def api_slurm_sacct_recent():
+    """Recent finished Slurm jobs via ``sacct`` — query ``limit`` (1-50, default 10) and ``state`` (default COMPLETED)."""
+    if os.environ.get("RACK_SLURM_SACCT_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        return jsonify({"ok": False, "error": "sacct disabled (RACK_SLURM_SACCT_DISABLED)", "jobs": []}), 403
+    try:
+        limit = int((request.args.get("limit") or "10").strip())
+    except (TypeError, ValueError):
+        limit = 10
+    limit = min(50, max(1, limit))
+    state = (request.args.get("state") or "COMPLETED").strip() or "COMPLETED"
+    try:
+        result = _run_sacct_recent(limit=limit, state=state)
+    except OSError as e:
+        return jsonify({"ok": False, "error": str(e), "jobs": []}), 500
+    return jsonify(result)
+
+
+def _slurm_job_log_path(job_id: str, log_dir: Path) -> tuple[str, str]:
+    """Resolve a finished job's stdout path: ``scontrol`` ``StdOut=`` (jobs still within
+    MinJobAge), else glob the dashboard log dir for the launcher's ``*_<jid>.out`` /
+    ``*-<jid>.txt`` (for jobs that have aged out of the controller)."""
+    jid = _slurm_job_base_id(job_id) or ""
+    if not jid:
+        return "", "invalid"
+    try:
+        r = _run_scontrol_show_job(jid)
+        if r.get("ok"):
+            m = _SLURM_STDOUT_RE.search(str(r.get("stdout") or ""))
+            if m:
+                p = m.group(1).strip()
+                if p and p.lower() not in ("(null)", "/dev/null", "none", "(none)"):
+                    return p, "scontrol"
+    except (ValueError, OSError):
+        pass
+    d = str(log_dir).rstrip("/")
+    if d:
+        listing = (
+            f"ls -1t {shlex.quote(d)}/*[_-]{jid}.out {shlex.quote(d)}/*[_-]{jid}.txt "
+            f"{shlex.quote(d)}/*-{jid}.out {shlex.quote(d)}/slurm-{jid}.out 2>/dev/null | head -1"
+        )
+        try:
+            proc = host_exec.run_on_host(listing, timeout=max(5, _env_int("RACK_SLURM_LOGFIND_TIMEOUT", 20)))
+            lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+            if lines:
+                return lines[0], "logdir"
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return "", "not_found"
+
+
+@app.route("/api/slurm-job-log-path", methods=["GET"])
+def api_slurm_job_log_path():
+    """Resolve a finished job's stdout log path (for the Recent-jobs 'open log' action)."""
+    job_id = (request.args.get("job_id") or "").strip()
+    if not _slurm_job_base_id(job_id):
+        return jsonify({"ok": False, "error": "job_id must be a Slurm job id"}), 400
+    try:
+        log_dir = _resolve_log_dir((request.args.get("log_dir") or "").strip() or None)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    try:
+        path, source = _slurm_job_log_path(job_id, log_dir)
+    except OSError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    if not path:
+        return jsonify(
+            {"ok": False, "error": f"no stdout log found for job {job_id} (aged out of scontrol; no matching file under log_dir)"}
+        ), 404
+    return jsonify({"ok": True, "job_id": _slurm_job_base_id(job_id), "path": path, "source": source})
 
 
 def _run_sinfo_r() -> dict:
@@ -7167,26 +9198,32 @@ def _resolve_slurm_job_stdout_path(path_raw: str, log_dir_raw: str | None) -> Pa
     raw = (path_raw or "").strip()
     if not raw or ".." in raw or "://" in raw:
         raise ValueError("invalid path")
-    p = _resolve_path(Path(raw))
-    if not p.exists():
+    p = _rpath(Path(raw))
+    # Asked of the execution host, which is where the file lives. Checking locally
+    # was the bug behind "path does not exist" on Scheduler → open log.
+    if not host_exec.is_file(p):
         raise ValueError("path does not exist")
-    if not p.is_file():
-        raise ValueError("path is not a regular file")
     roots = _allowed_roots()
     if roots:
         ok = any(str(p).startswith(str(r) + os.sep) or p == r for r in roots)
         if not ok:
             raise ValueError("job stdout path must be under RACK_STATUS_ALLOWED_PREFIXES")
         return p
+    # NB: do NOT call .resolve() on the roots here. _resolve_log_dir / _default_log_dir
+    # already return correctly-formed paths per mode (resolved locally, left as-is on the
+    # remote host in SSH mode), and `p` came through _resolve_path with the same policy.
+    # Re-resolving in SSH mode rewrites a remote "/home/cmods/..." path into the local
+    # macOS firmlink "/System/Volumes/Data/home/cmods/...", so the prefix check fails even
+    # when the stdout file genuinely lives under log_dir.
     if log_dir_raw and str(log_dir_raw).strip():
         try:
             log_root = _resolve_log_dir(str(log_dir_raw).strip())
-            p.relative_to(log_root.resolve())
+            p.relative_to(log_root)
             return p
         except ValueError:
             pass
     try:
-        p.relative_to(_default_log_dir().resolve())
+        p.relative_to(_default_log_dir())
         return p
     except ValueError as e:
         raise ValueError(
@@ -7234,10 +9271,13 @@ def api_slurm_job_stdout_content():
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     max_inline = max(0, _env_int("RACK_LOG_INLINE_MAX_BYTES", 10 * 1024 * 1024))
-    try:
-        sz = lp.stat().st_size
-    except OSError as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    # The stdout file lives on the execution host, so size and content must be asked
+    # of the connection. Calling Path.stat()/read_bytes() here read the container's
+    # own filesystem and raised AttributeError on the remote PurePosixPath.
+    st = host_exec.stat(lp)
+    if st is None:
+        return jsonify({"ok": False, "error": "path does not exist"}), 404
+    sz = int(st.size)
     if sz > max_inline:
         return jsonify(
             {
@@ -7249,11 +9289,7 @@ def api_slurm_job_stdout_content():
                 "download_hint": "Use GET /api/slurm-job-stdout-download with the same query parameters.",
             }
         )
-    try:
-        raw = lp.read_bytes()
-    except OSError as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-    text = raw.decode("utf-8", errors="replace")
+    text, _meta = host_exec.read_text(lp, whole_bytes=max_inline)
     return jsonify(
         {
             "ok": True,
@@ -7276,8 +9312,24 @@ def api_slurm_job_stdout_download():
         lp = _resolve_slurm_job_stdout_path(path_raw, request.args.get("log_dir"))
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
-    if not lp.is_file():
+    if not host_exec.is_file(lp):
         return jsonify({"ok": False, "error": "not a file"}), 404
+    if not isinstance(lp, Path):
+        # Remote (ssh mode): the file is on the execution host, so send_file() cannot
+        # reach it. Same transfer as api_rack_log_download().
+        cp = host_exec.run_on_host(f"base64 -w0 {shlex.quote(str(lp))}")
+        if cp.returncode != 0 or not (cp.stdout or "").strip():
+            return jsonify(
+                {"ok": False, "error": f"cannot read remote log: {lp} {(cp.stderr or '').strip()}"}
+            ), 404
+        try:
+            blob = base64.b64decode((cp.stdout or "").strip())
+        except ValueError as e:  # binascii.Error subclasses ValueError
+            return jsonify({"ok": False, "error": f"decode failed: {e}"}), 500
+        resp = app.response_class(blob, mimetype="text/plain; charset=utf-8")
+        resp.headers["Content-Disposition"] = f'attachment; filename="{lp.name}"'
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
     return send_file(
         str(lp),
         as_attachment=True,
@@ -7336,14 +9388,28 @@ def _rack_log_resolve(
             ),
             404,
         )
-    root = log_dir.resolve()
-    lp = log_path.resolve()
-    try:
-        lp.relative_to(root)
-    except ValueError:
-        return jsonify({"ok": False, "error": "invalid log path"}), 400
-    if not lp.is_file():
-        return jsonify({"ok": False, "error": "log file not found"}), 404
+    # In ssh mode these are REMOTE paths (PurePosixPath): .resolve()/.is_file() touch the local
+    # filesystem and raise AttributeError, which Flask turns into a 500 -> an HTML error page ->
+    # "Unexpected token '<'" in the SPA. Only do filesystem checks for genuinely local paths.
+    if isinstance(log_dir, Path) and isinstance(log_path, Path):
+        root = _rpath(log_dir)
+        lp = _rpath(log_path)
+        try:
+            lp.relative_to(root)
+        except ValueError:
+            return jsonify({"ok": False, "error": "invalid log path"}), 400
+        if not lp.is_file():
+            return jsonify({"ok": False, "error": "log file not found"}), 404
+    else:
+        # PurePath.relative_to does not collapse "..", so normalise textually before the
+        # containment check or "<dir>/../../etc/passwd" would pass it.
+        root = PurePosixPath(os.path.normpath(str(log_dir)))
+        lp = PurePosixPath(os.path.normpath(str(log_path)))
+        try:
+            lp.relative_to(root)
+        except ValueError:
+            return jsonify({"ok": False, "error": "invalid log path"}), 400
+        # Existence is not checkable from here; a missing remote file surfaces as a read error.
     return log_dir, lp, rk
 
 
@@ -7356,9 +9422,28 @@ def api_rack_log_download():
         request.args.get("job_id"),
         request.args.get("log_file"),
     )
-    if not isinstance(out[0], Path):
+    # Arity, not isinstance -- see the note in api_rack_log_content(); log_dir is a PurePosixPath
+    # in ssh mode and would otherwise be returned to Flask as if it were an error tuple.
+    if len(out) != 3:
         return out
     _log_dir, lp, _rk = out
+    if not isinstance(lp, Path):
+        # Remote (ssh mode): the file is on the head node, so send_file() cannot reach it.
+        # Stream it over the same transport that produced the path.
+        q = shlex.quote(str(lp))
+        cp = host_exec.run_on_host(f"base64 -w0 {q}")
+        if cp.returncode != 0 or not (cp.stdout or "").strip():
+            return jsonify(
+                {"ok": False, "error": f"cannot read remote log: {lp} {(cp.stderr or '').strip()}"}
+            ), 404
+        try:
+            blob = base64.b64decode((cp.stdout or "").strip())
+        except ValueError as e:  # binascii.Error subclasses ValueError
+            return jsonify({"ok": False, "error": f"decode failed: {e}"}), 500
+        resp = app.response_class(blob, mimetype="text/plain; charset=utf-8")
+        resp.headers["Content-Disposition"] = f'attachment; filename="{lp.name}"'
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
     return send_file(
         str(lp),
         as_attachment=True,
@@ -7378,13 +9463,34 @@ def api_rack_log_content():
         request.args.get("job_id"),
         request.args.get("log_file"),
     )
-    if not isinstance(out[0], Path):
+    # _rack_log_resolve returns (jsonify, code) on error and (log_dir, lp, rk) on success.
+    # Do NOT discriminate with isinstance(out[0], Path): in ssh mode log_dir is a PurePosixPath,
+    # which is NOT a Path subclass, so every successful remote resolve was mistaken for an error
+    # and returned raw to Flask ->
+    #   TypeError: The view function did not return a valid response ... it was a PurePosixPath
+    # i.e. a 500 on EVERY log view in ssh mode. Discriminate on arity instead.
+    if len(out) != 3:
         return out
     _log_dir, lp, _rk = out
-    try:
-        sz = lp.stat().st_size
-    except OSError as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    # The log lives on the head node in ssh mode, so lp is a PurePosixPath and .stat()/.read_bytes()
+    # raise AttributeError -> 500 -> an HTML error page -> "Unexpected token '<'" in the SPA.
+    # Read it over the same transport that produced the path.
+    remote = not isinstance(lp, Path)
+    if remote:
+        q = shlex.quote(str(lp))
+        cp = host_exec.run_on_host(f"stat -c %s {q} 2>/dev/null || echo -1")
+        rc, so, se = cp.returncode, (cp.stdout or ""), (cp.stderr or "")
+        try:
+            sz = int(so.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            sz = -1
+        if rc != 0 or sz < 0:
+            return jsonify({"ok": False, "error": f"log file not found: {lp} {(se or '').strip()}"}), 404
+    else:
+        try:
+            sz = lp.stat().st_size
+        except OSError as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
     if sz > max_inline:
         return jsonify(
             {
@@ -7395,11 +9501,17 @@ def api_rack_log_content():
                 "max_inline_bytes": max_inline,
             }
         )
-    try:
-        raw = lp.read_bytes()
-    except OSError as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-    text = raw.decode("utf-8", errors="replace")
+    if remote:
+        cp = host_exec.run_on_host(f"cat {shlex.quote(str(lp))}")
+        if cp.returncode != 0:
+            return jsonify({"ok": False, "error": (cp.stderr or "remote read failed").strip()}), 500
+        text = cp.stdout or ""
+    else:
+        try:
+            raw = lp.read_bytes()
+        except OSError as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+        text = raw.decode("utf-8", errors="replace")
     return jsonify(
         {
             "ok": True,
@@ -7463,12 +9575,1104 @@ def _demo_parser_results():
     })
 
 
+# =====================================================================================
+# Universal log ingest + durable run history  (added 2026-07-28 — STRICTLY ADDITIVE)
+#
+# Nothing below changes an existing response shape.  Two new module surfaces are used,
+# both optional (``results_history`` / ``universal_parser`` are soft-imported at the top
+# of this file and may be ``None`` when their bind mount is missing):
+#
+#   * ``universal_parser``  normalises ANY log — including the *.log / *.json / no-extension
+#     files and the sub-directories that ``native_status._host_log_entries`` never lists —
+#     into one dict.  It is used as a FALLBACK: parser.sh stays authoritative whenever it
+#     actually produced a number.
+#   * ``results_history``   persists every parse as a run + metric rows in SQLite under
+#     ``/app/var/history`` (the ``rack-data`` named volume), giving the first real history.
+#
+# Every call site is wrapped: an exception here must degrade to the pre-2026-07-28
+# behaviour, never 500 a request that used to work.
+# =====================================================================================
+
+# Head+tail caps mirror universal_parser's own DEFAULT_HEAD_BYTES / DEFAULT_TAIL_BYTES so a
+# remote read produces the same text the module would have produced locally.
+_UNIVERSAL_HEAD_BYTES = 2 * 1024 * 1024
+_UNIVERSAL_TAIL_BYTES = 1 * 1024 * 1024
+_UNIVERSAL_WHOLE_BYTES = _UNIVERSAL_HEAD_BYTES + _UNIVERSAL_TAIL_BYTES
+# Extra extensions the legacy discovery path (*.txt / *.out only) can never see.
+_UNIVERSAL_INVENTORY_MAX_FILES = 4000
+_UNIVERSAL_SCAN_DEFAULT_FILES = 25
+_UNIVERSAL_SCAN_MAX_FILES = 400
+
+# Intermediate artefacts that are SUPERSEDED by an aggregated result log and must not be
+# ingested as runs of their own.
+#
+# llmb-run writes raw sbatch stdout to ``llmb-nccl_nodes_<jobid>.out`` and a collector trace to
+# ``llmb-autocollect_<jobid>.log``; ``collect_llmb_nccl_log.sh`` then aggregates the real result
+# into ``cmods-NCCL-1Rack-<rack>-<N>N-<jobid>.txt``. Ingesting the raw stdout too produced TWO
+# history rows per job, and the raw one is routinely marked ``fail`` because it still contains
+# srun/pmix noise from launch attempts that llmb-run retried successfully — so a passing rack
+# surfaced as failed in the dashboard. Judge a run by its aggregated log, never by sbatch stdout.
+#
+# Override with RACK_UNIVERSAL_SCAN_IGNORE_RE (a full-match regex over the basename); set it to
+# something that matches nothing (e.g. ``$^``) to restore the previous behaviour.
+_UNIVERSAL_SCAN_IGNORE_RE = re.compile(
+    os.environ.get("RACK_UNIVERSAL_SCAN_IGNORE_RE")
+    # These are llmb's INTERMEDIATE files, not results. Each has a real aggregated
+    # counterpart (<user>-NCCL-1Rack-… / <user>-NEMO-1Rack-…) that the collectors write;
+    # ingesting the intermediates too produces duplicate or empty rows.
+    #   llmb-nccl_<label>_<jid>.out   sbatch stdout. <label> was `nodes` until 2026-07-31,
+    #                                 when it became the rack id — so match ANY label, or
+    #                                 rack-labelled files silently start being ingested.
+    #   llmb-autocollect_<jid>.log    NCCL collector watcher log
+    #   llmb-nemo-autocollect_<jid>.log  NEMO collector watcher log
+    or r"llmb-nccl_.+_\d+\.out|llmb(-nemo)?-?autocollect_\d+\.log",
+    re.IGNORECASE,
+)
+
+
+def _truthy_arg(val: object, *, default: bool = False) -> bool:
+    """Query-string / JSON-body boolean. Absent or blank -> *default*."""
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    if not s:
+        return default
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _universal_enabled() -> bool:
+    """True when the universal log normaliser is importable and not disabled by env."""
+    return _uparse is not None and not _truthy_env("RACK_UNIVERSAL_PARSER_DISABLED")
+
+
+def _history_enabled() -> bool:
+    """True when the SQLite run-history store is importable and not disabled by env."""
+    return results_history is not None and not _truthy_env("RACK_RESULTS_HISTORY_DISABLED")
+
+
+# --- host-aware stat lookup ----------------------------------------------------------
+_HIST_STAT_TTL_SEC = 20.0
+_hist_stat_lock = threading.Lock()
+_hist_stat_cache: dict[str, tuple[float, dict[str, tuple[float, int]]]] = {}
+
+
+def _host_log_stat_map(base: str) -> dict[str, tuple[float, int]]:
+    """``{abs path: (mtime_epoch, size_bytes)}`` for one directory on the EXEC host.
+
+    ``native_status._host_log_entries`` shells out to ``find`` (over SSH when remote), and
+    parser-results is polled by the dashboard, so the answer is memoised for ~20 s. The
+    (mtime, size) pair is what makes a history ``run_id`` stable, so it must be the real
+    head-node value — never a container-local ``stat``. Never raises.
+    """
+    key = str(base).rstrip("/") or "/"
+    now = time.time()
+    with _hist_stat_lock:
+        hit = _hist_stat_cache.get(key)
+        if hit is not None and (now - hit[0]) < _HIST_STAT_TTL_SEC:
+            return hit[1]
+    out: dict[str, tuple[float, int]] = {}
+    try:
+        for path, mtime_ns, size in native_status._host_log_entries(key):
+            out[str(path)] = (int(mtime_ns) / 1_000_000_000.0, int(size))
+    except Exception as e:  # noqa: BLE001 - discovery is best-effort
+        _logger.debug("host log stat map failed for %s: %s", key, e)
+        return {}
+    with _hist_stat_lock:
+        _hist_stat_cache[key] = (now, out)
+    return out
+
+
+def _log_stat_for_path(log_dir: Path, log_path_s: str) -> tuple[float | None, int | None]:
+    """``(mtime_epoch, size_bytes)`` for one log on the exec host, or ``(None, None)``."""
+    p = str(log_path_s)
+    bases: list[str] = []
+    parent = os.path.dirname(p)
+    if parent:
+        bases.append(parent)
+    try:
+        root = str(native_status._host_resolve(log_dir)).rstrip("/")
+    except Exception:  # noqa: BLE001
+        root = ""
+    if root and root not in bases:
+        bases.append(root)
+    for b in bases:
+        m = _host_log_stat_map(b)
+        hit = m.get(p)
+        if hit is not None:
+            return hit
+    return (None, None)
+
+
+# --- "did parser.sh actually parse anything?" ----------------------------------------
+_PARSER_PLACEHOLDER_TOKENS = {"", "-", "--", "---", "?", "n/a", "na", "none", "null", "unk"}
+
+
+def _parser_scalar_is_real(v: object) -> bool:
+    """True when a parser.sh table cell holds a genuine number (not ``-`` / ``---`` / ``?``)."""
+    if v is None or isinstance(v, bool):
+        return False
+    if isinstance(v, (int, float)):
+        return math.isfinite(float(v))
+    s = str(v).strip().replace(",", "")
+    if s.lower() in _PARSER_PLACEHOLDER_TOKENS:
+        return False
+    try:
+        return math.isfinite(float(s))
+    except (TypeError, ValueError):
+        return False
+
+
+def _parser_json_has_usable_rows(parsed: object) -> bool:
+    """True when a ``parser.sh --json`` object carries at least one real measurement.
+
+    parser.sh runs every extractor on every input file unconditionally, so it emits a
+    fully-formed placeholder row (``'---'`` / ``'?'`` / status ``FAIL``) even for a log the
+    extractor did not apply to. "The tables are non-empty" is therefore NOT evidence that
+    anything was parsed — this predicate is what decides whether the universal fallback runs.
+    """
+    if not isinstance(parsed, dict):
+        return False
+    tables = (
+        ("nccl_peak_out_of_place_busbw_gbps",
+         ("all_reduce_gbps", "all_gather_gbps", "alltoall_gbps"),
+         ("all_reduce_busbw_series",)),
+        ("nemotron_5h_56b_train_window",
+         ("step_s", "median_step_time", "tflops_per_gpu", "step_time_std", "perf_std", "mfu_percent"),
+         ("step_series",)),
+        ("mnubergemm_stress",
+         ("gflops_max", "gflops_median", "nodes", "ranks"),
+         ()),
+        ("sn_llama_nemotron",
+         ("step_s", "median_step_time", "tflops_per_gpu"),
+         ("step_series",)),
+    )
+    for key, scalars, series_keys in tables:
+        rows = parsed.get(key)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if any(_parser_scalar_is_real(row.get(f)) for f in scalars):
+                return True
+            for sk in series_keys:
+                ser = row.get(sk)
+                if isinstance(ser, list) and ser:
+                    return True
+    return False
+
+
+# --- host-aware capped log read ------------------------------------------------------
+def _read_log_text_capped(log_path_s: str, *, timeout: int = 120) -> tuple[str, dict[str, object]]:
+    """Head+tail capped read of a log on the execution host. ``(text, meta)``; never raises.
+
+    Thin wrapper over the connection, which applies the same head/tail cap wherever
+    the log lives. ``remote`` is kept in *meta* for the existing API consumers.
+    """
+    text, meta = host_exec.read_text(
+        log_path_s,
+        head_bytes=_UNIVERSAL_HEAD_BYTES,
+        tail_bytes=_UNIVERSAL_TAIL_BYTES,
+        whole_bytes=_UNIVERSAL_WHOLE_BYTES,
+        timeout=timeout,
+    )
+    meta["remote"] = meta.get("target") == "ssh"
+    return text, meta
+
+
+def _universal_parse_log(
+    log_dir: Path,
+    log_path_s: str,
+    *,
+    kind: str | None = None,
+    running_hint: bool | None = None,
+    timeout: int = 120,
+) -> dict[str, object] | None:
+    """Run ``universal_parser.parse`` over one log on the exec host. ``None`` when unavailable."""
+    if not _universal_enabled():
+        return None
+    text, meta = _read_log_text_capped(log_path_s, timeout=timeout)
+    if meta.get("read_error") and not text:
+        # A read failure is still a result: universal_parser turns it into a ``fail`` with the
+        # reason attached, which is far more useful than a blank panel.
+        text = ""
+    try:
+        return _uparse.parse(
+            log_path_s,
+            text,
+            kind=kind,
+            running_hint=running_hint,
+            meta={k: v for k, v in meta.items() if k in ("bytes", "truncated", "read_error", "gzip")},
+            head_bytes=_UNIVERSAL_HEAD_BYTES,
+            tail_bytes=_UNIVERSAL_TAIL_BYTES,
+        )
+    except Exception as e:  # noqa: BLE001 - the module promises not to raise; belt and braces
+        _logger.warning("universal_parser.parse failed for %s: %s", log_path_s, e)
+        return None
+
+
+# --- history ingest ------------------------------------------------------------------
+def _history_record_from_universal(
+    res: dict[str, object],
+    *,
+    source_log_path: str,
+    log_mtime: float | None,
+    log_size: int | None,
+    rack_hint: str | None = None,
+    source: str = "universal_parser",
+) -> dict[str, object]:
+    """Map a ``universal_parser.parse`` result onto a ``results_history.ingest_run`` record."""
+    size = log_size if log_size is not None else res.get("bytes")
+    extra: dict[str, object] = {
+        "parser_version": res.get("parser_version"),
+        "headline": res.get("headline"),
+        "exit_code": res.get("exit_code"),
+        "truncated": bool(res.get("truncated")),
+        "racks": res.get("racks") or [],
+        "errors": (res.get("errors") or [])[:10],
+        "warnings": (res.get("warnings") or [])[:10],
+    }
+    if isinstance(res.get("extra"), dict) and res["extra"]:
+        extra["parser_extra"] = res["extra"]
+    rec: dict[str, object] = {
+        # Salted so a universal record can never collide with the parser.sh records for the
+        # same log snapshot (results_history salts those with ""/nccl/nemo/mnubergemm).
+        "run_id": results_history.make_run_id(source_log_path, log_mtime, size, salt="universal"),
+        "source_log_path": str(source_log_path),
+        "log_basename": res.get("log_basename") or os.path.basename(str(source_log_path)),
+        "log_mtime": log_mtime,
+        "log_size": size,
+        "workload_kind": res.get("kind"),
+        "rack": res.get("rack") or rack_hint,
+        "nodes": res.get("nodes") or [],
+        "job_id": res.get("job_id"),
+        "started_at": res.get("started_at"),
+        "ended_at": res.get("ended_at"),
+        "status": res.get("status"),
+        "metrics": res.get("metrics") or [],
+        "source": source,
+        "extra": extra,
+    }
+    return rec
+
+
+def _history_ingest_universal(
+    res: dict[str, object] | None,
+    *,
+    source_log_path: str,
+    log_mtime: float | None = None,
+    log_size: int | None = None,
+    rack_hint: str | None = None,
+    source: str = "universal_parser",
+) -> str | None:
+    """Persist one universal_parser result. Returns the run_id, or ``None`` on any problem."""
+    if not res or not _history_enabled():
+        return None
+    run_id: str | None = None
+    try:
+        run_id = results_history.ingest_run(
+            _history_record_from_universal(
+                res,
+                source_log_path=source_log_path,
+                log_mtime=log_mtime,
+                log_size=log_size,
+                rack_hint=rack_hint,
+                source=source,
+            )
+        )
+    except Exception as e:  # noqa: BLE001 - history is best-effort
+        _logger.warning("results_history universal ingest failed for %s: %s", source_log_path, e)
+        return None
+
+    # Every run that reaches SQLite must also reach the Parquet lake — this is the single choke
+    # point all parsed runs flow through, so wiring it here is what makes "no more misses" true.
+    # Best-effort: the lake must never break a validation run, but a failure is LOGGED, never
+    # silently swallowed (a quiet provenance gap is indistinguishable from a successful capture).
+    _lake_push_universal(res, source_log_path=source_log_path, run_id=run_id)
+    return run_id
+
+
+
+# ---------------------------------------------------------------------------------------------
+# Universal action capture: EVERY API call lands in the Parquet lake.
+#
+# User requirement, verbatim: *"every fucking thing - along with a flag"* — the click, the request,
+# the script execution and the output. _lake_push_job covers async workers and sync tracked ops;
+# this after_request hook is the catch-all so a route nobody remembered to instrument is still
+# recorded. Provenance you have to remember to add is provenance you will forget to add.
+#
+# RACK_LAKE_CAPTURE:
+#   actions  (default) every mutating call (POST/PUT/PATCH/DELETE) + explicit action GETs
+#   all                every API call, including read-only polls (very chatty — debugging only)
+#   off                nothing
+# ---------------------------------------------------------------------------------------------
+_LAKE_CAPTURE_SKIP = frozenset({
+    # High-frequency SPA polls with no operator intent — they would swamp the lake and bury the
+    # actions that matter. Still captured under RACK_LAKE_CAPTURE=all.
+    "/api/rack-locks", "/api/status", "/api/cluster-overview", "/api/reset-job-status",
+    "/api/metrics/health", "/api/lake/health", "/api/observability/health",
+})
+# Read-only by verb but a deliberate operator action, so worth keeping even in "actions" mode.
+_LAKE_CAPTURE_GET_ALLOW = ("/api/hw-check", "/api/slurm-", "/api/history/capture-job",
+                           "/api/rack-log-content", "/api/parser-results", "/api/tools/")
+_LAKE_BODY_MAX = 64 * 1024
+
+
+def _lake_capture_mode() -> str:
+    return (os.environ.get("RACK_LAKE_CAPTURE") or "actions").strip().lower()
+
+
+def _lake_should_capture(path: str, method: str) -> bool:
+    mode = _lake_capture_mode()
+    if mode == "off" or not path.startswith("/api/"):
+        return False
+    if mode == "all":
+        return True
+    if method in ("POST", "PUT", "PATCH", "DELETE"):
+        return path not in _LAKE_CAPTURE_SKIP
+    return any(path.startswith(pfx) for pfx in _LAKE_CAPTURE_GET_ALLOW) and path not in _LAKE_CAPTURE_SKIP
+
+
+@app.before_request
+def _lake_capture_start():  # noqa: ANN201
+    try:
+        g._lake_t0 = time.time()
+        # Read the body here: after the view runs it may already be consumed.
+        if _lake_should_capture(request.path, request.method):
+            g._lake_body = (request.get_data(cache=True) or b"")[:_LAKE_BODY_MAX]
+    except Exception:  # noqa: BLE001 - capture must never break a request
+        pass
+
+
+@app.after_request
+def _lake_capture_request(response):  # noqa: ANN001, ANN201
+    try:
+        if lake_sink is None or lake_sink.is_disabled():
+            return response
+        if not _lake_should_capture(request.path, request.method):
+            return response
+        # Streaming responses (SSE log tails) must not be materialised — reading .data would
+        # consume the generator and break the stream in the browser. A generator-backed
+        # Response leaves direct_passthrough False, so is_streamed is the load-bearing check:
+        # without it a `tail -f` body is swallowed here and the viewer hangs on "Connecting…".
+        if response.direct_passthrough or response.is_streamed:
+            body = "<streaming response — not captured>"
+        else:
+            body = (response.get_data() or b"")[:_LAKE_BODY_MAX].decode("utf-8", "replace")
+        raw = getattr(g, "_lake_body", b"") or b""
+        rack = ""
+        try:
+            payload = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+            if isinstance(payload, dict):
+                rack = str(payload.get("rack") or "")
+        except Exception:  # noqa: BLE001
+            payload = {}
+        rack = rack or (request.args.get("rack") or "")
+        action = request.path.replace("/api/", "").strip("/").replace("/", "_") or "root"
+        record = {
+            "kind": "rackstatus_request",
+            "status": "pass" if response.status_code < 400 else "fail",
+            "action": action,
+            "method": request.method,
+            "path": request.path,
+            "query": dict(request.args),
+            "request_body": raw.decode("utf-8", "replace"),
+            "http_status": response.status_code,
+            "duration_ms": round((time.time() - getattr(g, "_lake_t0", time.time())) * 1000, 1),
+            "operator": _operator_from_request(),
+            "remote_addr": request.headers.get("X-Forwarded-For") or request.remote_addr,
+            "rack": rack,
+        }
+        lake_sink.push_run(
+            run_id=lake_sink.make_run_id(f"req-{action}", rack, uuid.uuid4().hex[:12]),
+            workload="rackstatus_request", rack=rack, job_id=None, nodes=[],
+            status=record["status"], parsed=record,
+            log_path=f"synthesized:{action}.response.json", log_text=body,
+        )
+    except Exception as e:  # noqa: BLE001 - never break a response
+        _logger.warning("lake request capture failed: %s", e)
+    return response
+
+
+def _lake_push_job(job_id: str, row: dict) -> None:
+    """Mirror ANY completed Rack Status action (hw_check, validation, reset, stress, bug-report…)
+    into the Parquet lake.
+
+    The user's requirement, verbatim: *"any check any click on any test I do in rackstatus goes into
+    parquet"*. Result-log parsing alone missed everything that is not a Slurm workload — a hardware
+    check that finds a fault, a gpu-reset, a drain — none of which write a log to the log dir. Those
+    ARE events and must be as recoverable as a benchmark number.
+
+    Best-effort and never raises: an action must not fail because provenance capture did.
+    """
+    if lake_sink is None or lake_sink.is_disabled():
+        return
+    try:
+        kind = str(row.get("kind") or "action")
+        rack = str(row.get("rack") or "")
+        phase = str(row.get("phase") or "")
+        rc = row.get("returncode")
+        status = "pass" if (phase == "done" and (rc in (0, None))) else "fail"
+        record = {
+            "kind": f"rackstatus_{kind}",
+            "status": status,
+            "job_id": job_id,
+            "rack": rack,
+            "phase": phase,
+            "returncode": rc,
+            "operator": row.get("operator"),
+            "preset": row.get("preset"),
+            "checker_args": row.get("checker_args"),
+            "command": row.get("command_display"),
+            "created_at": row.get("created_at"),
+            "finished_at": row.get("finished_at"),
+            "error": row.get("error"),
+            "nodes": row.get("specs") or row.get("nodes") or [],
+        }
+        # stdout/stderr are the actual evidence (which trays failed, and why) — archive verbatim.
+        body = "\n".join(
+            x for x in (
+                f"$ {row.get('command_display') or ''}",
+                "--- stdout ---", str(row.get("stdout") or ""),
+                "--- stderr ---", str(row.get("stderr") or ""),
+            ) if x is not None
+        )
+        out = lake_sink.push_run(
+            run_id=lake_sink.make_run_id(f"action-{kind}", rack, job_id),
+            workload=f"rackstatus_{kind}",
+            rack=rack,
+            job_id=job_id,
+            nodes=[str(n) for n in (record["nodes"] or [])],
+            status=status,
+            parsed=record,
+            log_path=f"synthesized:{kind}-{job_id}.log",
+            log_text=body,
+        )
+        if not out.get("ok"):
+            _logger.warning("lake action push failed (%s %s): %s", kind, job_id, out.get("error"))
+    except Exception as e:  # noqa: BLE001 - provenance must never break an action
+        _logger.warning("lake action push raised (%s): %s", job_id, e)
+
+
+def _lake_push_universal(
+    res: dict[str, object],
+    *,
+    source_log_path: str,
+    run_id: str | None,
+) -> None:
+    """Mirror one parsed run into the Parquet lake (run_artifacts: result + raw log + inputs)."""
+    if lake_sink is None or lake_sink.is_disabled():
+        return
+    try:
+        workload = str(res.get("kind") or "unknown")
+        rack = str(res.get("rack") or "")
+        job_id = res.get("job_id")
+        lake_run_id = lake_sink.make_run_id(workload, rack, job_id or run_id)
+        out = lake_sink.push_run(
+            run_id=lake_run_id,
+            workload=workload,
+            rack=rack,
+            job_id=job_id,
+            nodes=[str(n) for n in (res.get("nodes") or [])],
+            status=str(res.get("status") or "unknown"),
+            parsed=res,
+            log_path=source_log_path,
+            # `tail` is what the parser actually read; the full log lives on the head node and is
+            # re-readable via /api/rack-log-content, so we archive the excerpt, not a re-fetch.
+            log_text=str(res.get("tail") or ""),
+        )
+        if not out.get("ok"):
+            _logger.warning("lake push failed for %s: %s", source_log_path, out.get("error"))
+    except Exception as e:  # noqa: BLE001 - never let provenance break a run
+        _logger.warning("lake push raised for %s: %s", source_log_path, e)
+
+
+def _history_ingest_parser_json(
+    parsed: object,
+    log_dir: Path,
+    log_path_s: str,
+    *,
+    rack_hint: str | None = None,
+    source: str = "parser.sh",
+) -> list[str]:
+    """Persist a ``parser.sh --json`` payload. Returns run_ids (empty list on any problem)."""
+    if not isinstance(parsed, dict) or not _history_enabled():
+        return []
+    try:
+        mt, sz = _log_stat_for_path(log_dir, log_path_s)
+        return list(
+            results_history.ingest_parser_json(
+                parsed,
+                source_log_path=str(log_path_s),
+                log_mtime=mt,
+                log_size=sz,
+                rack_hint=rack_hint,
+                source=source,
+            )
+            or []
+        )
+    except Exception as e:  # noqa: BLE001 - history is best-effort
+        _logger.warning("results_history parser ingest failed for %s: %s", log_path_s, e)
+        return []
+
+
+def _universal_fallback_for_log(
+    log_dir: Path,
+    log_path_s: str,
+    *,
+    rack_hint: str | None = None,
+    ingest: bool = True,
+) -> dict[str, object] | None:
+    """Universal parse + optional history ingest for one log. ``None`` when unavailable."""
+    res = _universal_parse_log(log_dir, log_path_s)
+    if res is None:
+        return None
+    if ingest:
+        mt, sz = _log_stat_for_path(log_dir, log_path_s)
+        rid = _history_ingest_universal(
+            res,
+            source_log_path=log_path_s,
+            log_mtime=mt,
+            log_size=sz,
+            rack_hint=rack_hint,
+        )
+        if rid:
+            res = {**res, "history_run_id": rid}
+    return res
+
+
+# --- whole-directory inventory (every extension, every depth) ------------------------
+def _universal_inventory(log_dir: Path, *, maxdepth: int = 2, limit: int | None = None) -> dict[str, object]:
+    """List EVERY file under the log dir on the exec host — not just ``*.txt`` / ``*.out``.
+
+    ``native_status._host_log_entries`` (the only directory listing the rest of the app has)
+    is hardcoded to ``-maxdepth 1 -type f ( -name '*.txt' -o -name '*.out' )``, so a ``*.log``,
+    ``*.json``, ``*.csv``, extension-less or sub-directory result is invisible to every legacy
+    endpoint. This is deliberately a SEPARATE listing so that behaviour is untouched.
+
+    Each entry reports the legacy eligibility gates too, so an operator can see exactly WHY a
+    file does or does not appear in the rack table.
+    """
+    base = str(native_status._host_resolve(log_dir)).rstrip("/") or str(log_dir)
+    depth = max(1, min(int(maxdepth or 1), 6))
+    cap = max(1, min(int(limit or _UNIVERSAL_INVENTORY_MAX_FILES), _UNIVERSAL_INVENTORY_MAX_FILES))
+    err: str | None = None
+    entries: list[tuple[str, int, float]] = [
+        (path, st.size, st.mtime)
+        for path, st in host_exec.stat_dir(base, maxdepth=depth).items()
+    ]
+    if not entries and not host_exec.is_dir(base):
+        return {"ok": False, "log_dir": base, "error": f"not a directory: {base}", "files": []}
+
+    entries.sort(key=lambda t: t[2], reverse=True)
+    truncated = len(entries) > cap
+    entries = entries[:cap]
+
+    naming = _nvis_naming()
+    files: list[dict[str, object]] = []
+    kind_counts: dict[str, int] = {}
+    for path, size, mtime in entries:
+        name = os.path.basename(path)
+        kind = "unknown"
+        if _uparse is not None:
+            try:
+                # No content read here: sniff_kind falls back to the filename when head_text
+                # is empty, which is exactly the cheap listing behaviour we want.
+                kind = _uparse.sniff_kind(path, None)
+            except Exception:  # noqa: BLE001
+                kind = "unknown"
+        kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        try:
+            legacy_rack = naming.rack_id_from_log_basename(name)
+        except Exception:  # noqa: BLE001
+            legacy_rack = None
+        try:
+            legacy_listed = name.endswith((".txt", ".out")) and os.path.dirname(path).rstrip("/") == base
+            legacy_eligible = bool(legacy_listed and _nemo_single_rack_log_basename(name) and legacy_rack)
+        except Exception:  # noqa: BLE001
+            legacy_listed, legacy_eligible = False, False
+        files.append(
+            {
+                "path": path,
+                "basename": name,
+                "dir": os.path.dirname(path),
+                "size_bytes": size,
+                "mtime_epoch": mtime,
+                "mtime_iso": datetime.fromtimestamp(mtime, timezone.utc).isoformat(),
+                "kind_guess": kind,
+                "rack": legacy_rack,
+                # Why the legacy path does / does not show this file:
+                "legacy_listed": legacy_listed,       # survives the *.txt/*.out + maxdepth-1 find
+                "legacy_eligible": legacy_eligible,   # …and the basename + one-rack-id gates
+            }
+        )
+    return {
+        "ok": True,
+        "log_dir": base,
+        "maxdepth": depth,
+        "file_count": len(files),
+        "truncated": truncated,
+        "kind_counts": kind_counts,
+        "legacy_visible_count": sum(1 for f in files if f["legacy_eligible"]),
+        "error": err,
+        "files": files,
+    }
+
+
+def _universal_path_under_log_dir(log_dir: Path, raw: str) -> str | None:
+    """Resolve a caller-supplied path/basename to an absolute path INSIDE the log dir.
+
+    Anything with ``..`` or outside the log-dir prefix is rejected — the value is fed to a
+    remote shell, so a traversal here would be a real read-anything primitive.
+    """
+    s = (raw or "").strip()
+    if not s or "\x00" in s:
+        return None
+    base = str(native_status._host_resolve(log_dir)).rstrip("/") or str(log_dir)
+    cand = s if s.startswith("/") else f"{base}/{s}"
+    cand = PurePosixPath(cand).as_posix()
+    if ".." in PurePosixPath(cand).parts:
+        return None
+    if cand != base and not cand.startswith(base.rstrip("/") + "/"):
+        return None
+    return cand
+
+
+# --- history read routes -------------------------------------------------------------
+_HISTORY_FILTER_KEYS = (
+    "workload_kind", "kind", "rack", "job_id", "status", "run_id",
+    "since", "until", "search", "source_log_path", "has_metric",
+)
+
+
+def _history_filters_from_args() -> dict[str, object]:
+    """Query-string -> ``results_history`` filter mapping (repeatable params become lists)."""
+    out: dict[str, object] = {}
+    for key in _HISTORY_FILTER_KEYS:
+        vals = [v.strip() for v in request.args.getlist(key) if v and v.strip()]
+        if not vals:
+            continue
+        out[key] = vals[0] if len(vals) == 1 else vals
+    return out
+
+
+def _history_unavailable_response():
+    return jsonify(
+        {
+            "ok": False,
+            "error": "results history unavailable",
+            "detail": (
+                "backend/results_history.py is not importable — check the bind mount "
+                "in docker-compose.override.yml (or RACK_RESULTS_HISTORY_DISABLED)."
+            ),
+        }
+    ), 503
+
+
+@app.route("/api/history/runs")
+def api_history_runs():
+    """Paged run history. Filters: workload_kind, rack, job_id, status, since, until, search."""
+    if not _history_enabled():
+        return _history_unavailable_response()
+    try:
+        limit = max(1, min(int(request.args.get("limit") or 100), 1000))
+        offset = max(0, int(request.args.get("offset") or 0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "limit/offset must be integers"}), 400
+    filters = _history_filters_from_args()
+    include_metrics = _truthy_arg(request.args.get("metrics"), default=True)
+    order = "asc" if str(request.args.get("order") or "").lower().startswith("a") else "desc"
+    try:
+        runs = results_history.list_runs(
+            filters, limit, offset, order=order, include_metrics=include_metrics
+        )
+        total = results_history.count_runs(filters)
+    except Exception as e:  # noqa: BLE001
+        _logger.warning("history runs query failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify(
+        {"ok": True, "total": total, "limit": limit, "offset": offset,
+         "filters": filters, "runs": runs}
+    )
+
+
+@app.route("/api/history/runs/<path:run_id>")
+def api_history_run(run_id: str):
+    """One run with every metric row (series points included)."""
+    if not _history_enabled():
+        return _history_unavailable_response()
+    try:
+        run = results_history.get_run(run_id)
+    except Exception as e:  # noqa: BLE001
+        _logger.warning("history run lookup failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+    if not run:
+        return jsonify({"ok": False, "error": "run not found", "run_id": run_id}), 404
+    return jsonify({"ok": True, "run": run})
+
+
+@app.route("/api/history/metrics")
+def api_history_metrics():
+    """``?metric=<name>`` -> the trend series. Without ``metric`` -> the available names."""
+    if not _history_enabled():
+        return _history_unavailable_response()
+    name = (request.args.get("metric") or request.args.get("name") or "").strip()
+    filters = _history_filters_from_args()
+    try:
+        if not name:
+            return jsonify(
+                {"ok": True, "filters": filters, "metrics": results_history.metric_names(filters)}
+            )
+        include_series = _truthy_arg(request.args.get("series"), default=False)
+        limit = max(1, min(int(request.args.get("limit") or 5000), 200000))
+        points = results_history.metric_series(
+            name, filters, limit=limit, include_series_points=include_series
+        )
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "limit must be an integer"}), 400
+    except Exception as e:  # noqa: BLE001
+        _logger.warning("history metric series failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "metric": name.lower(), "filters": filters,
+                    "count": len(points), "points": points})
+
+
+# Alias kept because TRACK-A's integration note documents this spelling.
+@app.route("/api/history/metric-series")
+def api_history_metric_series():
+    """Alias of ``/api/history/metrics`` that requires ``?metric=``."""
+    if not (request.args.get("metric") or request.args.get("name") or "").strip():
+        return jsonify({"ok": False, "error": "metric is required"}), 400
+    return api_history_metrics()
+
+
+@app.route("/api/history/summary")
+def api_history_summary():
+    """Fleet baseline (count / median / p05 / p95 / latest per metric) + store health."""
+    if not _history_enabled():
+        return _history_unavailable_response()
+    kind = (request.args.get("workload_kind") or request.args.get("kind") or "").strip() or None
+    filters = _history_filters_from_args()
+    filters.pop("workload_kind", None)
+    filters.pop("kind", None)
+    try:
+        summary = results_history.summary_stats(kind, filters or None)
+        stats = results_history.db_stats()
+    except Exception as e:  # noqa: BLE001
+        _logger.warning("history summary failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "summary": summary, "db": stats})
+
+
+# --- universal ingest routes ---------------------------------------------------------
+@app.route("/api/universal/inventory")
+def api_universal_inventory():
+    """Every file in the log dir on the exec host — all extensions, sub-dirs included."""
+    if not _universal_enabled():
+        return jsonify(
+            {"ok": False, "error": "universal_parser unavailable",
+             "detail": "check the backend/universal_parser.py bind mount in docker-compose.override.yml"}
+        ), 503
+    try:
+        log_dir = _resolve_log_dir(request.args.get("log_dir"))
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    try:
+        depth = int(request.args.get("maxdepth") or 2)
+    except (TypeError, ValueError):
+        depth = 2
+    try:
+        out = _universal_inventory(log_dir, maxdepth=depth)
+    except Exception as e:  # noqa: BLE001
+        _logger.warning("universal inventory failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify(out)
+
+
+@app.route("/api/universal/parse")
+def api_universal_parse():
+    """Normalise ONE log of any kind. ``?path=`` (abs or relative to the log dir) or ``?log_file=``."""
+    if not _universal_enabled():
+        return jsonify(
+            {"ok": False, "error": "universal_parser unavailable",
+             "detail": "check the backend/universal_parser.py bind mount in docker-compose.override.yml"}
+        ), 503
+    try:
+        log_dir = _resolve_log_dir(request.args.get("log_dir"))
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    raw = (request.args.get("path") or request.args.get("log_file") or "").strip()
+    target = _universal_path_under_log_dir(log_dir, raw)
+    if not target:
+        return jsonify(
+            {"ok": False, "error": "path is required and must resolve inside the log directory"}
+        ), 400
+    rack_hint = (request.args.get("rack") or "").strip() or None
+    ingest = _truthy_arg(request.args.get("ingest"), default=True)
+    res = _universal_fallback_for_log(log_dir, target, rack_hint=rack_hint, ingest=ingest)
+    if res is None:
+        return jsonify({"ok": False, "error": "universal parse failed", "path": target}), 500
+    return jsonify({"ok": True, "log_dir": str(log_dir), "path": target, "result": res})
+
+
+@app.route("/api/universal/scan", methods=["POST"])
+def api_universal_scan():
+    """Parse + persist a batch of logs from the log dir (newest first). Backfills history.
+
+    Body/query: ``log_dir``, ``maxdepth`` (default 2), ``max_files`` (default 25, max 400),
+    ``budget_sec`` (default 120), ``kind``/``search`` filters, ``ingest`` (default true).
+    Safe to re-run: ingest is idempotent per (path, mtime, size) snapshot.
+    """
+    if not _universal_enabled():
+        return jsonify(
+            {"ok": False, "error": "universal_parser unavailable",
+             "detail": "check the backend/universal_parser.py bind mount in docker-compose.override.yml"}
+        ), 503
+    body = request.get_json(silent=True) or {}
+
+    def _arg(name, default=None):
+        v = body.get(name)
+        if v is None:
+            v = request.args.get(name)
+        return default if v is None or str(v).strip() == "" else v
+
+    try:
+        log_dir = _resolve_log_dir(str(_arg("log_dir")) if _arg("log_dir") else None)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    try:
+        depth = max(1, min(int(_arg("maxdepth", 2)), 6))
+        max_files = max(1, min(int(_arg("max_files", _UNIVERSAL_SCAN_DEFAULT_FILES)),
+                               _UNIVERSAL_SCAN_MAX_FILES))
+        budget = max(10, min(int(_arg("budget_sec", 120)), 900))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "maxdepth/max_files/budget_sec must be integers"}), 400
+    want_kind = (str(_arg("kind", "")) or "").strip().lower()
+    want_search = (str(_arg("search", "")) or "").strip().lower()
+    ingest = _truthy_arg(_arg("ingest"), default=True)
+
+    inv = _universal_inventory(log_dir, maxdepth=depth)
+    if not inv.get("ok"):
+        return jsonify(inv), 502
+    started = time.monotonic()
+    scanned: list[dict[str, object]] = []
+    skipped = 0
+    for f in inv.get("files") or []:
+        if len(scanned) >= max_files:
+            break
+        if (time.monotonic() - started) > budget:
+            break
+        name = str(f.get("basename") or "")
+        # Never ingest an intermediate artefact that an aggregated log supersedes.
+        if _UNIVERSAL_SCAN_IGNORE_RE.fullmatch(name):
+            skipped += 1
+            continue
+        if want_search and want_search not in name.lower():
+            skipped += 1
+            continue
+        if want_kind and str(f.get("kind_guess") or "") != want_kind:
+            skipped += 1
+            continue
+        path = str(f.get("path") or "")
+        res = _universal_parse_log(log_dir, path)
+        if res is None:
+            skipped += 1
+            continue
+        run_id = None
+        if ingest:
+            run_id = _history_ingest_universal(
+                res,
+                source_log_path=path,
+                log_mtime=f.get("mtime_epoch"),
+                log_size=f.get("size_bytes"),
+                rack_hint=f.get("rack"),
+            )
+        scanned.append(
+            {
+                "path": path,
+                "basename": name,
+                "kind": res.get("kind"),
+                "status": res.get("status"),
+                "rack": res.get("rack"),
+                "job_id": res.get("job_id"),
+                "metric_count": len(res.get("metrics") or []),
+                "headline": res.get("headline"),
+                "run_id": run_id,
+            }
+        )
+    return jsonify(
+        {
+            "ok": True,
+            "log_dir": inv.get("log_dir"),
+            "file_count": inv.get("file_count"),
+            "parsed": len(scanned),
+            "skipped": skipped,
+            "ingested": sum(1 for s in scanned if s.get("run_id")),
+            "history_enabled": _history_enabled(),
+            "elapsed_sec": round(time.monotonic() - started, 3),
+            "results": scanned,
+        }
+    )
+
+
+@app.route("/api/bringup/config")
+def api_bringup_config():
+    """Discovery: whether Travis's bring-up automation tree is present, and where."""
+    if _truthy_env("RACK_STATUS_DEMO"):
+        return jsonify({"ok": True, "enabled": True, "present": True, "home": "/home/cmods/bringup"})
+    if _bringup is None:
+        return jsonify({"ok": True, "enabled": False, "present": False, "home": ""})
+    try:
+        return jsonify({"ok": True, **_bringup.config()})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/bringup/node")
+def api_bringup_node():
+    """Per-node bring-up job summary (status+reason from status-check, metric from daily-report)."""
+    node = (request.args.get("node") or "").strip()
+    if not node or not re.match(r"^[A-Za-z0-9._-]+$", node):
+        return jsonify({"ok": False, "error": "a valid node name is required"}), 400
+    if _truthy_env("RACK_STATUS_DEMO"):
+        data = _bringup.demo_node_summary(node) if _bringup else {"node": node, "jobs": []}
+        return jsonify({"ok": True, "data": data})
+    if _bringup is None or not _bringup.is_enabled():
+        return jsonify({"ok": False, "error": "bring-up integration disabled or unavailable"}), 404
+    try:
+        data = _bringup.node_summary(node)
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "error": "bring-up report timed out"}), 504
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "data": data})
+
+
+def _requested_nodes() -> list[str]:
+    """Node list from a JSON body (preferred) or a ``?nodes=`` query.
+
+    The body is the real channel: a cluster-sized list does not fit in a URL — 591 node names is
+    a ~12 KB query and gunicorn rejects any request line over 4094 bytes with a bare 400. The
+    query form is kept for hand-run curl against a handful of nodes.
+    """
+    body = request.get_json(silent=True) or {}
+    raw = body.get("nodes") if isinstance(body, dict) else None
+    if isinstance(raw, list):
+        return [str(n).strip() for n in raw if str(n).strip()]
+    return [n.strip() for n in (request.args.get("nodes") or "").split(",") if n.strip()]
+
+
+@app.route("/api/bringup/fleet", methods=["GET", "POST"])
+def api_bringup_fleet():
+    """Bring-up state for every node — what a cluster heatmap and the daily report need.
+
+    One request instead of one per node: the underlying fleet scripts are cheap because they
+    share a verdict cache, so this is ~2 round trips for the whole cluster. POST so the node
+    list travels as a JSON body; GET still works for a whole-cluster query with no list.
+    """
+    if _truthy_env("RACK_STATUS_DEMO"):
+        # Seed the synthetic fleet from the demo rack inventory so node names line up with
+        # what the dashboard is already showing.
+        data = _bringup.demo_fleet_summary(_requested_nodes()) if _bringup else {"nodes": []}
+        return jsonify({"ok": True, "data": data})
+    if _bringup is None or not _bringup.is_enabled():
+        return jsonify({"ok": False, "error": "bring-up integration disabled or unavailable"}), 404
+    try:
+        data = _bringup.fleet_summary()
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "error": "bring-up fleet report timed out"}), 504
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "data": data})
+
+
+@app.route("/api/node-report", methods=["GET", "POST"])
+def api_node_report():
+    """Daily node-validation report as schema-validated JSON.
+
+    Generated server-side so it can be checked against the vendored contract
+    (``backend/schemas/node_report_schema.json``) before anyone downloads it; the browser just
+    saves what it is given. POST carries the node list as a JSON body; ``download`` (body or
+    query) sets a filename so the SPA can hand the file straight to the user.
+    """
+    if _node_report is None:
+        return jsonify({"ok": False, "error": "report generator unavailable"}), 503
+    try:
+        if _truthy_env("RACK_STATUS_DEMO"):
+            nodes = _requested_nodes()
+            fleet = _bringup.demo_fleet_summary(nodes) if _bringup else {"nodes": [], "columns": []}
+        elif _bringup is None or not _bringup.is_enabled():
+            return jsonify({"ok": False, "error": "bring-up integration disabled or unavailable"}), 404
+        else:
+            fleet = _bringup.fleet_summary()
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "error": "bring-up fleet report timed out"}), 504
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    # The schema requires at least one test result, and rightly so: a validation report with no
+    # tests in it says nothing. Refuse clearly instead of emitting an invalid document.
+    if not (fleet.get("columns") and fleet.get("nodes")):
+        return jsonify({
+            "ok": False,
+            "error": "no bring-up results to report on yet",
+            "detail": "the bring-up tree reported no active test columns for any node",
+        }), 409
+
+    project = cluster = platform = None
+    try:
+        project, cluster, platform = catalog_context.resolve()
+    except Exception as e:  # noqa: BLE001 - a missing catalog must not block the report
+        _logger.warning("node-report: catalog context unavailable: %s", e)
+
+    def _as_dict(obj):
+        return obj.to_dict() if hasattr(obj, "to_dict") else (obj or {})
+
+    report = _node_report.build_report(
+        fleet,
+        platform=_as_dict(platform),
+        cluster=_as_dict(cluster),
+        project=_as_dict(project),
+    )
+    errors = _node_report.validate(report)
+    if errors:
+        # Surface it rather than shipping an invalid document to a customer-facing report.
+        _logger.error("node-report failed schema validation: %s", errors[:5])
+        return jsonify({"ok": False, "error": "report failed schema validation", "detail": errors[:20]}), 500
+
+    payload = request.get_json(silent=True)
+    download = payload.get("download") if isinstance(payload, dict) else None
+    if download is None:
+        download = request.args.get("download")
+
+    body = json.dumps(report, indent=2)
+    if _truthy_arg(download):
+        name = f"{report['report_metadata']['report_id']}.json"
+        return Response(
+            body,
+            mimetype="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{name}"'},
+        )
+    return Response(body, mimetype="application/json")
+
+
 @app.route("/api/parser-results")
 def api_parser_results():
     """Run parser.sh --json on the log for rack (same cwd convention as rack_status log_dir).
 
     Optional ``log_file``: basename under log_dir (or failed/) for multirack / explicit logs (must
     contain NEMO or NCCL in the basename). When set, ``rack`` is optional (used for Grafana context).
+
+    Optional ``full_rack=1``: when resolving by rack (no ``log_file``/``path``), only consider logs
+    whose basename encodes the full-rack node count (``-18N-`` by default; override with
+    ``full_rack_nodes`` or ``RACK_FULL_RACK_NODES``). A row ``job_id`` that points at a partial
+    (e.g. ``-1N-``) run is ignored so the newest full-rack log is used instead.
 
     Optional ``display_timezone`` query (IANA, e.g. ``Europe/Berlin``): zone for naive wall-clock
     timestamps in the NEMO log when deriving the LLM/Grafana time window (same as Charts TZ in the UI).
@@ -7484,10 +10688,28 @@ def api_parser_results():
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     log_fn = (request.args.get("log_file") or "").strip()
+    path_arg = (request.args.get("path") or "").strip()
     rack = (request.args.get("rack") or "").strip()
     job_raw = (request.args.get("job_id") or "").strip()
     job_id = job_raw if job_raw and job_raw != "-" else None
-    if log_fn:
+    full_rack = (request.args.get("full_rack") or "").strip().lower() in ("1", "true", "yes", "on")
+    fr_nodes_raw = (request.args.get("full_rack_nodes") or "").strip()
+    full_rack_nodes: int | None = None
+    if fr_nodes_raw.isdigit():
+        full_rack_nodes = int(fr_nodes_raw, 10) if int(fr_nodes_raw, 10) > 0 else None
+    # Populated only when resolving by rack; an explicit ``path``/``log_file`` request means the
+    # caller named the exact file it wants, so it keeps the single-log behaviour untouched.
+    stage_paths: dict[str, Path] = {}
+    if path_arg:
+        # Explicit allowlisted path (e.g. a Travis bring-up node log
+        # results/<node>/allreduce.txt) — bypasses the NEMO/NCCL basename filter but
+        # must live under RACK_STATUS_ALLOWED_PREFIXES (validated by the shared resolver).
+        try:
+            log_path = _resolve_slurm_job_stdout_path(path_arg, request.args.get("log_dir"))
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+        rk = rack
+    elif log_fn:
         log_path = _resolve_nemo_log_basename_in_dir(log_dir, log_fn)
         if log_path is None:
             return jsonify(
@@ -7506,35 +10728,51 @@ def api_parser_results():
             rk = _normalize_rack_id(rack)
         except ValueError as e:
             return jsonify({"ok": False, "error": str(e)}), 400
-        log_path = pick_log_for_rack(log_dir, rack, job_id)
+        # One log per stage: NCCL and NeMo are separate jobs since llmb-run, so a single file
+        # can only carry one stage's evidence. The primary keeps every downstream consumer
+        # (grafana window, sn-llama, history ingest, adoption) on exactly one log as before;
+        # a distinct second stage is parsed after and merged in below.
+        stage_paths = pick_logs_for_rack(
+            log_dir, rack, job_id, full_rack=full_rack, full_rack_nodes=full_rack_nodes
+        )
+        log_path = _primary_stage_log(stage_paths, job_id)
         if log_path is None:
-            return jsonify(
-                {
-                    "ok": False,
-                    "error": (
-                        f"no matching *.txt for rack {rk!r} under {log_dir} or {log_dir / 'failed'} "
-                        f"(NEMO/NCCL basename, or ClusterKit root-CK-/clusterkit with one rack id)"
-                    ),
-                }
-            ), 404
+            need_n = full_rack_nodes if full_rack_nodes and full_rack_nodes > 0 else _full_rack_expected_nodes()
+            detail = (
+                f"no matching *-{need_n}N-*.txt for rack {rk!r} under {log_dir} "
+                f"(full-rack filter on; uncheck Full rack validation to use the latest partial log)"
+                if full_rack
+                else (
+                    f"no matching *.txt for rack {rk!r} under {log_dir} or {log_dir / 'failed'} "
+                    f"(NEMO/NCCL basename, or ClusterKit root-CK-/clusterkit with one rack id)"
+                )
+            )
+            return jsonify({"ok": False, "error": detail}), 404
+    adopt_rk = (rk or rack or multirack_display_rack_from_basename(log_path.name) or "").strip()
+    if adopt_rk:
+        try:
+            adopt_rk = _normalize_rack_id(adopt_rk)
+        except ValueError:
+            pass
+    _maybe_adopt_validation_log(log_path, log_dir, adopt_rk)
     parser = _parser_path()
     if not _script_exists(parser):
         return jsonify({"ok": False, "error": f"parser.sh not found: {parser}"}), 500
     env = _subprocess_env({"NO_COLOR": "1"})
+    # Route parser.sh through host_exec (SSH when remote) and don't local-resolve a remote path.
+    lp = str(_rpath(log_path))
     cmd = [
         "bash",
         str(parser),
         *_parser_extra_args(),
         "--json",
-        str(log_path.resolve()),
+        lp,
     ]
     try:
-        proc = subprocess.run(
+        proc = host_exec.run_on_host(
             cmd,
             cwd=str(log_dir),
             env=env,
-            capture_output=True,
-            text=True,
             timeout=max(30, _job_env_int("RACK_PARSER_TIMEOUT", 300)),
         )
     except subprocess.TimeoutExpired:
@@ -7553,25 +10791,29 @@ def api_parser_results():
                 "stderr": err_tail,
                 "stdout_head": raw_out[:4000],
                 "returncode": proc.returncode,
-                "log_file": str(log_path.resolve()),
+                "log_file": lp,
             }
         ), 502
     if not isinstance(parsed, dict):
         return jsonify({"ok": False, "error": "parser JSON root must be an object"}), 502
     display_cmd = "./parser.sh --json " + shlex.quote(log_path.name)
     sn_nemo: list[object] = []
+    # Secondary sn-llama pass. This used to be skipped unless the app ran on the
+    # target host, because it shelled out locally against local files; going
+    # through the logs role runs it wherever the logs actually are, so the
+    # sn-llama series is no longer missing from the charts on a remote deployment.
+    root = _rpath(log_dir)
     sn_paths = _sn_llama_txt_paths_for_rack(log_dir, rk, exclude=log_path)
     if sn_paths:
         try:
-            rel_sn = [str(p.resolve().relative_to(log_dir.resolve())) for p in sn_paths]
+            rel_sn = [str(PurePosixPath(str(p)).relative_to(root)) for p in sn_paths]
             cmd_sn = ["bash", str(parser), *_parser_extra_args(), "--json", *rel_sn]
-            proc_sn = subprocess.run(
+            proc_sn = host_exec.run_on_host(
                 cmd_sn,
-                cwd=str(log_dir),
+                cwd=str(root),
                 env=env,
-                capture_output=True,
-                text=True,
                 timeout=max(60, _job_env_int("RACK_PARSER_TIMEOUT", 300)),
+                role="logs",
             )
             if proc_sn.returncode == 0 and (proc_sn.stdout or "").strip():
                 sn_parsed = json.loads(proc_sn.stdout)
@@ -7582,21 +10824,107 @@ def api_parser_results():
         except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired, ValueError) as e:
             _logger.warning("parser sn-llama bundle failed: %s", e)
     merged_data: dict[str, object] = {**parsed, "sn_llama_nemotron": sn_nemo}
+
+    # --- second stage (2026-08-03) ----------------------------------------------------
+    # Stage 1 (NCCL) and stage 2 (NeMo) are separate jobs writing separate logs, so the file
+    # parsed above holds evidence for only one of them. Parse the other stage's own log and take
+    # ONLY that stage's table from it. Rows are self-describing (each carries rack and job_id),
+    # so this is a concatenation. Best-effort: a missing second stage just means one empty tab.
+    stage_logs: dict[str, str] = {}
+    if stage_paths:
+        stage_logs = {stage: str(_rpath(p)) for stage, p in stage_paths.items()}
+    for stage, spath in _parser_secondary_stages(stage_paths, log_path):
+        table = _PARSER_STAGE_TABLES.get(stage)
+        if not table:
+            continue
+        slp = str(_rpath(spath))
+        try:
+            proc_s = host_exec.run_on_host(
+                ["bash", str(parser), *_parser_extra_args(), "--json", slp],
+                cwd=str(log_dir),
+                env=env,
+                timeout=max(30, _job_env_int("RACK_PARSER_TIMEOUT", 300)),
+            )
+            if proc_s.returncode != 0 or not (proc_s.stdout or "").strip():
+                _logger.warning("parser %s stage returned nothing for %s", stage, slp)
+                continue
+            parsed_s = json.loads(proc_s.stdout)
+            if not isinstance(parsed_s, dict):
+                continue
+            rows_s = parsed_s.get(table)
+            if isinstance(rows_s, list) and rows_s:
+                # Replace, not append: parser.sh emits an all-"---" placeholder row for an
+                # explicitly-named file whatever its content, so the primary log contributes a
+                # junk row to the table it is not the authority for. This stage owns the table.
+                merged_data[table] = list(rows_s)
+        except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired, ValueError) as e:
+            _logger.warning("parser %s stage failed for %s: %s", stage, slp, e)
+
+    # The replace-the-table step above only fires when the other stage HAS its own log. A rack that
+    # never ran a stage (NCCL-only racks such as j15/j16 on 2026-08-07) keeps the placeholder row
+    # the primary parse produced for the table it is not the authority for. Drop it by content, so
+    # "stage never ran" reads as an empty table rather than a UNK row wearing the other stage's
+    # job id. Content-based on purpose: a combined-format log legitimately yields both tables from
+    # one parse and must not be stripped.
+    dropped_placeholders = _drop_parser_placeholder_rows(merged_data)
+    if dropped_placeholders:
+        _logger.info("parser placeholder rows dropped for %s: %s", rk or "?", dropped_placeholders)
+
     log_tz_q = _sanitize_display_timezone_query(request.args.get("display_timezone"))
-    g_embed = _grafana_parser_embed_context(
-        log_path, rk, job_raw, parsed, log_timestamp_tz=log_tz_q
-    )
+    # Grafana time-window context is optional; never let it 500 the parser charts (it may touch
+    # log files, which over SSH can fail). Degrade to no embed on error.
+    try:
+        g_embed = _grafana_parser_embed_context(
+            log_path, rk, job_raw, parsed, log_timestamp_tz=log_tz_q
+        )
+    except Exception as e:
+        _logger.warning("grafana embed context failed: %s", e)
+        g_embed = None
     pdisp = _grafana_url_timezone_param()
     if isinstance(g_embed, dict) and g_embed.get("display_timezone"):
         pdisp = str(g_embed["display_timezone"])
+
+    # --- universal ingest + durable history (2026-07-28) -----------------------------
+    # Additive only: the four parser.sh tables in ``data`` are untouched, so the NCCL /
+    # Nemotron / MNUBERGEMM charts keep rendering exactly what they rendered before. When
+    # parser.sh produced nothing usable (a foreign tool, or the stale head-node v6 that
+    # returns rack='?' and '---' for a real MNUBERGEMM log) a ``data.universal`` key is
+    # added with the normalised result so the log still surfaces. Never fails the request.
+    universal_res = None
+    try:
+        if not _parser_json_has_usable_rows(parsed):
+            universal_res = _universal_fallback_for_log(log_dir, lp, rack_hint=rk or None)
+            if universal_res is not None:
+                merged_data = {**merged_data, "universal": universal_res}
+    except Exception as e:  # noqa: BLE001 - never break the charts for this
+        _logger.warning("universal fallback failed for %s: %s", lp, e)
+    try:
+        if universal_res is None:
+            _history_ingest_parser_json(parsed, log_dir, lp, rack_hint=rk or None,
+                                        source="api/parser-results")
+    except Exception as e:  # noqa: BLE001 - history is best-effort
+        _logger.warning("results_history ingest failed for %s: %s", lp, e)
+
     return jsonify(
         {
             "ok": proc.returncode == 0,
             "returncode": proc.returncode,
             "rack": rk,
-            "log_file": str(log_path.resolve()),
+            "log_file": lp,
+            # Which file fed each tab. Absent keys mean that stage has no log for this rack yet.
+            "stage_logs": stage_logs,
+            "job_id": _jobid_from_nemo_log_basename(Path(lp).name) or job_raw or "",
+            "full_rack": bool(full_rack) if not (path_arg or log_fn) else False,
+            "full_rack_nodes": (
+                (full_rack_nodes if full_rack_nodes and full_rack_nodes > 0 else _full_rack_expected_nodes())
+                if full_rack and not (path_arg or log_fn)
+                else None
+            ),
             "command_display": display_cmd,
             "data": merged_data,
+            # {table: [rack…]} for parser.sh placeholder rows removed above. Non-empty means that
+            # stage produced no run for this rack, as opposed to the tab having failed to load.
+            "dropped_placeholder_rows": dropped_placeholders,
             "stderr": err_tail,
             "grafana_uri": _rack_web_grafana_uri(),
             "grafana_port": _rack_web_grafana_port(),
@@ -7642,10 +10970,10 @@ def api_nvloom_heatmaps_log():
             }
         ), 404
     log_path = cands[0]
-    try:
-        sz = log_path.stat().st_size
-    except OSError as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    st = host_exec.stat(log_path)
+    if st is None:
+        return jsonify({"ok": False, "error": f"NVLOOM log not readable: {log_path}"}), 404
+    sz = st.size
     if sz > _NVLOOM_HEATMAPS_LOG_MAX_BYTES:
         return jsonify(
             {
@@ -7653,11 +10981,15 @@ def api_nvloom_heatmaps_log():
                 "error": f"NVLOOM log too large ({sz} bytes; max {_NVLOOM_HEATMAPS_LOG_MAX_BYTES})",
             }
         ), 413
-    try:
-        text = log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-    return jsonify({"ok": True, "path": str(log_path.resolve()), "content": text})
+    text, rmeta = host_exec.read_text(
+        log_path,
+        head_bytes=_NVLOOM_HEATMAPS_LOG_MAX_BYTES,
+        tail_bytes=0,
+        whole_bytes=_NVLOOM_HEATMAPS_LOG_MAX_BYTES,
+    )
+    if rmeta.get("read_error"):
+        return jsonify({"ok": False, "error": str(rmeta["read_error"])}), 500
+    return jsonify({"ok": True, "path": str(_rpath(log_path)), "content": text})
 
 
 _CLUSTERKIT_JSON_MAX_BYTES = 80 * 1024 * 1024
@@ -7823,49 +11155,55 @@ def api_clusterkit_results():
         rk = _normalize_rack_id(rack_raw)
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
-    base = _clusterkit_rack_dir(log_dir, rk)
-    if not base.is_dir():
+    root = _rpath(log_dir)
+    base = _rpath(_clusterkit_rack_dir(root, rk))
+    # One listing covers every run directory under this rack. These files live on
+    # the execution host, so the previous iterdir()/stat()/read_text() walk was
+    # both a local-filesystem call on a remote path and a round trip per run.
+    found = host_exec.stat_dir(
+        base, patterns=("bandwidth.json", "latency.json"), maxdepth=2
+    )
+    if not found:
         return jsonify({"ok": True, "rack": rk, "runs": []})
+
+    def _rel_to_log_dir(p: PurePosixPath) -> str:
+        try:
+            return str(p.relative_to(root))
+        except ValueError:
+            return str(p)
+
+    with_latency = {
+        PurePosixPath(s).parent for s in found if PurePosixPath(s).name == "latency.json"
+    }
     runs_out: list[dict[str, object]] = []
-    try:
-        subdirs = [p for p in base.iterdir() if p.is_dir()]
-    except OSError as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-    for sub in subdirs:
-        bw = sub / "bandwidth.json"
-        if not bw.is_file():
+    for path_s, st in found.items():
+        bw = PurePosixPath(path_s)
+        # Only <rack>/<run>/bandwidth.json; skip a stray file directly under the rack dir.
+        if bw.name != "bandwidth.json" or bw.parent == base:
+            continue
+        entry: dict[str, object] = {
+            "dir": bw.parent.name,
+            "rel_path": _rel_to_log_dir(bw),
+            "mtime": int(st.mtime),
+        }
+        if st.size > _CLUSTERKIT_JSON_MAX_BYTES:
+            entry["error"] = f"bandwidth.json too large ({st.size} bytes)"
+            runs_out.append(entry)
+            continue
+        raw, read_meta = host_exec.read_text(bw, whole_bytes=_CLUSTERKIT_JSON_MAX_BYTES)
+        if read_meta.get("read_error"):
+            entry["error"] = str(read_meta["read_error"])
+            runs_out.append(entry)
             continue
         try:
-            st = bw.stat()
-        except OSError:
-            continue
-        if st.st_size > _CLUSTERKIT_JSON_MAX_BYTES:
-            runs_out.append(
-                {
-                    "dir": sub.name,
-                    "rel_path": str(bw.resolve().relative_to(log_dir.resolve())),
-                    "mtime": int(st.st_mtime),
-                    "error": f"bandwidth.json too large ({st.st_size} bytes)",
-                }
-            )
-            continue
-        try:
-            raw = bw.read_text(encoding="utf-8", errors="replace")
             data = json.loads(raw)
-        except (OSError, json.JSONDecodeError) as e:
-            runs_out.append(
-                {
-                    "dir": sub.name,
-                    "rel_path": str(bw.resolve().relative_to(log_dir.resolve())),
-                    "mtime": int(st.st_mtime),
-                    "error": str(e),
-                }
-            )
+        except json.JSONDecodeError as e:
+            entry["error"] = str(e)
+            runs_out.append(entry)
             continue
         if not isinstance(data, dict):
             continue
-        summ = _clusterkit_bandwidth_summary_from_data(data)
-        meta_only = {
+        entry["meta"] = {
             "hca_tag": data.get("HCA_Tag"),
             "units": data.get("Units"),
             "date_and_time": data.get("Date_and_Time"),
@@ -7873,64 +11211,54 @@ def api_clusterkit_results():
             "bidirectional": data.get("Bidirectional"),
             "cluster": data.get("Cluster"),
         }
-        has_lat = (sub / "latency.json").is_file()
-        runs_out.append(
-            {
-                "dir": sub.name,
-                "rel_path": str(bw.resolve().relative_to(log_dir.resolve())),
-                "mtime": int(st.st_mtime),
-                "meta": meta_only,
-                "summary": summ or {},
-                "has_latency": has_lat,
-            }
-        )
+        entry["summary"] = _clusterkit_bandwidth_summary_from_data(data) or {}
+        entry["has_latency"] = bw.parent in with_latency
+        runs_out.append(entry)
     runs_out.sort(key=lambda r: int(r.get("mtime") or 0), reverse=True)
     out: dict[str, object] = {"ok": True, "rack": rk, "runs": runs_out}
     run_q = (request.args.get("run") or "").strip()
-    if run_q and run_q == Path(run_q).name and re.fullmatch(r"[A-Za-z0-9_.\-]+", run_q):
-        target = base / run_q / "bandwidth.json"
-        try:
-            sub_resolved = (base / run_q).resolve()
-            if target.is_file() and sub_resolved.parent == base.resolve():
-                sz = target.stat().st_size
-                if sz <= _CLUSTERKIT_JSON_MAX_BYTES:
-                    data = json.loads(target.read_text(encoding="utf-8", errors="replace"))
-                    if isinstance(data, dict):
-                        parsed = _clusterkit_parse_bandwidth_payload(data)
-                        if parsed:
-                            labels, matrix, meta = parsed
-                            summ = _clusterkit_bandwidth_summary_from_data(data)
-                            detail: dict[str, object] = {
-                                "dir": run_q,
-                                "labels": labels,
-                                "matrix": matrix,
-                                "meta": meta,
-                                "summary": summ or {},
-                            }
-                            lat_path = sub_resolved / "latency.json"
-                            try:
-                                if lat_path.is_file():
-                                    lst = lat_path.stat().st_size
-                                    if lst <= _CLUSTERKIT_JSON_MAX_BYTES:
-                                        lat_data = json.loads(
-                                            lat_path.read_text(encoding="utf-8", errors="replace")
-                                        )
-                                        if isinstance(lat_data, dict):
-                                            lat_parsed = _clusterkit_parse_bandwidth_payload(lat_data)
-                                            if lat_parsed:
-                                                ll, lm, lmeta = lat_parsed
-                                                lsumm = _clusterkit_pairwise_positive_summary(lat_data)
-                                                detail["latency"] = {
-                                                    "labels": ll,
-                                                    "matrix": lm,
-                                                    "meta": lmeta,
-                                                    "summary": lsumm or {},
-                                                }
-                            except (OSError, json.JSONDecodeError, ValueError, TypeError):
-                                pass
-                            out["detail"] = detail
-        except (OSError, json.JSONDecodeError, ValueError):
-            pass
+    if run_q and run_q == PurePosixPath(run_q).name and re.fullmatch(r"[A-Za-z0-9_.\-]+", run_q):
+        # Containment comes from the listing: `found` only holds paths under base,
+        # so a traversal attempt simply misses instead of needing a resolve() check.
+        sub = base / run_q
+
+        def _load_json(p: PurePosixPath) -> dict | None:
+            st = found.get(str(p))
+            if st is None or st.size > _CLUSTERKIT_JSON_MAX_BYTES:
+                return None
+            text, meta = host_exec.read_text(p, whole_bytes=_CLUSTERKIT_JSON_MAX_BYTES)
+            if meta.get("read_error"):
+                return None
+            try:
+                loaded = json.loads(text)
+            except json.JSONDecodeError:
+                return None
+            return loaded if isinstance(loaded, dict) else None
+
+        data = _load_json(sub / "bandwidth.json")
+        parsed = _clusterkit_parse_bandwidth_payload(data) if data is not None else None
+        if parsed:
+            labels, matrix, bw_meta = parsed
+            detail: dict[str, object] = {
+                "dir": run_q,
+                "labels": labels,
+                "matrix": matrix,
+                "meta": bw_meta,
+                "summary": _clusterkit_bandwidth_summary_from_data(data) or {},
+            }
+            lat_data = _load_json(sub / "latency.json")
+            lat_parsed = (
+                _clusterkit_parse_bandwidth_payload(lat_data) if lat_data is not None else None
+            )
+            if lat_parsed:
+                ll, lm, lmeta = lat_parsed
+                detail["latency"] = {
+                    "labels": ll,
+                    "matrix": lm,
+                    "meta": lmeta,
+                    "summary": _clusterkit_pairwise_positive_summary(lat_data) or {},
+                }
+            out["detail"] = detail
     return jsonify(out)
 
 
@@ -7940,19 +11268,16 @@ def _parser_json_for_log_path(log_dir: Path, log_path: Path) -> tuple[dict | Non
     if not _script_exists(parser):
         return None, "parser.sh not found"
     env = _subprocess_env({"NO_COLOR": "1"})
-    try:
-        rel = str(log_path.resolve().relative_to(log_dir.resolve()))
-    except ValueError:
-        return None, "log path outside log_dir"
-    cmd = ["bash", str(parser), *_parser_extra_args(), "--json", rel]
+    # Route parser.sh through host_exec (SSH when remote) and pass an absolute path; don't
+    # local-resolve a remote path (``.resolve()`` breaks on the PurePosixPath returned in SSH mode).
+    lp = str(_rpath(log_path))
+    cmd = ["bash", str(parser), *_parser_extra_args(), "--json", lp]
     timeout = max(30, _job_env_int("RACK_PARSER_TIMEOUT", 300))
     try:
-        proc = subprocess.run(
+        proc = host_exec.run_on_host(
             cmd,
             cwd=str(log_dir),
             env=env,
-            capture_output=True,
-            text=True,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
@@ -7969,7 +11294,17 @@ def _parser_json_for_log_path(log_dir: Path, log_path: Path) -> tuple[dict | Non
         parsed = json.loads(raw)
     except json.JSONDecodeError:
         return None, "parser stdout is not valid JSON"
-    return (parsed if isinstance(parsed, dict) else None), None
+    if not isinstance(parsed, dict):
+        return None, None
+    # Durable history (2026-07-28). This is the single choke point every analytics /
+    # multirack parser call goes through, so hooking it here records a run for each parsed
+    # log with no change to the return contract. Best-effort: swallowed on any failure.
+    try:
+        if _parser_json_has_usable_rows(parsed):
+            _history_ingest_parser_json(parsed, log_dir, lp, source="parser_json_for_log_path")
+    except Exception as e:  # noqa: BLE001
+        _logger.debug("history ingest (parser_json_for_log_path) failed for %s: %s", lp, e)
+    return parsed, None
 
 
 def _parse_gbps_scalar(v: object) -> float | None:
@@ -8034,9 +11369,9 @@ def _step_series_cv_pct(row: dict) -> float | None:
 
 
 def _multirack_rack_count_from_basename(name: str) -> int:
-    m = _MULTIRACK_N_RACK_RE.search(name)
-    if m:
-        tok = m.group(0).lower()
+    tok = nvis_id_templates.multirack_n_rack_marker(name)
+    if tok:
+        tok = tok.lower()
         if tok.endswith("rack"):
             try:
                 return max(1, int(tok[:-4], 10))
@@ -8047,32 +11382,30 @@ def _multirack_rack_count_from_basename(name: str) -> int:
 
 
 def _multirack_done_log_paths(log_dir: Path) -> list[Path]:
-    """Multirack NEMO/NCCL logs under log_dir root and ``failed/`` that pass the successful-log heuristic."""
-    pat = _parser_export_glob()
-    root = log_dir.resolve()
-    merged: dict[str, Path] = {}
-    if root.is_dir():
-        for p in root.glob(pat):
-            if not p.is_file() or not _nemo_nccl_in_log_basename(p.name):
+    """Multirack NEMO/NCCL logs under log_dir root and ``failed/`` that pass the successful-log heuristic.
+
+    Host-aware: discovers via ``host_exec`` (SSH when remote) so multirack analytics works whether the
+    app runs on the head node or on a laptop over SSH.
+    """
+    base_root = str(native_status._host_resolve(log_dir)).rstrip("/")
+    merged: dict[str, tuple[float, Path]] = {}
+    for base in (base_root, base_root + "/failed"):
+        for path, mtime_ns, _size in native_status._host_log_entries(base):
+            name = os.path.basename(path)
+            if not _nemo_nccl_in_log_basename(name):
                 continue
-            if not _is_multirack_log_basename(p.name):
+            if not _is_multirack_log_basename(name):
                 continue
-            if not _nemo_log_file_looks_successful(p):
+            hp = native_status._host_path(path)
+            if not _nemo_log_file_looks_successful(hp):
                 continue
-            merged[str(p.resolve())] = p
-    for p in _multirack_txt_paths_under_failed(log_dir, pat):
-        if _nemo_log_file_looks_successful(p):
-            merged[str(p.resolve())] = p
-    return sorted(merged.values(), key=lambda x: x.stat().st_mtime, reverse=True)
+            merged[path] = (mtime_ns / 1_000_000_000, hp)
+    return [p for _m, p in sorted(merged.values(), key=lambda t: t[0], reverse=True)]
 
 
 def _read_log_text_chunk(path: Path, max_bytes: int = 14 * 1024 * 1024) -> str:
-    try:
-        with path.open("rb") as fh:
-            blob = fh.read(max_bytes)
-        return blob.decode("utf-8", errors="replace")
-    except OSError:
-        return ""
+    # Host-aware (local or SSH); tolerates PurePosixPath remote paths.
+    return _host_read_text(path, max_bytes=max_bytes) or ""
 
 
 _RE_RUN_GB = re.compile(r"(?<![\w-])-gb\s+(\d+)\b", re.I)
@@ -8171,9 +11504,10 @@ def _mean_finite(vals: list[float | None]) -> float | None:
 
 
 def _log_mtime_or_zero(path: Path) -> float:
+    # AttributeError guards a remote PurePosixPath (no .stat()); mtime is only used for rep selection.
     try:
         return float(path.stat().st_mtime)
-    except OSError:
+    except (OSError, AttributeError):
         return 0.0
 
 
@@ -8368,6 +11702,138 @@ def _demo_analytics_aggregate() -> dict[str, object]:
     }
 
 
+# Metrics worth a fleet baseline, per workload kind. Names match what
+# ``results_history`` stores from parser.sh (records_from_parser_json) and from
+# ``universal_parser`` — both write the same lower-cased metric_name.
+_ANALYTICS_HISTORY_METRICS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("nccl", ("all_reduce_gbps", "all_gather_gbps", "alltoall_gbps", "busbw_gbps",
+              "reduce_scatter_gbps", "sendrecv_gbps")),
+    ("nemo", ("step_s", "step_time_s", "tflops_per_gpu", "mfu_percent")),
+    ("mnubergemm", ("gflops_max", "gflops_median")),
+    ("hpl", ("gflops", "tflops")),
+    ("nvbandwidth", ("bandwidth_gbps",)),
+    ("nvloom", ("bandwidth_gbps",)),
+)
+_ANALYTICS_HISTORY_SERIES_LIMIT = 5000
+
+
+def _analytics_history_block(since: str | None = None) -> dict[str, object]:
+    """Fleet baseline computed over the PERSISTED run history, not just today's log dir.
+
+    The existing single-rack/multirack tables in ``/api/analytics/aggregate`` are derived
+    from whatever logs happen to sit in ``log_dir`` right now *and* are gated on the rack's
+    ``nemo`` cell being ``done``; both facts are unchanged here. This adds a parallel view
+    whose baseline is every run ever ingested, so a deviation figure exists even when zero
+    racks are currently ``done``.
+
+    Returned under a NEW top-level ``history`` key — no existing field is touched.
+    """
+    if not _history_enabled():
+        return {
+            "available": False,
+            "reason": "results_history unavailable (check the bind mount in docker-compose.override.yml)",
+        }
+    base_filters: dict[str, object] = {}
+    if since:
+        base_filters["since"] = since
+    out: dict[str, object] = {
+        "available": True,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "since": since,
+        "workloads": {},
+    }
+    try:
+        out["db"] = results_history.db_stats()
+    except Exception as e:  # noqa: BLE001
+        out["db"] = {"error": str(e)}
+    for kind, metric_names in _ANALYTICS_HISTORY_METRICS:
+        try:
+            summary = results_history.summary_stats(kind, base_filters or None)
+        except Exception as e:  # noqa: BLE001
+            _logger.debug("history summary for %s failed: %s", kind, e)
+            continue
+        if not summary or not int(summary.get("run_count") or 0):
+            continue
+        stats = summary.get("metrics") or {}
+        per_metric: dict[str, object] = {}
+        for metric in metric_names:
+            st = stats.get(metric)
+            if not isinstance(st, dict) or not st.get("count"):
+                continue
+            median = st.get("median")
+            filt = dict(base_filters)
+            filt["workload_kind"] = kind
+            try:
+                pts = results_history.metric_series(
+                    metric, filt, limit=_ANALYTICS_HISTORY_SERIES_LIMIT
+                )
+            except Exception as e:  # noqa: BLE001
+                _logger.debug("history series for %s/%s failed: %s", kind, metric, e)
+                pts = []
+            # metric_series returns oldest-first, so the last row per rack is its latest run.
+            latest_by_rack: dict[str, dict[str, object]] = {}
+            for p in pts:
+                rk = p.get("rack")
+                if not rk:
+                    continue
+                latest_by_rack[str(rk)] = p
+            racks_out: list[dict[str, object]] = []
+            for rk in sorted(latest_by_rack):
+                p = latest_by_rack[rk]
+                val = p.get("value")
+                dev = None
+                if val is not None and isinstance(median, (int, float)) and float(median) > 0:
+                    dev = round((float(val) - float(median)) / float(median) * 100.0, 2)
+                racks_out.append(
+                    {
+                        "rack": rk,
+                        "value": val,
+                        "unit": p.get("unit"),
+                        "run_id": p.get("run_id"),
+                        "job_id": p.get("job_id"),
+                        "status": p.get("status"),
+                        "log_file": p.get("log_basename"),
+                        "started_at": p.get("started_at"),
+                        "pct_vs_history_median": dev,
+                    }
+                )
+            per_metric[metric] = {
+                "unit": st.get("unit"),
+                "sample_count": st.get("count"),
+                "median": median,
+                "mean": st.get("mean"),
+                "p05": st.get("p05"),
+                "p95": st.get("p95"),
+                "min": st.get("min"),
+                "max": st.get("max"),
+                "latest_per_rack": racks_out,
+            }
+        if not per_metric:
+            continue
+        out["workloads"][kind] = {
+            "run_count": summary.get("run_count"),
+            "pass_count": summary.get("pass_count"),
+            "fail_count": summary.get("fail_count"),
+            "first_started_at": summary.get("first_started_at"),
+            "last_started_at": summary.get("last_started_at"),
+            "metrics": per_metric,
+        }
+    return out
+
+
+@app.route("/api/analytics/history", methods=["GET"])
+def api_analytics_history():
+    """Fleet baseline over the persisted run history (``?since=`` ISO-8601 or epoch)."""
+    if not _history_enabled():
+        return _history_unavailable_response()
+    since = (request.args.get("since") or "").strip() or None
+    try:
+        return jsonify({"ok": True, "history": _analytics_history_block(since)})
+    except Exception as e:  # noqa: BLE001
+        _logger.warning("analytics history failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/analytics/last", methods=["GET"])
 def api_analytics_last():
     """Return the last saved analytics aggregate for ``log_dir`` (written after a successful POST)."""
@@ -8383,7 +11849,7 @@ def api_analytics_last():
         log_dir = _resolve_log_dir(request.args.get("log_dir"))
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
-    hit = _analytics_aggregate_cache_get(str(log_dir.resolve()))
+    hit = _analytics_aggregate_cache_get(str(_rpath(log_dir)))
     if not hit:
         return jsonify({"ok": False, "error": "no cached analysis for this log directory"}), 404
     out: dict[str, object] = dict(hit)
@@ -8429,72 +11895,133 @@ def api_analytics_aggregate():
             continue
         rk = str(ent.get("rack", "")).strip()
         nemo = str(ent.get("nemo", "")).strip().lower()
-        if not rk or nemo != "done":
+        # A rack qualifies if EITHER plane has a result. Gating on nemo=="done" alone made
+        # Analytics empty for any rack that ran only a Stage-1 NCCL sweep -- and with no
+        # Nemotron run anywhere on the cluster that meant "Run Analytics" returned nothing at
+        # all (48 racks: 12 nemo=fail, 36 nemo=pending, 0 done, while h03 had a COMPLETED
+        # 24-test NCCL sweep, job 65828). The NCCL and NEMO logs are already selected
+        # independently below, so admitting NCCL-only racks here needs no downstream change.
+        stage1 = str(ent.get("stage1", "")).strip().lower()
+        nccl = str(ent.get("nccl", "")).strip().lower()
+        if not rk or not (nemo == "done" or stage1 == "done" or nccl == "done"):
             continue
         try:
             done_racks.append(_normalize_rack_id(rk))
         except ValueError:
             continue
+
+    # The SPA posts ONLY {rack, nemo} -- AnalyticsView.tsx bodyRows does
+    #   rows.map(r => ({ rack: r.rack, nemo: r.nemo }))
+    # so stage1/nccl above can never arrive from the browser (they only work for API callers).
+    # The frontend is baked into the image, so instead of requiring a rebuild, discover racks
+    # that have a single-rack NCCL log straight from the log dir. ONE listing for the whole
+    # directory, not one per rack, so this costs a single round trip over SSH.
+    try:
+        _naming = _nvis_naming()
+        _base_root = str(native_status._host_resolve(log_dir)).rstrip("/")
+        for _base in (_base_root, _base_root + "/failed"):
+            for _path, _mt, _sz in native_status._host_log_entries(_base):
+                _name = os.path.basename(_path)
+                if "nccl" not in _name.lower():
+                    continue
+                if not _nemo_single_rack_log_basename(_name) or _is_multirack_log_basename(_name):
+                    continue
+                if _naming.is_llama_slurm_stdout_basename(_name):
+                    continue
+                _rid = _naming.rack_id_from_log_basename(_name) or ""
+                if not _rid:
+                    continue
+                try:
+                    done_racks.append(_normalize_rack_id(_rid))
+                except ValueError:
+                    continue
+    except Exception as _e:  # discovery is best-effort; never break the posted-rows path
+        app.logger.warning("analytics: NCCL rack discovery failed: %s", _e)
+
     done_racks = sorted(set(done_racks))
 
     series_by_rack: dict[str, list[dict[str, float]]] = {}
     scalar_rows: list[dict[str, object]] = []
     nemotron_rows: list[dict[str, object]] = []
     scaling_entries: dict[int, list[dict[str, object]]] = {}
+    # Successful runs whose step/TFLOPs could not be averaged, keyed the same way. They get a
+    # row with null means instead of being dropped: a 50-step multirack NeMo run used to pass
+    # every gate, contribute its NCCL series to the chart, and then vanish from the tables with
+    # no indication it had ever been considered.
+    scaling_no_metrics: dict[int, list[str]] = {}
 
     for rack in done_racks:
-        lp = pick_log_for_rack(log_dir, rack, None)
-        if lp is None or not lp.is_file():
+        cands = find_log_paths_for_rack(log_dir, rack)
+        if not cands:
             continue
-        if not _nemo_log_file_looks_successful(lp):
-            continue
-        parsed, err = _parser_json_for_log_path(log_dir, lp)
-        if parsed is None:
-            continue
-        nc = _pick_nccl_row(parsed, rack)
-        nm = _pick_nemotron_row(parsed, rack)
-        lf = lp.name
-        ar_series: list[dict[str, float]] = []
-        if isinstance(nc, dict):
-            raw_ser = nc.get("all_reduce_busbw_series") or []
-            if isinstance(raw_ser, list):
-                for p in raw_ser:
-                    if not isinstance(p, dict):
-                        continue
-                    try:
-                        sz = int(p.get("size_bytes") or 0)
-                        bw = float(p.get("bus_bw_gbps") or 0)
-                    except (TypeError, ValueError):
-                        continue
-                    if sz > 0 and bw >= 0:
-                        ar_series.append({"size_bytes": float(sz), "bus_bw_gbps": bw})
-            if ar_series:
-                series_by_rack[rack] = ar_series
-            scalar_rows.append(
-                {
-                    "rack": rack,
-                    "log_file": lf,
-                    "all_reduce_gbps": _parse_gbps_scalar(nc.get("all_reduce_gbps")),
-                    "all_gather_gbps": _parse_gbps_scalar(nc.get("all_gather_gbps")),
-                    "alltoall_gbps": _parse_gbps_scalar(nc.get("alltoall_gbps")),
-                }
-            )
-        if isinstance(nm, dict):
-            med = _parse_gbps_scalar(nm.get("median_step_time"))
-            if med is None:
-                med = _parse_gbps_scalar(nm.get("step_s"))
-            tf = _parse_gbps_scalar(nm.get("tflops_per_gpu"))
-            nemotron_rows.append(
-                {
-                    "rack": rack,
-                    "log_file": lf,
-                    "median_step_time": med,
-                    "tflops_per_gpu": tf,
-                    "step_time_cv_pct": _step_series_cv_pct(nm),
-                }
-            )
-            if med is not None and tf is not None:
-                _nemotron_scaling_append_entry(scaling_entries, 1, lp, float(tf), float(med))
+        # Select the NCCL and NEMO single-rack logs INDEPENDENTLY (candidates are newest-first).
+        # Previously we picked the single newest *1Rack*.txt and gated it on the NEMO-success
+        # grep (LLM step markers); that silently dropped any rack whose most-recent single-rack
+        # log was a standalone NCCL sweep — so a fresh NCCL run would hide the rack from
+        # analytics even though its logs are present and valid.
+        nccl_lp = next((p for p in cands if "nccl" in p.name.lower()), None)
+        nemo_lp = next(
+            (p for p in cands if "nccl" not in p.name.lower() and _nemo_log_file_looks_successful(p)),
+            None,
+        )
+
+        # --- NCCL (all_reduce bus-bw) from the newest NCCL single-rack log --------------
+        if nccl_lp is not None:
+            parsed_nc, _ = _parser_json_for_log_path(log_dir, nccl_lp)
+            nc = _pick_nccl_row(parsed_nc, rack) if isinstance(parsed_nc, dict) else None
+            if isinstance(nc, dict):
+                lf = nccl_lp.name
+                ar_series: list[dict[str, float]] = []
+                raw_ser = nc.get("all_reduce_busbw_series") or []
+                if isinstance(raw_ser, list):
+                    for p in raw_ser:
+                        if not isinstance(p, dict):
+                            continue
+                        try:
+                            sz = int(p.get("size_bytes") or 0)
+                            bw = float(p.get("bus_bw_gbps") or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if sz > 0 and bw >= 0:
+                            ar_series.append({"size_bytes": float(sz), "bus_bw_gbps": bw})
+                if ar_series:
+                    series_by_rack[rack] = ar_series
+                scalar_rows.append(
+                    {
+                        "rack": rack,
+                        "log_file": lf,
+                        "all_reduce_gbps": _parse_gbps_scalar(nc.get("all_reduce_gbps")),
+                        "all_gather_gbps": _parse_gbps_scalar(nc.get("all_gather_gbps")),
+                        "alltoall_gbps": _parse_gbps_scalar(nc.get("alltoall_gbps")),
+                        # NVIS 2026-07-28: parser.sh now also emits these two (nccl_busbw_ext_csv).
+                        "reduce_scatter_gbps": _parse_gbps_scalar(nc.get("reduce_scatter_gbps")),
+                        "sendrecv_gbps": _parse_gbps_scalar(nc.get("sendrecv_gbps")),
+                    }
+                )
+
+        # --- Nemotron from the newest successful NEMO single-rack log -------------------
+        if nemo_lp is not None:
+            parsed_nm, _ = _parser_json_for_log_path(log_dir, nemo_lp)
+            nm = _pick_nemotron_row(parsed_nm, rack) if isinstance(parsed_nm, dict) else None
+            if isinstance(nm, dict):
+                lf = nemo_lp.name
+                med = _parse_gbps_scalar(nm.get("median_step_time"))
+                if med is None:
+                    med = _parse_gbps_scalar(nm.get("step_s"))
+                tf = _parse_gbps_scalar(nm.get("tflops_per_gpu"))
+                nemotron_rows.append(
+                    {
+                        "rack": rack,
+                        "log_file": lf,
+                        "median_step_time": med,
+                        "tflops_per_gpu": tf,
+                        "step_time_cv_pct": _step_series_cv_pct(nm),
+                    }
+                )
+                if med is not None and tf is not None:
+                    _nemotron_scaling_append_entry(scaling_entries, 1, nemo_lp, float(tf), float(med))
+                else:
+                    scaling_no_metrics.setdefault(1, []).append(lf)
 
     size_to_vals: dict[int, list[float]] = {}
     for _rk, ser in series_by_rack.items():
@@ -8526,6 +12053,8 @@ def api_analytics_aggregate():
         ("all_reduce_gbps", "all_reduce_gbps"),
         ("all_gather_gbps", "all_gather_gbps"),
         ("alltoall_gbps", "alltoall_gbps"),
+        ("reduce_scatter_gbps", "reduce_scatter_gbps"),
+        ("sendrecv_gbps", "sendrecv_gbps"),
     ):
         vals = [float(r[key]) for r in scalar_rows if r.get(key) is not None]
         if not vals:
@@ -8601,31 +12130,40 @@ def api_analytics_aggregate():
                 tf_f = float(tf)
                 st_f = float(st)
                 _nemotron_scaling_append_entry(scaling_entries, n_r, lp, tf_f, st_f)
+            else:
+                scaling_no_metrics.setdefault(n_r, []).append(lp.name)
 
     nemotron_scaling: list[dict[str, object]] = []
     nemotron_throughput_scaling: list[dict[str, object]] = []
-    for n_r in sorted(scaling_entries.keys()):
-        ents = scaling_entries[n_r]
-        if not ents:
+    for n_r in sorted(set(scaling_entries) | set(scaling_no_metrics)):
+        ents = scaling_entries.get(n_r) or []
+        no_metrics = scaling_no_metrics.get(n_r) or []
+        if not ents and not no_metrics:
             continue
-        mean_tf = round(statistics.mean(float(e["tf"]) for e in ents), 3)
-        mean_st = round(statistics.mean(float(e["st"]) for e in ents), 4)
+        mean_tf = round(statistics.mean(float(e["tf"]) for e in ents), 3) if ents else None
+        mean_st = round(statistics.mean(float(e["st"]) for e in ents), 4) if ents else None
         n_logs = len(ents)
         nemotron_scaling.append(
             {
                 "n_racks": n_r,
                 "n_logs": n_logs,
+                "n_logs_no_metrics": len(no_metrics),
+                "logs_no_metrics": no_metrics,
                 "mean_tflops_per_gpu": mean_tf,
                 "mean_step_s": mean_st,
             }
         )
-        rep = max(ents, key=lambda e: _log_mtime_or_zero(e["path"]))  # type: ignore[arg-type]
-        nn = rep.get("num_nodes")
-        ng = rep.get("num_gpus")
-        num_nodes = int(nn) if nn is not None else None
-        num_gpus = int(ng) if ng is not None else None
-        mtps = _mean_finite([e.get("throughput_tokens_s") for e in ents])  # type: ignore[list-item]
-        mtpsg = _mean_finite([e.get("throughput_tokens_s_per_gpu") for e in ents])  # type: ignore[list-item]
+        num_nodes: int | None = None
+        num_gpus: int | None = None
+        mtps = mtpsg = None
+        if ents:
+            rep = max(ents, key=lambda e: _log_mtime_or_zero(e["path"]))  # type: ignore[arg-type]
+            nn = rep.get("num_nodes")
+            ng = rep.get("num_gpus")
+            num_nodes = int(nn) if nn is not None else None
+            num_gpus = int(ng) if ng is not None else None
+            mtps = _mean_finite([e.get("throughput_tokens_s") for e in ents])  # type: ignore[list-item]
+            mtpsg = _mean_finite([e.get("throughput_tokens_s_per_gpu") for e in ents])  # type: ignore[list-item]
         days: float | None = None
         if mtps is not None and mtps > 0:
             days = 1_000_000_000_000.0 / (mtps * 86400.0)
@@ -8633,6 +12171,8 @@ def api_analytics_aggregate():
             {
                 "n_racks": n_r,
                 "n_logs": n_logs,
+                "n_logs_no_metrics": len(no_metrics),
+                "logs_no_metrics": no_metrics,
                 "num_nodes": num_nodes,
                 "num_gpus": num_gpus,
                 "mean_step_s": mean_st,
@@ -8666,8 +12206,18 @@ def api_analytics_aggregate():
             "nemotron_throughput_scaling": nemotron_throughput_scaling,
         },
     }
+    # NEW key only — ``single_rack`` / ``multirack`` above are byte-for-byte what they were.
+    # The fleet baseline here is computed over the durable run history, so it is populated
+    # even when no rack's ``nemo`` cell is ``done`` (the gate the tables above still apply).
     try:
-        _analytics_aggregate_cache_put(str(log_dir.resolve()), payload)
+        payload["history"] = _analytics_history_block(
+            (body.get("since") or "").strip() or None if isinstance(body.get("since"), str) else None
+        )
+    except Exception as e:  # noqa: BLE001 - never fail the analytics response for this
+        _logger.warning("analytics history block failed: %s", e)
+        payload["history"] = {"available": False, "reason": str(e)}
+    try:
+        _analytics_aggregate_cache_put(str(_rpath(log_dir)), payload)
     except OSError:
         _logger.exception("analytics aggregate cache write failed")
     return jsonify(payload)
@@ -8678,16 +12228,28 @@ def _probe_log_json_via_rack_status(abs_path: Path) -> dict[str, object] | None:
     script = _script_path()
     if not _script_exists(script):
         return None
-    ap = abs_path.resolve()
+    ap = _rpath(abs_path)
     mvt = (_eget("RACK_MULTIRACK_VALIDATION_TEST") or "nccl_all_reduce").strip() or "nccl_all_reduce"
     vt_if_unset = mvt if _is_multirack_log_basename(ap.name) else "nccl_all_reduce,llm"
     env = _subprocess_env({"NO_COLOR": "1"}, validation_test_if_unset=vt_if_unset)
     _ensure_cmsh_rack_list_env_for_subprocess(env)
+    # ``env=`` is LOCAL ONLY -- run_on_host drops it for an SSH target, which is how this
+    # deployment runs the script. Without env_extra the remote never sees VALIDATION_TEST and
+    # validation_test_env.sh falls back to its strictest suite
+    # (all_reduce + alltoall + allgather + llm) applied to whichever single log is newest,
+    # so racks that passed every stage still render red. Forward the acceptance knobs
+    # explicitly; env_extra bypasses the FORWARD_ENV_PREFIXES allowlist.
+    env_extra = {"NO_COLOR": "1", "VALIDATION_TEST": env.get("VALIDATION_TEST", vt_if_unset)}
+    for _k in ("NEMO_TARGET_STEPS", "RACK_VALIDATION_CT_RANGE", "NVIS_RACK_ID"):
+        _v = (env.get(_k) or "").strip()
+        if _v:
+            env_extra[_k] = _v
     try:
         proc = host_exec.run_on_host(
             [str(script), "--probe-json", str(ap)],
             cwd=str(ap.parent),
             env=env,
+            env_extra=env_extra,
             timeout=max(60, _env_int("RACK_MULTIRACK_PROBE_TIMEOUT", 180)),
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -8702,18 +12264,17 @@ def _probe_log_json_via_rack_status(abs_path: Path) -> dict[str, object] | None:
     return out if isinstance(out, dict) else None
 
 
-_LOG_ANALYSIS_CACHE_VERSION = 1
+_LOG_ANALYSIS_CACHE_VERSION = 2
 _LOG_ANALYSIS_CACHE_PATH = REPO_ROOT / "var" / "cache" / "log_analysis_cache.json"
 
 
 def _glob_one_rack_nemo_logs_for_rack_status(log_dir: Path) -> list[Path]:
     """NEMO single-rack validation logs in log_dir root (not failed/, not NCCL-only, no Llama stdout)."""
-    root = log_dir.resolve()
+    root = _rpath(log_dir)
     naming = _nvis_naming()
     out: list[Path] = []
-    for p in sorted(root.glob("*.txt"), key=lambda x: x.name.lower()):
-        if not p.is_file():
-            continue
+    listing = [PurePosixPath(s) for s in host_exec.stat_dir(root, patterns=("*.txt",))]
+    for p in sorted(listing, key=lambda x: x.name.lower()):
         if not _nemo_single_rack_log_basename(p.name):
             continue
         if naming.is_llama_slurm_stdout_basename(p.name):
@@ -8758,6 +12319,8 @@ def _load_log_analysis_cache_entries() -> dict[str, dict[str, object]]:
     except OSError:
         return {}
     if not isinstance(raw, dict):
+        return {}
+    if raw.get("version") != _LOG_ANALYSIS_CACHE_VERSION:
         return {}
     ent = raw.get("entries")
     if not isinstance(ent, dict):
@@ -8923,12 +12486,19 @@ def api_multirack_status():
         log_dir = _resolve_log_dir(request.args.get("log_dir"))
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
-    payload = native_status.build_multirack_status(
-        log_dir.resolve(),
-        _probe_log_json_via_rack_status,
-        multirack_display_rack_from_basename,
-        _multirack_physical_rack_ids,
-    )
+    # Always jsonify failures: an uncaught AttributeError (e.g. PurePosixPath.resolve in
+    # ssh/container mode) becomes Flask's HTML 500 page, and the SPA surfaces
+    # "Unexpected token '<!DOCTYPE' is not valid JSON" in Results & logs on disk.
+    try:
+        payload = native_status.build_multirack_status(
+            log_dir,
+            _probe_log_json_via_rack_status,
+            multirack_display_rack_from_basename,
+            _multirack_physical_rack_ids,
+        )
+    except Exception as e:
+        app.logger.exception("multirack-status failed for log_dir=%s", log_dir)
+        return jsonify({"ok": False, "error": f"multirack-status failed: {e}"}), 500
     return jsonify(payload)
 
 
@@ -8950,7 +12520,7 @@ def _export_float_cell(v: object) -> float | None:
 
 
 def _export_nodes_per_rack() -> int:
-    n = _env_int("RACK_EXPORT_NODES_PER_RACK", 18)
+    n = _eget_int("RACK_EXPORT_NODES_PER_RACK", 18)
     return max(1, min(n, 65535))
 
 
@@ -9206,8 +12776,10 @@ def _parser_excel_report_copy_dir() -> Path:
     """
     raw = (_eget("RACK_PARSER_EXCEL_REPORT_DIR") or "").strip()
     if raw:
-        return Path(os.path.expanduser(raw)).resolve()
-    return (_bug_report_local_base_path() / "parser-excel").resolve()
+        # An exec-host path: expanduser/resolve would answer from this process's
+        # filesystem and home directory, which is not where the reports live.
+        return _rpath(raw)
+    return _bug_report_local_base_path() / "parser-excel"
 
 
 @app.route("/api/parser-export-excel")
@@ -9234,20 +12806,27 @@ def api_parser_export_excel():
     parser = _parser_path()
     if not _script_exists(parser):
         return jsonify({"ok": False, "error": f"parser.sh not found: {parser}"}), 500
+    root = _rpath(log_dir)
     rel_args: list[str] = []
     for p in paths:
-        rel_args.append(str(p.resolve().relative_to(log_dir.resolve())))
+        # Already absolute exec-host paths from the listing; .resolve() would ask
+        # the *local* filesystem about a directory that may live elsewhere.
+        try:
+            rel_args.append(str(PurePosixPath(str(p)).relative_to(root)))
+        except ValueError:
+            rel_args.append(str(p))
     env = _subprocess_env({"NO_COLOR": "1"})
     cmd = ["bash", str(parser), *_parser_extra_args(), "--json", *rel_args]
     timeout = max(60, _env_int("RACK_PARSER_EXPORT_TIMEOUT", 900))
     try:
-        proc = subprocess.run(
+        # parser.sh reads the logs, so it has to run where they are: the logs role's
+        # host, with the log dir as cwd. A local subprocess found neither.
+        proc = host_exec.run_on_host(
             cmd,
-            cwd=str(log_dir),
+            cwd=str(root),
             env=env,
-            capture_output=True,
-            text=True,
             timeout=timeout,
+            role="logs",
         )
     except subprocess.TimeoutExpired:
         return jsonify({"ok": False, "error": f"parser.sh --json timed out after {timeout}s"}), 504
@@ -9298,10 +12877,12 @@ def api_parser_export_excel():
         "X-Export-Log-Count": str(len(paths)),
     }
     try:
-        report_dir = _parser_excel_report_copy_dir()
-        report_dir.mkdir(parents=True, exist_ok=True)
-        dest = report_dir / fname
-        dest.write_bytes(body)
+        dest = _parser_excel_report_copy_dir() / fname
+        # The reports directory belongs to the execution host, so the copy travels
+        # through the connection; a local write would land inside the container.
+        err = host_exec.write_bytes(dest, body)
+        if err:
+            raise OSError(err)
         hdrs["X-Export-Report-Copy"] = str(dest)
     except OSError as e:
         _logger.warning("parser Excel: could not write report copy: %s", e)
@@ -9340,16 +12921,33 @@ def api_export_logs_zip():
                 ),
             }
         ), 404
-    root = log_dir.resolve()
+    root = _rpath(log_dir)
+    # The logs live on the execution host, so each one is pulled through the
+    # connection and written from memory: zipfile.write() resolves and opens the
+    # path locally, which finds nothing when the log dir is on the head node.
+    cap = max(1, _env_int("RACK_LOG_EXPORT_MAX_BYTES", 64 * 1024 * 1024))
     bio = io.BytesIO()
+    written = 0
+    skipped: list[str] = []
     try:
         with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
             for p in paths:
-                rp = p.resolve()
-                arc = str(rp.relative_to(root))
-                zf.write(str(rp), arcname=arc)
-    except OSError as e:
+                text, meta = host_exec.read_text(p, whole_bytes=cap)
+                if meta.get("read_error"):
+                    skipped.append(p.name)
+                    continue
+                try:
+                    arc = str(PurePosixPath(str(p)).relative_to(root))
+                except ValueError:
+                    arc = p.name
+                zf.writestr(arc, text)
+                written += 1
+    except (OSError, zipfile.BadZipFile) as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+    if not written:
+        return jsonify(
+            {"ok": False, "error": f"could not read any of the {len(paths)} matching logs"}
+        ), 500
     body = bio.getvalue()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     fname = f"rack-logs-export-{stamp}.zip"
@@ -9360,9 +12958,126 @@ def api_export_logs_zip():
             "Content-Disposition": f'attachment; filename="{fname}"',
             "Cache-Control": "no-store, max-age=0",
             "Pragma": "no-cache",
-            "X-Export-Log-Count": str(len(paths)),
+            "X-Export-Log-Count": str(written),
+            "X-Export-Skipped": str(len(skipped)),
         },
     )
+
+
+_NCCL_DEBUG_LEVELS = ("VERSION", "WARN", "INFO", "TRACE")
+
+# Custom launch env vars (UI "Extra environment variables" field). A key must be a valid
+# POSIX-ish env name; values are single-line and length-capped; the count is bounded. These
+# guardrails keep a well-formed KEY=VALUE map without allowing injection of newlines / huge
+# payloads into the job environment. Forwarded as env_extra (bypasses the SSH allowlist) and
+# chained to the container via each launcher's --export=ALL.
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ENV_MAX_VARS = 32
+_ENV_MAX_VALUE_LEN = 2048
+
+# Upper bound for the launch dialog's NEMO step selector. The UI offers 50 (perf) and 2010
+# (soak); the cap only rejects absurd hand-crafted payloads, it does not pin the choices.
+_NEMO_MAX_STEPS_LIMIT = 1_000_000
+
+
+def _custom_env_from_body(body: dict) -> dict[str, str]:
+    """Validated user-supplied ``env`` map from the POST body ({"KEY": "VALUE", ...}).
+
+    Silently drops entries with an invalid key, a multi-line/oversized value, or beyond the
+    per-launch cap (the UI validates too, so a bad row just doesn't get applied).
+    """
+    extra = body.get("env")
+    if not isinstance(extra, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in extra.items():
+        key = str(k).strip()
+        if not _ENV_KEY_RE.match(key):
+            continue
+        val = str(v)
+        if "\n" in val or "\r" in val or len(val) > _ENV_MAX_VALUE_LEN:
+            continue
+        out[key] = val
+        if len(out) >= _ENV_MAX_VARS:
+            break
+    return out
+
+
+def _launch_env_from_body(body: dict) -> dict[str, str]:
+    """Per-launch env knobs parsed from the POST body: NCCL debug level + custom env vars.
+
+    ``nccl_debug`` accepts VERSION/WARN/INFO/TRACE (case-insensitive). ``off``/``default``/
+    empty/absent means "leave the script default" (no override). We set BOTH
+    ``NVIS_NCCL_DEBUG`` (honored by the NEMO launchers, which otherwise hard-code the
+    level) and raw ``NCCL_DEBUG`` (read directly by ``nccl_allreduce.sbatch`` and the
+    portable Stage-1 launcher) so the toggle reaches every NCCL/NEMO launch path.
+
+    ``env`` is a user-supplied KEY=VALUE map from the launch dialog (e.g.
+    ``OMPI_MCA_coll_hcoll_enable=0``). Explicit keys win over the NCCL-debug defaults.
+
+    All of these are threaded to the worker as ``env_extra`` so they reach the remote
+    cluster over SSH (the forward allowlist is bypassed for explicit ``env_extra`` keys)
+    and are forwarded into the container by each launcher's ``--export=ALL``.
+    """
+    out: dict[str, str] = {}
+    raw = body.get("nccl_debug")
+    if raw is not None:
+        lvl = str(raw).strip().upper()
+        if lvl and lvl not in ("OFF", "DEFAULT", "NONE") and lvl in _NCCL_DEBUG_LEVELS:
+            out["NVIS_NCCL_DEBUG"] = lvl
+            out["NCCL_DEBUG"] = lvl
+    # NEMO training length. NVIS_NEMO_MAX_STEPS is what the job runs; NEMO_TARGET_STEPS is the
+    # minimum DECLARED total the log labeller requires before calling a run finished
+    # (lib/llm_label.inc.sh, default 2010). They MUST move together — a 50-step run left at the
+    # 2010 threshold completes but is never labelled done.
+    steps = body.get("max_steps")
+    if isinstance(steps, bool):
+        steps = None
+    if isinstance(steps, (int, float)) and 1 <= int(steps) <= _NEMO_MAX_STEPS_LIMIT:
+        out["NVIS_NEMO_MAX_STEPS"] = str(int(steps))
+        out["NEMO_TARGET_STEPS"] = str(int(steps))
+    # User-supplied vars win over the debug defaults above.
+    custom = _custom_env_from_body(body)
+    out.update(custom)
+    # Advertise the exact set of user-supplied keys so multi-node launchers can forward
+    # precisely these to remote ranks. nccl_allreduce.sbatch only propagates an explicit
+    # -x allowlist to orted on nodes other than the mpirun host; without this, a custom
+    # var (e.g. NCCL_NET_PLUGIN=none) would apply to local ranks only.
+    if custom:
+        out["NVIS_EXTRA_ENV_KEYS"] = " ".join(sorted(custom))
+    return out
+
+
+def _nccl_version_cli(body: dict) -> list[str] | tuple[object, int]:
+    """Validate ``body['nccl_version']`` → ``["--nccl-version", v]`` for run_nccl_mpi.sh.
+
+    Shared by the direct NCCL launch surfaces (single-rack Stage-1 + cross-rack) so the
+    version selector behaves identically. Returns ``[]`` when unset/default, or an
+    ``(jsonify(error), 400)`` tuple on an invalid token. "system"/"default" = host build
+    (2.28.9); "X.Y.Z" = a vetted NFS build loaded via LD_LIBRARY_PATH.
+    """
+    ver = (body.get("nccl_version") or _eget("RACK_NCCL_MPI_VERSION") or "").strip()
+    if not ver:
+        return []
+    if not re.match(r"^(system|default|[0-9]+(\.[0-9]+){1,3})$", ver):
+        return (jsonify({"ok": False, "error": f"invalid nccl_version: {ver!r}"}), 400)
+    return ["--nccl-version", ver]
+
+
+def _nccl_rounds_from_body(body: dict, default: int | None) -> int | None:
+    """NCCL sweep rounds from the launch body (``iters``), clamped to 1..50.
+
+    ``default`` is returned when the body omits ``iters`` (single-rack Stage-1 passes 5 so the
+    acceptance sweep runs 5 times; the x-rack path passes ``None`` to leave the sbatch default).
+    """
+    raw = body.get("iters")
+    if raw is None:
+        return default
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(n, 50))
 
 
 def _prepare_run_validation(body: dict) -> tuple[dict | None, tuple[object, int] | None]:
@@ -9389,8 +13104,10 @@ def _prepare_run_validation(body: dict) -> tuple[dict | None, tuple[object, int]
     script = _validation_script_path()
     if not _script_exists(script):
         return None, (jsonify({"ok": False, "error": f"validation script not found: {script}"}), 500)
-    cmd = ["bash", str(script), target]
-    display_cmd = "./" + script.name + " " + shlex.quote(target)
+    # Pass the resolved rack id as $2 so the script names the log …-1Rack-<rack>-… correctly for any
+    # naming convention (Bright p<N>-r<N> or Boston bos01-b05); the script's own regex is Bright-only.
+    cmd = ["bash", str(script), target, rk]
+    display_cmd = "./" + script.name + " " + shlex.quote(target) + " " + shlex.quote(rk)
     timeout = max(30, _job_env_int("RACK_VALIDATION_TIMEOUT", 600))
     return (
         {
@@ -9400,6 +13117,19 @@ def _prepare_run_validation(body: dict) -> tuple[dict | None, tuple[object, int]
             "cmd": cmd,
             "display_cmd": display_cmd,
             "timeout": timeout,
+            # Settings -> job env values must reach run_llmb_nccl.sh, which otherwise falls back
+            # to its built-in defaults (/home/nvis/dgxc-benchmarking, /home/nvis/llmb_venv) —
+            # the wrong user on this cluster, and paths that do not exist. Mirrors how the
+            # ClusterKit prepare pulls its RACK_CLUSTERKIT_* keys via _eget.
+            "env_updates": {
+                **{
+                    k: v
+                    for k in ("LLMB_INSTALL", "LLMB_REPO", "LLMB_VENV", "NVIS_WORKSPACE_DIR")
+                    if (v := (_eget(k) or "").strip())
+                },
+                # Launch-dialog vars win over the stored Settings values.
+                **_launch_env_from_body(body),
+            },
         },
         None,
     )
@@ -9421,13 +13151,14 @@ def api_run_validation():
     timeout = int(prep["timeout"])
     try:
         with _track_sync_op(rk, "validation", _operator_from_request()):
-            proc = subprocess.run(
+            # Privileged "script" target (root@slogin): pdsh-rsync to root-owned /raid/data
+            # + sbatch. Routes via host_exec so SSH mode runs on the cluster, not locally.
+            proc = host_exec.run_on_host(
                 cmd,
+                timeout=timeout,
                 cwd=str(log_dir),
                 env=_subprocess_env(),
-                capture_output=True,
-                text=True,
-                timeout=timeout,
+                profile="script",
             )
     except subprocess.TimeoutExpired:
         return jsonify({"ok": False, "error": "validation script timed out", "target": target}), 504
@@ -9461,13 +13192,31 @@ def api_run_validation_async():
     cmd = prep["cmd"]
     display_cmd = str(prep["display_cmd"])
     timeout = int(prep["timeout"])
+    _eu = prep.get("env_updates")
+    env_merged = {str(k): str(v) for k, v in _eu.items()} if isinstance(_eu, dict) and _eu else None
     job_id = str(uuid.uuid4())
     created = datetime.now(timezone.utc).isoformat()
+    operator = _operator_from_request()
+    val_tool, val_stage = _validation_tool_and_stage()
+    _record_validation_activity(
+        val_tool,
+        stage=val_stage,
+        scope="rack",
+        rack=rk,
+        racks=[rk],
+        log_dir=str(log_dir),
+        command_display=display_cmd,
+        activity_id=job_id,
+        operator=operator,
+    )
+    if env_merged is None:
+        env_merged = {}
+    env_merged = {**env_merged, "NVIS_ACTIVITY_ID": job_id}
     with _validation_jobs_lock:
         _validation_jobs[job_id] = {
             "job_id": job_id,
             "kind": "validation",
-            "operator": _operator_from_request(),
+            "operator": operator,
             "rack": rk,
             "target": target,
             "log_dir": str(log_dir),
@@ -9478,6 +13227,7 @@ def api_run_validation_async():
     threading.Thread(
         target=_validation_worker,
         args=(job_id, cmd, str(log_dir), timeout, display_cmd),
+        kwargs={"env_updates": env_merged},
         daemon=True,
     ).start()
     return jsonify(
@@ -9522,6 +13272,7 @@ def _prepare_run_nemo_xrack(body: dict) -> tuple[dict | None, tuple[object, int]
     if not isinstance(racks_raw, list) or len(racks_raw) < 1:
         return None, (jsonify({"ok": False, "error": "racks must be a non-empty array of rack ids"}), 400)
     inner = _validation_ct_inner()
+    naming = _nvis_naming()
     specs: list[str] = []
     seen: set[str] = set()
     for item in racks_raw:
@@ -9529,7 +13280,12 @@ def _prepare_run_nemo_xrack(body: dict) -> tuple[dict | None, tuple[object, int]
         if rk in seen:
             continue
         seen.add(rk)
-        specs.append(f"{rk}-ct[{inner}]")
+        # Build the tray spec from NVIS_CT_ID, never a literal "-ct". The joiner is a naming
+        # property: Bright is <rack>-ct<NN>, but Nscale TX is <rack>-<NN>, so the hardcoded form
+        # produced ink50-dh01-h02-ct[11-18,...] — hosts that exist in neither DNS nor Slurm.
+        # pdsh then failed ssh 255 on every node and sbatch rejected the list with
+        # "Invalid node name specified". Every other tray-spec site already uses ct_blob.
+        specs.append(naming.ct_blob(rk, inner))
     if not specs:
         return None, (jsonify({"ok": False, "error": "no valid rack ids"}), 400)
     script = _nemo_xrack_script_path()
@@ -9546,6 +13302,8 @@ def _prepare_run_nemo_xrack(body: dict) -> tuple[dict | None, tuple[object, int]
             "display_cmd": display_cmd,
             "timeout": timeout,
             "arg": arg,
+            "racks": sorted(seen),
+            "env_updates": _launch_env_from_body(body),
         },
         None,
     )
@@ -9567,25 +13325,42 @@ def api_run_nemo_xrack_async():
     display_cmd = str(prep["display_cmd"])
     timeout = int(prep["timeout"])
     arg = str(prep["arg"])
+    racks = [str(r) for r in prep.get("racks") or []]
+    _eu = prep.get("env_updates")
+    env_merged = {str(k): str(v) for k, v in _eu.items()} if isinstance(_eu, dict) and _eu else None
     job_id = str(uuid.uuid4())
     created = datetime.now(timezone.utc).isoformat()
+    operator = _operator_from_request()
     # Same as run-validation: cwd=log_dir so Slurm --output=… writes under the UI log dir.
-    cwd = str(log_dir.resolve())
+    cwd = _host_job_cwd(log_dir)
     with _xrack_jobs_lock:
         _xrack_jobs[job_id] = {
             "job_id": job_id,
             "kind": "xrack",
-            "operator": _operator_from_request(),
+            "operator": operator,
             "rack": "multinode",
+            "racks": racks,
             "log_dir": str(log_dir),
             "phase": "starting",
             "command_display": display_cmd,
             "created_at": created,
             "xrack_arg": arg,
         }
+    _record_validation_activity(
+        "nemo-xrack",
+        stage="multirack",
+        scope="multirack",
+        rack=racks[0] if racks else "",
+        racks=racks,
+        log_dir=str(log_dir),
+        command_display=display_cmd,
+        activity_id=job_id,
+        operator=operator,
+    )
     threading.Thread(
         target=_xrack_worker,
         args=(job_id, cmd, cwd, timeout, display_cmd),
+        kwargs={"env_updates": env_merged},
         daemon=True,
     ).start()
     return jsonify(
@@ -9665,12 +13440,24 @@ def api_run_llama_async():
     nodes_spec = str(prep["nodes_spec"])
     job_id = str(uuid.uuid4())
     created = datetime.now(timezone.utc).isoformat()
-    cwd = str(log_dir.resolve())
+    operator = _operator_from_request()
+    cwd = _host_job_cwd(log_dir)
+    _record_validation_activity(
+        "llama",
+        stage="other",
+        scope="rack",
+        rack=rk,
+        racks=[rk],
+        log_dir=cwd,
+        command_display=display_cmd,
+        activity_id=job_id,
+        operator=operator,
+    )
     with _llama_jobs_lock:
         _llama_jobs[job_id] = {
             "job_id": job_id,
             "kind": "llama",
-            "operator": _operator_from_request(),
+            "operator": operator,
             "rack": rk,
             "log_dir": cwd,
             "nodes_spec": nodes_spec,
@@ -9709,10 +13496,7 @@ def api_run_llama_status():
 
 def _sn_llama_txt_paths_for_rack(log_dir: Path, rack: str, *, exclude: Path | None = None) -> list[Path]:
     """``log_dir/sn-llama/*.txt`` whose names suggest LLAMA and match *rack* (case-insensitive substring on rack id tokens)."""
-    root = log_dir.resolve()
-    d = root / "sn-llama"
-    if not d.is_dir():
-        return []
+    d = _rpath(log_dir) / "sn-llama"
     needles: list[str] = []
     for rid in _nvis_naming().find_rack_ids_in_string(rack or ""):
         needles.append(rid)
@@ -9720,22 +13504,20 @@ def _sn_llama_txt_paths_for_rack(log_dir: Path, rack: str, *, exclude: Path | No
         t = (rack or "").strip().lower()
         if t:
             needles = [t]
-    ex = exclude.resolve() if exclude is not None else None
+    ex = str(_rpath(exclude)) if exclude is not None else None
     out: list[Path] = []
-    try:
-        paths = sorted(d.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
-    except OSError:
-        return []
+    # One listing on the execution host; mtime arrives with it, so the newest-first
+    # ordering below needs no per-file stat.
+    entries = host_exec.stat_dir(d, patterns=("*.txt",))
+    paths = [
+        PurePosixPath(s)
+        for s in sorted(entries, key=lambda s: entries[s].mtime, reverse=True)
+    ]
     cap = max(1, _env_int("RACK_PARSER_SN_LLAMA_MAX_FILES", 25))
     for p in paths:
         if len(out) >= cap:
             break
-        try:
-            if not p.is_file():
-                continue
-            if ex is not None and p.resolve() == ex:
-                continue
-        except OSError:
+        if ex is not None and str(p) == ex:
             continue
         nl = p.name.casefold()
         if "llama" not in nl:
@@ -9755,25 +13537,16 @@ def api_sn_llama_logs():
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     rack_f = (request.args.get("rack") or "").strip().lower()
-    d = log_dir.resolve() / "sn-llama"
-    if not d.is_dir():
-        return jsonify({"ok": True, "files": []})
+    d = _rpath(log_dir) / "sn-llama"
+    # Single listing through the connection: name + mtime is all this endpoint
+    # reports, and an absent directory comes back empty.
+    entries = host_exec.stat_dir(d, patterns=("*.txt",))
     out: list[dict[str, object]] = []
-    try:
-        paths = sorted(d.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
-    except OSError as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-    for p in paths[:200]:
-        try:
-            if not p.is_file():
-                continue
-            nm = p.name.lower()
-            if rack_f and rack_f not in nm:
-                continue
-            st = p.stat()
-            out.append({"name": p.name, "mtime": int(st.st_mtime)})
-        except OSError:
+    for path_s in sorted(entries, key=lambda s: entries[s].mtime, reverse=True)[:200]:
+        name = PurePosixPath(path_s).name
+        if rack_f and rack_f not in name.lower():
             continue
+        out.append({"name": name, "mtime": int(entries[path_s].mtime)})
     return jsonify({"ok": True, "files": out})
 
 
@@ -9815,15 +13588,147 @@ def _prepare_run_mnubergemm_stress(body: dict) -> tuple[dict | None, tuple[objec
         "WORKSPACE_DIR": ws,
         "NVIS_WORKSPACE_DIR": ws,
         "TOPDIR": ws,
-        "NVIS_BIN_SCRIPTS": str(_resolve_path(SCRIPTS_DIR)),
+        "NVIS_BIN_SCRIPTS": str(_rpath(SCRIPTS_DIR)),
         "CUDA_MAJ": cuda_m,
         "NVIS_SYSINFO_SH": str(_sysinfo_script_path()),
-        "NVIS_CHECKER_SH": str(_resolve_path(SCRIPTS_DIR / "checker.sh")),
+        "NVIS_CHECKER_SH": str(_rpath(SCRIPTS_DIR / "checker.sh")),
     }
     for k in ("NVIS_HPCX_ROOT", "NVIS_NCCL_PATH", "RACK_MNUBERGEMM_PARTITION"):
         v = (_eget(k) or "").strip()
         if v:
             env_updates[k] = v
+    return (
+        {
+            "log_dir": log_dir,
+            "rk": rk,
+            "target": target,
+            "cmd": cmd,
+            "display_cmd": display_cmd,
+            "timeout": timeout,
+            "env_updates": env_updates,
+        },
+        None,
+    )
+
+
+def _llmb_env_updates(body: dict) -> dict[str, str]:
+    """Env for the llmb-run launchers.
+
+    ``_eget()`` reads Settings out of ``var/cache/job_env_overrides.json``, which is NOT part
+    of ``os.environ`` and therefore does NOT cross the SSH hop to the head node. Without this,
+    ``run_llmb_nccl.sh`` silently falls back to its built-in ``/home/nvis/...`` defaults and
+    cannot find llmb-run. Forward the workspace keys explicitly.
+    """
+    out: dict[str, str] = {}
+    for key in ("LLMB_INSTALL", "LLMB_REPO", "LLMB_VENV", "LLMB_RUN", "NVIS_WORKSPACE_DIR"):
+        val = (_eget(key) or "").strip()
+        if val:
+            out[key] = val
+    out.update(_launch_env_from_body(body))
+    return out
+
+
+def _prepare_run_nccl_fullrack(body: dict) -> tuple[dict | None, tuple[object, int] | None]:
+    """Shared parse for the standalone Stage-1 NCCL benchmark.
+
+    Converged onto the SAME direct path as the cross-rack test (``run_nccl_mpi.sh`` →
+    ``nccl_allreduce.sbatch``: host nccl-tests + mpirun, NCCL over the IB rails, library
+    version selectable via LD_LIBRARY_PATH). ``--app-log-rack`` names the Slurm output
+    ``<user>-NCCL-1Rack-<rack>-<n>N-<jobid>.txt`` so the dashboard row + parser flip the
+    rack's Stage-1 NCCL status, exactly as the legacy portable launcher did. Uses the
+    ``script`` profile (root@slogin) like the other NCCL launchers.
+    """
+    if os.environ.get("RACK_NCCL_FULLRACK_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        return None, (
+            jsonify({"ok": False, "error": "NCCL benchmark disabled (RACK_NCCL_FULLRACK_DISABLED)"}),
+            403,
+        )
+    log_raw = body.get("log_dir")
+    try:
+        log_dir = _resolve_log_dir(str(log_raw).strip() if log_raw else None)
+    except ValueError as e:
+        return None, (jsonify({"ok": False, "error": str(e)}), 400)
+    rack = (body.get("rack") or "").strip()
+    try:
+        rk = _normalize_rack_id(rack)
+    except ValueError as e:
+        return None, (jsonify({"ok": False, "error": str(e)}), 400)
+    tgt_ov = body.get("target")
+    if tgt_ov is not None and not isinstance(tgt_ov, str):
+        return None, (jsonify({"ok": False, "error": "target must be a string"}), 400)
+    tgt_ov_s = tgt_ov.strip() if isinstance(tgt_ov, str) else ""
+    # Resolve the node target. When the UI sends an explicit node selection we submit those
+    # exact trays via ``--nodelist`` (so e.g. a rack minus a down/faulted node runs on 17);
+    # with no selection we pass the rack id and let run_nccl_mpi.sh resolve the full rack.
+    try:
+        target = validation_target_for_rack(rack, tgt_ov_s or None)
+    except ValueError:
+        target = rk
+    # Stage-1 runs through llmb-run (run_llmb_nccl.sh), not raw sbatch. Operator ask
+    # 2026-07-28: "fix stage 1 NCCL to use llmb run - no more sbatch - only for MNUberGEMM
+    # everything else is llmbrun". One llmb submit runs the whole pre-generated testset
+    # (24 tests: all_reduce, all_gather, reduce_scatter, alltoall, sendrecv), so the
+    # per-collective knobs below (--size-max / --nccl-version / --rounds) do not apply --
+    # the sweep is defined by llmb_repo/nccl/config/testset.toml and baked into launch.sh.
+    # Set RACK_NCCL_FULLRACK_LAUNCHER=mpi to fall back to run_nccl_mpi.sh + nccl_allreduce.sbatch.
+    launcher = (_eget("RACK_NCCL_FULLRACK_LAUNCHER") or "llmb").strip().lower()
+    use_llmb = launcher not in ("mpi", "sbatch", "direct", "nccl_mpi")
+    script = _run_llmb_nccl_script_path() if use_llmb else _run_nccl_mpi_script_path()
+    if not _script_exists(script):
+        return None, (jsonify({"ok": False, "error": f"NCCL launcher not found: {script}"}), 500)
+    env_updates: dict[str, str] = {"RACK_JOB_LOG_DIR": str(log_dir), "NVIS_RACK": rk}
+
+    if use_llmb:
+        cmd = ["bash", str(script)]
+        reservation = (body.get("reservation") or _eget("RACK_LLMB_NCCL_RESERVATION") or "").strip()
+        if reservation:
+            cmd += ["--reservation", reservation]
+        if bool(body.get("dry_run")):
+            cmd.append("--dry-run")
+        # Explicit tray selection -> --nodelist; otherwise let the script expand the rack id.
+        if tgt_ov_s:
+            cmd += ["--nodelist", target]
+            node_arg_display = " --nodelist " + shlex.quote(target)
+        else:
+            cmd.append(rk)
+            node_arg_display = " " + shlex.quote(rk)
+        display_cmd = "./" + script.name + (
+            (" --reservation " + shlex.quote(reservation)) if reservation else ""
+        ) + (" --dry-run" if body.get("dry_run") else "") + node_arg_display
+        timeout = max(120, _job_env_int("RACK_LLMB_NCCL_TIMEOUT", 14400))
+        env_updates.update(_llmb_env_updates(body))
+    else:
+        # Cap the all_reduce sweep. Accept the legacy `end`/RACK_NCCL_FULLRACK_END knobs too.
+        size_max = (
+            body.get("size_max") or body.get("end") or _eget("RACK_NCCL_MPI_SIZE_MAX")
+            or _eget("RACK_NCCL_FULLRACK_END") or "16G"
+        ).strip()
+        cmd = ["bash", str(script), "--app-log-rack", rk]
+        if size_max:
+            cmd += ["--size-max", size_max]
+        vc = _nccl_version_cli(body)
+        if isinstance(vc, tuple):
+            return None, vc
+        cmd += vc
+        nccl_version = vc[1] if vc else ""
+        # Stage-1 acceptance runs the sweep 5× by default; the UI modal can override via ``iters``.
+        rounds = _nccl_rounds_from_body(body, 5) or 5
+        cmd += ["--rounds", str(rounds)]
+        if tgt_ov_s:
+            cmd += ["--nodelist", target]
+            node_arg_display = " --nodelist " + shlex.quote(target)
+        else:
+            cmd.append(rk)
+            node_arg_display = " " + shlex.quote(rk)
+        display_cmd = "./" + script.name + " --app-log-rack " + shlex.quote(rk) + (
+            (" --size-max " + shlex.quote(size_max)) if size_max else ""
+        ) + (
+            (" --nccl-version " + shlex.quote(nccl_version)) if nccl_version else ""
+        ) + " --rounds " + str(rounds) + node_arg_display
+        timeout = max(120, _job_env_int("RACK_NCCL_FULLRACK_TIMEOUT", 7200))
+        # run_nccl_mpi.sh writes its Slurm --output under RACK_JOB_LOG_DIR (defaults to cwd; the
+        # worker cwd is log_dir, but set it explicitly so the app log always lands in log_dir).
+        env_updates.update(_launch_env_from_body(body))
     return (
         {
             "log_dir": log_dir,
@@ -9863,7 +13768,7 @@ def _prepare_run_nvloom_singlerack(body: dict) -> tuple[dict | None, tuple[objec
     except ValueError as e:
         return None, (jsonify({"ok": False, "error": str(e)}), 400)
     script = _nvloom_singlerack_script_path()
-    if not script.is_file():
+    if not _script_exists(script):
         return None, (jsonify({"ok": False, "error": f"nvloom script not found: {script}"}), 500)
     cmd = ["bash", str(script), target]
     display_cmd = "./" + script.name + " " + shlex.quote(target)
@@ -9879,7 +13784,7 @@ def _prepare_run_nvloom_singlerack(body: dict) -> tuple[dict | None, tuple[objec
         "WORKSPACE_DIR": ws,
         "NVIS_WORKSPACE_DIR": ws,
         "TOPDIR": ws,
-        "NVIS_BIN_SCRIPTS": str(_resolve_path(SCRIPTS_DIR)),
+        "NVIS_BIN_SCRIPTS": str(_rpath(SCRIPTS_DIR)),
         "CUDA_MAJ": cuda_m,
     }
     for k in ("NVIS_NVLOOM_HPCX_INIT", "NVIS_NVLOOM_CLI", "NVIS_NVLOOM_UCX_TLS", "RACK_NVLOOM_PARTITION"):
@@ -9925,7 +13830,7 @@ def _prepare_run_clusterkit_singlerack(body: dict) -> tuple[dict | None, tuple[o
     except ValueError as e:
         return None, (jsonify({"ok": False, "error": str(e)}), 400)
     script = _clusterkit_script_path()
-    if not script.is_file():
+    if not _script_exists(script):
         return None, (jsonify({"ok": False, "error": f"clusterkit script not found: {script}"}), 500)
     cmd = ["bash", str(script), target]
     display_cmd = "./" + script.name + " " + shlex.quote(target)
@@ -9938,7 +13843,7 @@ def _prepare_run_clusterkit_singlerack(body: dict) -> tuple[dict | None, tuple[o
         "WORKSPACE_DIR": ws,
         "NVIS_WORKSPACE_DIR": ws,
         "TOPDIR": ws,
-        "NVIS_BIN_SCRIPTS": str(_resolve_path(SCRIPTS_DIR)),
+        "NVIS_BIN_SCRIPTS": str(_rpath(SCRIPTS_DIR)),
         "CUDA_MAJ": cuda_m,
         "RACK_CLUSTERKIT_RACK": rk,
     }
@@ -9972,6 +13877,115 @@ def _prepare_run_clusterkit_singlerack(body: dict) -> tuple[dict | None, tuple[o
     )
 
 
+def _prepare_run_llmb_nccl(body: dict) -> tuple[dict | None, tuple[object, int] | None]:
+    """Shared parse for the LLMB NCCL microbenchmark (MOP §7.3).
+
+    Accepts EITHER a single ``rack`` (single-rack component) OR a list ``racks``
+    (multi/cross-rack component). The wrapper (``run_llmb_nccl.sh``) takes NVIS rack
+    ids and resolves the real Slurm nodes via ``sinfo`` itself, so we pass the
+    canonical rack id(s) — not the ``-ct[...]`` validation target.
+    """
+    if os.environ.get("RACK_LLMB_NCCL_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        return None, (
+            jsonify({"ok": False, "error": "NCCL Microbenchmark (LLMB) disabled (RACK_LLMB_NCCL_DISABLED)"}),
+            403,
+        )
+    log_raw = body.get("log_dir")
+    try:
+        log_dir = _resolve_log_dir(str(log_raw).strip() if log_raw else None)
+    except ValueError as e:
+        return None, (jsonify({"ok": False, "error": str(e)}), 400)
+
+    # Accept a single rack ("rack") or a list ("racks"); normalize + de-dupe.
+    racks_in: list[str] = []
+    racks_raw = body.get("racks")
+    if racks_raw is not None:
+        if not isinstance(racks_raw, list) or len(racks_raw) < 1:
+            return None, (jsonify({"ok": False, "error": "racks must be a non-empty array of rack ids"}), 400)
+        racks_in = [str(x) for x in racks_raw]
+    else:
+        single = (body.get("rack") or "").strip()
+        if not single:
+            return None, (jsonify({"ok": False, "error": "rack or racks is required"}), 400)
+        racks_in = [single]
+
+    rack_ids: list[str] = []
+    seen: set[str] = set()
+    for item in racks_in:
+        try:
+            rk = _normalize_rack_id(str(item).strip())
+        except ValueError as e:
+            return None, (jsonify({"ok": False, "error": str(e)}), 400)
+        if rk in seen:
+            continue
+        seen.add(rk)
+        rack_ids.append(rk)
+    if not rack_ids:
+        return None, (jsonify({"ok": False, "error": "no valid rack ids"}), 400)
+
+    # Multi-rack NCCL now runs the DIRECT path (run_nccl_mpi.sh → nccl_allreduce.sbatch:
+    # host nccl-tests + mpirun, NCCL over the IB rails). This replaces the llmb-run
+    # pyxis/enroot container, whose UCX could not see the RDMA verbs devices inside the
+    # container ("network devices 'mlx5_*:1' are not available" → no active transport →
+    # job killed). Set RACK_LLMB_NCCL_USE_CONTAINER=1 to fall back to the old container.
+    use_container = _truthy_env("RACK_LLMB_NCCL_USE_CONTAINER")
+    script = _run_llmb_nccl_script_path() if use_container else _run_nccl_mpi_script_path()
+    if not _script_exists(script):
+        return None, (jsonify({"ok": False, "error": f"NCCL launcher not found: {script}"}), 500)
+
+    cmd: list[str] = ["bash", str(script)]
+    reservation = (body.get("reservation") or _eget("RACK_LLMB_NCCL_RESERVATION") or "").strip()
+    if reservation:
+        cmd += ["--reservation", reservation]
+    dry_run = bool(body.get("dry_run"))
+    if dry_run:
+        cmd.append("--dry-run")
+    # Direct path only: cap the all_reduce sweep (nccl-tests -e). Default 16G so the
+    # x-rack test exercises large messages; overridable per-request or via Settings.
+    size_max = ""
+    nccl_version = ""
+    if not use_container:
+        size_max = (body.get("size_max") or _eget("RACK_NCCL_MPI_SIZE_MAX") or "16G").strip()
+        if size_max:
+            cmd += ["--size-max", size_max]
+        # NCCL version selector (direct path only): which vetted libnccl the sbatch loads
+        # via LD_LIBRARY_PATH. Shared validator with the single-rack Stage-1 path.
+        _vc = _nccl_version_cli(body)
+        if isinstance(_vc, tuple):
+            return None, _vc
+        cmd += _vc
+        nccl_version = _vc[1] if _vc else ""
+    # Sweep rounds: honor an explicit ``iters`` from the launch modal; else leave the sbatch
+    # default (1) so existing cross-rack behavior is unchanged when the knob isn't sent.
+    rounds = _nccl_rounds_from_body(body, None) if not use_container else None
+    if rounds:
+        cmd += ["--rounds", str(rounds)]
+    cmd += rack_ids
+
+    display_cmd = "./" + script.name + (
+        (" --reservation " + shlex.quote(reservation)) if reservation else ""
+    ) + (" --dry-run" if dry_run else "") + (
+        (" --size-max " + shlex.quote(size_max)) if size_max else ""
+    ) + (
+        (" --nccl-version " + shlex.quote(nccl_version)) if nccl_version else ""
+    ) + (
+        (" --rounds " + str(rounds)) if rounds else ""
+    ) + " " + " ".join(shlex.quote(r) for r in rack_ids)
+    timeout = max(120, _job_env_int("RACK_LLMB_NCCL_TIMEOUT", 14400))
+    return (
+        {
+            "log_dir": log_dir,
+            "racks": rack_ids,
+            "cmd": cmd,
+            "display_cmd": display_cmd,
+            "timeout": timeout,
+            "dry_run": dry_run,
+            "env_updates": _launch_env_from_body(body),
+        },
+        None,
+    )
+
+
 @app.route("/api/run-mnubergemm-stress-async", methods=["POST"])
 def api_run_mnubergemm_stress_async():
     """Start mnubergemm stress driver; poll GET /api/run-mnubergemm-stress-status?job_id=…"""
@@ -9990,11 +14004,23 @@ def api_run_mnubergemm_stress_async():
     env_merged = {str(k): str(v) for k, v in _eu.items()} if isinstance(_eu, dict) else None
     job_id = str(uuid.uuid4())
     created = datetime.now(timezone.utc).isoformat()
+    operator = _operator_from_request()
+    _record_validation_activity(
+        "mnubergemm",
+        stage="other",
+        scope="rack",
+        rack=rk,
+        racks=[rk],
+        log_dir=str(log_dir),
+        command_display=display_cmd,
+        activity_id=job_id,
+        operator=operator,
+    )
     with _stress_jobs_lock:
         _stress_jobs[job_id] = {
             "job_id": job_id,
             "kind": "mnubergemm",
-            "operator": _operator_from_request(),
+            "operator": operator,
             "rack": rk,
             "target": target,
             "log_dir": str(log_dir),
@@ -10005,7 +14031,7 @@ def api_run_mnubergemm_stress_async():
     threading.Thread(
         target=_stress_worker,
         args=(job_id, cmd, str(log_dir), timeout, display_cmd),
-        kwargs={"env_updates": env_merged},
+        kwargs={"env_updates": env_merged, "persist": True},
         daemon=True,
     ).start()
     client_poll_deadline_ms = min(int(timeout) * 1000 + 600000, 48 * 3600 * 1000)
@@ -10037,6 +14063,91 @@ def api_run_mnubergemm_stress_status():
     return jsonify(payload)
 
 
+@app.route("/api/run-nccl-fullrack-async", methods=["POST"])
+def api_run_nccl_fullrack_async():
+    """Start the standalone Stage-1 NCCL benchmark; poll GET /api/run-nccl-fullrack-status?job_id=…"""
+    body = request.get_json(silent=True) or {}
+    prep, err = _prepare_run_nccl_fullrack(body)
+    if err is not None:
+        return err[0], err[1]
+    assert prep is not None
+    log_dir = prep["log_dir"]
+    rk = str(prep["rk"])
+    target = str(prep["target"])
+    cmd = prep["cmd"]
+    display_cmd = str(prep["display_cmd"])
+    timeout = int(prep["timeout"])
+    _eu = prep.get("env_updates")
+    env_merged = {str(k): str(v) for k, v in _eu.items()} if isinstance(_eu, dict) else None
+    job_id = str(uuid.uuid4())
+    created = datetime.now(timezone.utc).isoformat()
+    operator = _operator_from_request()
+    _record_validation_activity(
+        "nccl-fullrack",
+        stage="stage1",
+        scope="rack",
+        rack=rk,
+        racks=[rk],
+        log_dir=str(log_dir),
+        command_display=display_cmd,
+        activity_id=job_id,
+        operator=operator,
+    )
+    if env_merged is None:
+        env_merged = {}
+    env_merged = {**env_merged, "NVIS_ACTIVITY_ID": job_id}
+    with _stress_jobs_lock:
+        _stress_jobs[job_id] = {
+            "job_id": job_id,
+            "kind": "nccl-fullrack",
+            "operator": operator,
+            "rack": rk,
+            "target": target,
+            "log_dir": str(log_dir),
+            "phase": "starting",
+            "command_display": display_cmd,
+            "created_at": created,
+        }
+    threading.Thread(
+        target=_stress_worker,
+        args=(job_id, cmd, str(log_dir), timeout, display_cmd),
+        kwargs={
+            "error_label": "nccl benchmark script",
+            "env_updates": env_merged,
+            "profile": "script",
+            "persist": True,
+        },
+        daemon=True,
+    ).start()
+    client_poll_deadline_ms = min(int(timeout) * 1000 + 600000, 48 * 3600 * 1000)
+    return jsonify(
+        {
+            "ok": True,
+            "job_id": job_id,
+            "rack": rk,
+            "target": target,
+            "command_display": display_cmd,
+            "timeout_sec": timeout,
+            "client_poll_deadline_ms": client_poll_deadline_ms,
+        }
+    )
+
+
+@app.route("/api/run-nccl-fullrack-status", methods=["GET"])
+def api_run_nccl_fullrack_status():
+    """Return state for a job started via /api/run-nccl-fullrack-async (shared stress job store)."""
+    job_id = (request.args.get("job_id") or "").strip()
+    if not job_id:
+        return jsonify({"ok": False, "error": "job_id is required"}), 400
+    with _stress_jobs_lock:
+        row = _stress_jobs.get(job_id)
+        if row is None:
+            return jsonify({"ok": False, "error": "unknown or expired job_id"}), 404
+        payload = dict(row)
+    payload["ok"] = True
+    return jsonify(payload)
+
+
 @app.route("/api/run-nvloom-async", methods=["POST"])
 def api_run_nvloom_async():
     """Start nvloom singlerack Slurm driver (sbatch --wait); poll GET /api/run-nvloom-status?job_id=…"""
@@ -10055,11 +14166,23 @@ def api_run_nvloom_async():
     env_merged = {str(k): str(v) for k, v in _eu.items()} if isinstance(_eu, dict) else None
     job_id = str(uuid.uuid4())
     created = datetime.now(timezone.utc).isoformat()
+    operator = _operator_from_request()
+    _record_validation_activity(
+        "nvloom",
+        stage="other",
+        scope="rack",
+        rack=rk,
+        racks=[rk],
+        log_dir=str(log_dir),
+        command_display=display_cmd,
+        activity_id=job_id,
+        operator=operator,
+    )
     with _stress_jobs_lock:
         _stress_jobs[job_id] = {
             "job_id": job_id,
             "kind": "nvloom",
-            "operator": _operator_from_request(),
+            "operator": operator,
             "rack": rk,
             "target": target,
             "log_dir": str(log_dir),
@@ -10070,7 +14193,7 @@ def api_run_nvloom_async():
     threading.Thread(
         target=_stress_worker,
         args=(job_id, cmd, str(log_dir), timeout, display_cmd),
-        kwargs={"error_label": "nvloom singlerack script", "env_updates": env_merged},
+        kwargs={"error_label": "nvloom singlerack script", "env_updates": env_merged, "persist": True},
         daemon=True,
     ).start()
     client_poll_deadline_ms = min(int(timeout) * 1000 + 600000, 48 * 3600 * 1000)
@@ -10120,11 +14243,23 @@ def api_run_clusterkit_async():
     env_merged = {str(k): str(v) for k, v in _eu.items()} if isinstance(_eu, dict) else None
     job_id = str(uuid.uuid4())
     created = datetime.now(timezone.utc).isoformat()
+    operator = _operator_from_request()
+    _record_validation_activity(
+        "clusterkit",
+        stage="other",
+        scope="rack",
+        rack=rk,
+        racks=[rk],
+        log_dir=str(log_dir),
+        command_display=display_cmd,
+        activity_id=job_id,
+        operator=operator,
+    )
     with _stress_jobs_lock:
         _stress_jobs[job_id] = {
             "job_id": job_id,
             "kind": "clusterkit",
-            "operator": _operator_from_request(),
+            "operator": operator,
             "rack": rk,
             "target": target,
             "log_dir": str(log_dir),
@@ -10135,7 +14270,7 @@ def api_run_clusterkit_async():
     threading.Thread(
         target=_stress_worker,
         args=(job_id, cmd, str(log_dir), timeout, display_cmd),
-        kwargs={"error_label": "clusterkit script", "env_updates": env_merged},
+        kwargs={"error_label": "clusterkit script", "env_updates": env_merged, "persist": True},
         daemon=True,
     ).start()
     client_poll_deadline_ms = min(int(timeout) * 1000 + 600000, 48 * 3600 * 1000)
@@ -10165,6 +14300,223 @@ def api_run_clusterkit_status():
         payload = dict(row)
     payload["ok"] = True
     return jsonify(payload)
+
+
+@app.route("/api/run-llmb-nccl-async", methods=["POST"])
+def api_run_llmb_nccl_async():
+    """Start the LLMB NCCL microbenchmark (single rack via ``rack`` or cross-rack via
+    ``racks``); poll GET /api/run-llmb-nccl-status?job_id=…
+
+    Process cwd is *log_dir* (like clusterkit / nemo-xrack) so Slurm batch stdout lands
+    under the UI log dir. Runs on the privileged ``script`` profile (Slurm + llmb-run on
+    the head node).
+    """
+    body = request.get_json(silent=True) or {}
+    prep, err = _prepare_run_llmb_nccl(body)
+    if err is not None:
+        return err[0], err[1]
+    assert prep is not None
+    log_dir = prep["log_dir"]
+    racks = [str(r) for r in prep["racks"]]
+    cmd = prep["cmd"]
+    display_cmd = str(prep["display_cmd"])
+    timeout = int(prep["timeout"])
+    dry_run = bool(prep["dry_run"])
+    _eu = prep.get("env_updates")
+    env_merged = {str(k): str(v) for k, v in _eu.items()} if isinstance(_eu, dict) and _eu else None
+    rack_label = racks[0] if len(racks) == 1 else f"{len(racks)} racks"
+    cwd = _host_job_cwd(log_dir)
+    job_id = str(uuid.uuid4())
+    created = datetime.now(timezone.utc).isoformat()
+    operator = _operator_from_request()
+    scope = "multirack" if len(racks) > 1 else "rack"
+    _record_validation_activity(
+        "llmb-nccl",
+        stage="stage1",
+        scope=scope,
+        rack=racks[0] if racks else rack_label,
+        racks=racks,
+        log_dir=str(log_dir),
+        command_display=display_cmd,
+        activity_id=job_id,
+        operator=operator,
+        dry_run=dry_run,
+    )
+    if env_merged is None:
+        env_merged = {}
+    env_merged = {**env_merged, "NVIS_ACTIVITY_ID": job_id}
+    with _stress_jobs_lock:
+        _stress_jobs[job_id] = {
+            "job_id": job_id,
+            "kind": "llmb-nccl",
+            "operator": operator,
+            "rack": rack_label,
+            "racks": racks,
+            "dry_run": dry_run,
+            "log_dir": str(log_dir),
+            "phase": "starting",
+            "command_display": display_cmd,
+            "created_at": created,
+        }
+    threading.Thread(
+        target=_stress_worker,
+        args=(job_id, cmd, cwd, timeout, display_cmd),
+        kwargs={
+            "error_label": "run_llmb_nccl script",
+            "profile": "script",
+            "persist": True,
+            "env_updates": env_merged,
+        },
+        daemon=True,
+    ).start()
+    client_poll_deadline_ms = min(int(timeout) * 1000 + 600000, 48 * 3600 * 1000)
+    return jsonify(
+        {
+            "ok": True,
+            "job_id": job_id,
+            "rack": rack_label,
+            "racks": racks,
+            "command_display": display_cmd,
+            "timeout_sec": timeout,
+            "client_poll_deadline_ms": client_poll_deadline_ms,
+        }
+    )
+
+
+@app.route("/api/run-llmb-nccl-status", methods=["GET"])
+def api_run_llmb_nccl_status():
+    """Return state for a job started via /api/run-llmb-nccl-async."""
+    job_id = (request.args.get("job_id") or "").strip()
+    if not job_id:
+        return jsonify({"ok": False, "error": "job_id is required"}), 400
+    with _stress_jobs_lock:
+        row = _stress_jobs.get(job_id)
+        if row is None:
+            return jsonify({"ok": False, "error": "unknown or expired job_id"}), 404
+        payload = dict(row)
+    payload["ok"] = True
+    return jsonify(payload)
+
+
+@app.route("/api/multirack-jobs", methods=["GET"])
+def api_multirack_jobs():
+    """List launched multi-rack jobs from the durable state table (newest first).
+
+    Persists across sessions / restarts, so every operator sees the same job list.
+    Optional ``?log_dir=`` filters to jobs launched against that log directory.
+    """
+    log_dir_raw = (request.args.get("log_dir") or "").strip()
+    log_dir_filter: str | None = None
+    if log_dir_raw:
+        try:
+            log_dir_filter = str(_resolve_log_dir(log_dir_raw))
+        except ValueError:
+            log_dir_filter = log_dir_raw
+    try:
+        limit = int(request.args.get("limit", "100"))
+    except (TypeError, ValueError):
+        limit = 100
+    jobs = validation_activities.list_activities(log_dir=log_dir_filter, scope="multirack", limit=limit)
+    _refresh_validation_activities_lazy(jobs)
+    return jsonify({"ok": True, "jobs": jobs})
+
+
+@app.route("/api/multirack-jobs/<job_id>", methods=["DELETE"])
+def api_multirack_job_delete(job_id: str):
+    """Dismiss (remove) a launched multi-rack job from the durable state table."""
+    if validation_activities.delete_activity(job_id):
+        return jsonify({"ok": True, "job_id": job_id})
+    return jsonify({"ok": False, "error": "unknown job_id"}), 404
+
+
+def _validation_activities_query_filters() -> tuple[str | None, str | None, str | None, str | None, int]:
+    log_dir_raw = (request.args.get("log_dir") or "").strip()
+    log_dir_filter: str | None = None
+    if log_dir_raw:
+        try:
+            log_dir_filter = str(_resolve_log_dir(log_dir_raw))
+        except ValueError:
+            log_dir_filter = log_dir_raw
+    rack = (request.args.get("rack") or "").strip() or None
+    tool = (request.args.get("tool") or "").strip() or None
+    scope = (request.args.get("scope") or "").strip() or None
+    try:
+        limit = int(request.args.get("limit", "100"))
+    except (TypeError, ValueError):
+        limit = 100
+    return log_dir_filter, rack, tool, scope, limit
+
+
+@app.route("/api/validation-activities", methods=["GET"])
+def api_validation_activities():
+    """List validation activities (newest first) with optional rack/log_dir/tool/scope filters."""
+    log_dir_filter, rack, tool, scope, limit = _validation_activities_query_filters()
+    rows = validation_activities.list_activities(
+        log_dir=log_dir_filter,
+        rack=rack,
+        tool=tool,
+        scope=scope,
+        limit=limit,
+    )
+    _refresh_validation_activities_lazy(rows)
+    return jsonify({"ok": True, "activities": rows})
+
+
+@app.route("/api/validation-activities/<activity_id>", methods=["GET"])
+def api_validation_activity_detail(activity_id: str):
+    aid = (activity_id or "").strip()
+    if not aid:
+        return jsonify({"ok": False, "error": "activity_id is required"}), 400
+    rec = validation_activities.get_activity(aid)
+    if rec is None:
+        return jsonify({"ok": False, "error": "unknown activity_id"}), 404
+    _refresh_validation_activities_lazy([rec])
+    rec = validation_activities.get_activity(aid) or rec
+    return jsonify({"ok": True, "activity": rec})
+
+
+@app.route("/api/validation-activities/<activity_id>", methods=["DELETE"])
+def api_validation_activity_delete(activity_id: str):
+    aid = (activity_id or "").strip()
+    if validation_activities.delete_activity(aid):
+        return jsonify({"ok": True, "activity_id": aid})
+    return jsonify({"ok": False, "error": "unknown activity_id"}), 404
+
+
+@app.route("/api/validation-activities/adopt", methods=["POST"])
+def api_validation_activities_adopt():
+    """Register an external validation log under a new durable activity id."""
+    body = request.get_json(silent=True) or {}
+    path_raw = (body.get("path") or body.get("log_path") or "").strip()
+    if not path_raw:
+        return jsonify({"ok": False, "error": "path is required"}), 400
+    log_raw = body.get("log_dir")
+    try:
+        log_dir = _resolve_log_dir(str(log_raw).strip() if log_raw else None)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    rack = (body.get("rack") or "").strip()
+    try:
+        if rack:
+            rack = _normalize_rack_id(rack)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    if not rack:
+        rack = multirack_display_rack_from_basename(os.path.basename(path_raw)) or ""
+    try:
+        log_path = _resolve_slurm_job_stdout_path(path_raw, str(log_dir))
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    aid = validation_activities.adopt_log(
+        str(log_path),
+        log_dir=str(log_dir),
+        rack=rack,
+        operator=_operator_from_request() or "external",
+    )
+    if not aid:
+        return jsonify({"ok": False, "error": "could not adopt log"}), 400
+    rec = validation_activities.get_activity(aid)
+    return jsonify({"ok": True, "activity_id": aid, "activity": rec})
 
 
 @app.route("/api/rack-grafana-live-charts", methods=["GET"])
@@ -10234,6 +14586,26 @@ def _parse_sysinfo_request(body: dict) -> tuple[dict | None, tuple[object, int] 
     )
 
 
+def _translate_cwd_for_remote(local_cwd: str) -> str | None:
+    """Map a dashboard-host cwd onto the cluster filesystem for SSH execution.
+
+    Streamed tool/validation commands pass a *local* path (usually ``REPO_ROOT``) as
+    their cwd so the script runs from the repo root locally. Over SSH that path does not
+    exist on the cluster, so map any path at/under ``REPO_ROOT`` onto
+    ``RACK_REMOTE_BASE_PATH``. Paths already on the remote filesystem (e.g. a remote log
+    dir, or callers that pre-translate to the remote base) are returned unchanged.
+    Returns ``None`` when no remote base is configured (run in the remote home).
+    """
+    if not _REMOTE_BASE:
+        return None if local_cwd == str(REPO_ROOT) else local_cwd
+    try:
+        rel = Path(local_cwd).resolve().relative_to(REPO_ROOT.resolve())
+    except (ValueError, OSError):
+        return local_cwd
+    rel_s = str(rel)
+    return _REMOTE_BASE if rel_s == "." else str(PurePosixPath(_REMOTE_BASE) / rel_s)
+
+
 def _merged_stdout_stream_generator(
     cmd: list[str],
     cwd: str,
@@ -10243,20 +14615,51 @@ def _merged_stdout_stream_generator(
     linebuffer_env_var: str,
     linebuffer_default: str = "1",
     env_extra: dict[str, str] | None = None,
+    privileged: bool = False,
 ) -> Iterator[bytes]:
-    """Yield merged stdout/stderr from a subprocess until exit (or timeout)."""
+    """Yield merged stdout/stderr from a subprocess until exit (or timeout).
+
+    ``privileged=True`` routes the command to the dedicated root "script" SSH
+    target (``RACK_SCRIPT_SSH_*``) when configured, for node-operational tools
+    (sysinfo, switch audits) that require root + ``pdsh`` and therefore cannot run
+    as the unprivileged control-plane user on the head node.
+    """
     cmd_run = list(cmd)
-    remote = host_exec.is_remote()
-    if not remote and (_eget(linebuffer_env_var, linebuffer_default) or "").strip().lower() in (
+    # Transport-boundary code: this builds a streaming Popen by hand out of
+    # host_exec.wrap_for_host(), so unlike ordinary callers it does have to know the
+    # mechanism (whether cwd/env apply locally or travel inside the SSH command).
+    # It should eventually move behind a streaming Connection API; until then the
+    # dependency is explicit rather than hidden behind a predicate.
+    remote = host_exec.exec_kind() == "ssh"
+    linebuffer_on = (_eget(linebuffer_env_var, linebuffer_default) or "").strip().lower() in (
         "1",
         "true",
         "yes",
         "on",
-    ):
-        stdbuf = shutil.which("stdbuf")
+    )
+    # Force line-buffering at the source so the UI gets a steady stream instead of
+    # block-buffered clumps. Over SSH there is no TTY, so most programs default to
+    # full block buffering on their stdout pipe. `stdbuf -oL -eL` sets glibc stdio to
+    # line-buffered for the whole process tree (via LD_PRELOAD/_STDBUF_*), which fixes
+    # shell/curl/C tools. coreutils `stdbuf` is standard on the cluster nodes; for local
+    # we can verify it exists first.
+    if linebuffer_on:
+        stdbuf = host_exec.which("stdbuf")
         if stdbuf:
             cmd_run = [stdbuf, "-oL", "-eL", *cmd_run]
-    cmd_run = host_exec.wrap_for_host(cmd_run, cwd=cwd if remote else None)
+    # Python keeps its OWN block buffer on a non-TTY stdout that stdbuf cannot change, so
+    # force unbuffered Python explicitly (the common cause of "logs only update in bursts"
+    # for Python tools like llmb-install). Harmless for non-Python commands. Forwarded over
+    # SSH via env_extra; merged into the subprocess env locally.
+    env_extra = dict(env_extra or {})
+    env_extra.setdefault("PYTHONUNBUFFERED", "1")
+    remote_cwd = _translate_cwd_for_remote(cwd) if remote else None
+    cmd_run = host_exec.wrap_for_host(
+        cmd_run,
+        cwd=remote_cwd,
+        profile="script" if privileged else "control",
+        env_extra=env_extra,
+    )
     env = None if remote else _subprocess_env(env_extra)
     proc = subprocess.Popen(
         cmd_run,
@@ -10287,7 +14690,7 @@ def _merged_stdout_stream_generator(
             outq.put(None)
 
     threading.Thread(target=feeder, daemon=True).start()
-    header = f"# {display_cmd}\n# cwd: {cwd}\n\n"
+    header = f"# {display_cmd}\n# cwd: {(remote_cwd if remote else cwd) or '(remote home)'}\n\n"
     yield header.encode("utf-8")
     deadline = time.monotonic() + timeout_sec
     rc: int | None = None
@@ -10331,7 +14734,7 @@ def _merged_stdout_stream_generator(
 def _sysinfo_stream_generator(prep: dict):
     """Yield stdout+stderr bytes from sysinfo.sh until process exit (or timeout)."""
     timeout_sec = max(30, _job_env_int("RACK_SYSINFO_TIMEOUT", 1800))
-    cwd = _REMOTE_BASE if host_exec.is_remote() and _REMOTE_BASE else str(prep["log_dir"])
+    cwd = _REMOTE_BASE if (_REMOTE_BASE and host_exec.exec_kind() == "ssh") else str(prep["log_dir"])
     yield from _merged_stdout_stream_generator(
         list(prep["cmd"]),
         cwd,
@@ -10339,6 +14742,7 @@ def _sysinfo_stream_generator(prep: dict):
         timeout_sec,
         linebuffer_env_var="RACK_SYSINFO_LINEBUFFER",
         linebuffer_default="1",
+        privileged=True,
     )
 
 
@@ -10392,7 +14796,7 @@ def _parse_nvswitch_audit_request(body: dict) -> tuple[dict | None, tuple[object
 def _nvswitch_audit_stream_generator(prep: dict):
     """Stream nvswitches_rack_audit.sh (check-only or --fix)."""
     timeout_sec = max(60, _env_int("RACK_NVSWITCH_AUDIT_TIMEOUT", 7200))
-    cwd = _REMOTE_BASE if host_exec.is_remote() and _REMOTE_BASE else str(prep["log_dir"])
+    cwd = _REMOTE_BASE if (_REMOTE_BASE and host_exec.exec_kind() == "ssh") else str(prep["log_dir"])
     yield from _merged_stdout_stream_generator(
         list(prep["cmd"]),
         cwd,
@@ -10400,6 +14804,7 @@ def _nvswitch_audit_stream_generator(prep: dict):
         timeout_sec,
         linebuffer_env_var="RACK_NVSWITCH_AUDIT_LINEBUFFER",
         linebuffer_default="1",
+        privileged=True,
     )
 
 
@@ -10443,7 +14848,8 @@ def api_run_sysinfo():
 def api_tools_download_containers():
     """Run bin/scripts/05-download-containers.sh with a chosen destination (and optional arch).
 
-    Requires ``NGC_API_KEY`` in the **server** environment (nvapi-…), not in the HTTP body.
+    Requires ``NGC_API_KEY`` (nvapi-…) saved in Settings → External connections or the
+    **server** environment — never in the HTTP body.
     If the expected ``.sqsh`` already exists and is non-empty, returns success with ``skipped`` (no import, no key needed).
     """
     if os.environ.get("RACK_TOOLS_DOWNLOAD_CONTAINERS_DISABLED", "").strip().lower() in ("1", "true", "yes"):
@@ -10471,11 +14877,11 @@ def api_tools_download_containers():
                 "command_display": "(no command — output file already present)",
             }
         )
-    if not (os.environ.get("NGC_API_KEY") or "").strip():
+    if not (_eget("NGC_API_KEY") or "").strip():
         return jsonify(
             {
                 "ok": False,
-                "error": "NGC_API_KEY is not set on the dashboard host (export before starting the app)",
+                "error": "NGC_API_KEY is not set — add it in Settings → External connections (or export before starting the app)",
             }
         ), 400
     arch = str(arch_raw).strip() if arch_raw else ""
@@ -10484,7 +14890,7 @@ def api_tools_download_containers():
     if arch == "arm64":
         arch = "aarch64"
     script = SCRIPTS_DIR / "05-download-containers.sh"
-    if not script.is_file():
+    if not _script_exists(script):
         return jsonify({"ok": False, "error": f"script missing: {script}"}), 500
     timeout = max(60, _env_int("RACK_TOOLS_DOWNLOAD_CONTAINERS_TIMEOUT", 14400))
     cmd: list[str] = [str(script), str(dest_dir)]
@@ -10553,11 +14959,12 @@ def api_tools_download_containers_stream():
             mimetype="text/plain; charset=utf-8",
             headers=dict(_STREAM_NO_CACHE_HEADERS),
         )
-    if not (os.environ.get("NGC_API_KEY") or "").strip():
+    if not (_eget("NGC_API_KEY") or "").strip():
 
         def _ngc_gen() -> Iterator[bytes]:
             yield (
-                "ERROR: NGC_API_KEY is not set on the dashboard host (export before starting the app)\n"
+                "ERROR: NGC_API_KEY is not set — add it in Settings \u2192 External connections "
+                "(or export before starting the app)\n"
             ).encode("utf-8")
 
         return Response(
@@ -10572,7 +14979,7 @@ def api_tools_download_containers_stream():
     if arch == "arm64":
         arch = "aarch64"
     script = SCRIPTS_DIR / "05-download-containers.sh"
-    if not script.is_file():
+    if not _script_exists(script):
         return jsonify({"ok": False, "error": f"script missing: {script}"}), 500
     timeout = max(60, _env_int("RACK_TOOLS_DOWNLOAD_CONTAINERS_TIMEOUT", 14400))
     cmd: list[str] = [str(script), str(dest_dir)]
@@ -10718,7 +15125,7 @@ def api_tools_launch_grafana_bright_prometheus():
     ):
         return jsonify({"ok": False, "error": "disabled (RACK_TOOLS_LAUNCH_GRAFANA_BRIGHT_PROMETHEUS_DISABLED)"}), 403
     script = SCRIPTS_DIR / "launch-grafana-bright-prometheus.sh"
-    if not script.is_file():
+    if not _script_exists(script):
         return jsonify({"ok": False, "error": f"script missing: {script}"}), 500
     user = (_eget("RACK_PROMETHEUS_BASIC_AUTH_USER") or "").strip()
     password = (_eget("RACK_PROMETHEUS_BASIC_AUTH_PASSWORD") or "").strip()
@@ -10791,7 +15198,7 @@ def api_tools_launch_grafana_bright_prometheus_stream():
     ):
         return jsonify({"ok": False, "error": "disabled (RACK_TOOLS_LAUNCH_GRAFANA_BRIGHT_PROMETHEUS_DISABLED)"}), 403
     script = SCRIPTS_DIR / "launch-grafana-bright-prometheus.sh"
-    if not script.is_file():
+    if not _script_exists(script):
         return jsonify({"ok": False, "error": f"script missing: {script}"}), 500
     user = (_eget("RACK_PROMETHEUS_BASIC_AUTH_USER") or "").strip()
     password = (_eget("RACK_PROMETHEUS_BASIC_AUTH_PASSWORD") or "").strip()
@@ -10900,13 +15307,13 @@ def api_tools_install_hpcx_workspace():
                 "error": 'arch must be "aarch64" (matches aihpc_val installation/03-build-nccl.sh).',
             }
         ), 400
-    ws_raw = (body.get("workspace") or "").strip() or "/home/cmsupport/workspace"
+    ws_raw = (body.get("workspace") or "").strip() or _nvis_workspace_dir_effective()
     try:
         ws = _resolve_tools_destination(ws_raw)
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     script = SCRIPTS_DIR / "install-hpcx-workspace.sh"
-    if not script.is_file():
+    if not _script_exists(script):
         return jsonify({"ok": False, "error": f"script missing: {script}"}), 500
     timeout = max(300, _env_int("RACK_TOOLS_INSTALL_HPCX_WORKSPACE_TIMEOUT", 28800))
     cmd = ["bash", str(script), str(ws), cuda_major, arch]
@@ -10961,13 +15368,13 @@ def api_tools_install_hpcx_workspace_stream():
                 "error": 'arch must be "aarch64" (matches aihpc_val installation/03-build-nccl.sh).',
             }
         ), 400
-    ws_raw = (body.get("workspace") or "").strip() or "/home/cmsupport/workspace"
+    ws_raw = (body.get("workspace") or "").strip() or _nvis_workspace_dir_effective()
     try:
         ws = _resolve_tools_destination(ws_raw)
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     script = SCRIPTS_DIR / "install-hpcx-workspace.sh"
-    if not script.is_file():
+    if not _script_exists(script):
         return jsonify({"ok": False, "error": f"script missing: {script}"}), 500
     timeout = max(300, _env_int("RACK_TOOLS_INSTALL_HPCX_WORKSPACE_TIMEOUT", 28800))
     cmd = ["bash", str(script), str(ws), cuda_major, arch]
@@ -11002,6 +15409,160 @@ def api_tools_install_hpcx_workspace_stream():
 
     return Response(
         stream_with_context(_hpcx_stream_gen()),
+        mimetype="text/plain; charset=utf-8",
+        headers=dict(_STREAM_NO_CACHE_HEADERS),
+    )
+
+
+_DCGM_VALID_ARCH = ("aarch64", "x86_64")
+_DCGM_VALID_DISTRO = (
+    "dgx",
+    "ubuntu2404",
+    "ubuntu2204",
+    "ubuntu2004",
+    "debian12",
+    "rhel9",
+    "rhel8",
+    "sles15",
+)
+_DCGM_VERSION_RE = re.compile(r"^[0-9][0-9A-Za-z.:_+~-]{0,63}$")
+
+
+def _parse_dcgm_body(body: dict) -> tuple[dict | None, str | None]:
+    """Validate the DCGM workspace-install JSON. Returns ``(parsed, None)`` or ``(None, error)``."""
+    cuda_major = str(body.get("cuda_major") or "13").strip()
+    if cuda_major not in ("12", "13"):
+        return None, 'cuda_major must be "12" or "13"'
+    arch = str(body.get("arch") or "aarch64").strip()
+    if arch not in _DCGM_VALID_ARCH:
+        return None, 'arch must be "aarch64" (GBx00 / ARM) or "x86_64" (Bx00)'
+    distro = str(body.get("distro") or "dgx").strip()
+    if distro not in _DCGM_VALID_DISTRO:
+        return None, f"distro must be one of: {', '.join(_DCGM_VALID_DISTRO)}"
+    version = str(body.get("version") or "").strip()
+    if version and not _DCGM_VERSION_RE.match(version):
+        return None, "version pin has invalid characters"
+    ws_raw = (body.get("workspace") or "").strip() or _nvis_workspace_dir_effective()
+    try:
+        ws = _resolve_tools_destination(ws_raw)
+    except ValueError as e:
+        return None, str(e)
+    return {"cuda_major": cuda_major, "arch": arch, "distro": distro, "version": version, "ws": ws}, None
+
+
+def _dcgm_extra_env(parsed: dict) -> dict[str, str]:
+    env = {"NVIS_DCGM_DISTRO": parsed["distro"]}
+    if parsed["version"]:
+        env["NVIS_DCGM_VERSION"] = parsed["version"]
+    return env
+
+
+def _dcgm_display_cmd(parsed: dict) -> str:
+    extra = _dcgm_extra_env(parsed)
+    prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in extra.items())
+    if prefix:
+        prefix += " "
+    return (
+        f"{prefix}bash bin/scripts/install-dcgm-workspace.sh "
+        f"{shlex.quote(str(parsed['ws']))} {shlex.quote(parsed['cuda_major'])} {shlex.quote(parsed['arch'])}"
+    )
+
+
+@app.route("/api/tools/install-dcgm-workspace", methods=["POST"])
+def api_tools_install_dcgm_workspace():
+    """Run ``install-dcgm-workspace.sh``: download + extract DCGM 4.x into the shared workspace (head node)."""
+    if os.environ.get("RACK_TOOLS_INSTALL_DCGM_WORKSPACE_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        return jsonify({"ok": False, "error": "disabled (RACK_TOOLS_INSTALL_DCGM_WORKSPACE_DISABLED)"}), 403
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
+    parsed, err = _parse_dcgm_body(body)
+    if err is not None:
+        return jsonify({"ok": False, "error": err}), 400
+    assert parsed is not None
+    script = SCRIPTS_DIR / "install-dcgm-workspace.sh"
+    if not _script_exists(script):
+        return jsonify({"ok": False, "error": f"script missing: {script}"}), 500
+    timeout = max(300, _env_int("RACK_TOOLS_INSTALL_DCGM_WORKSPACE_TIMEOUT", 7200))
+    cmd = ["bash", str(script), str(parsed["ws"]), parsed["cuda_major"], parsed["arch"]]
+    try:
+        with _tools_exclusive_lock("install_dcgm_workspace"):
+            proc = subprocess.run(
+                cmd,
+                cwd=str(REPO_ROOT),
+                env=_subprocess_env(_dcgm_extra_env(parsed)),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+    except _ToolsExclusiveLockBusyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 409
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "error": f"install-dcgm-workspace timed out after {timeout}s"}), 504
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    ok = proc.returncode == 0
+    return jsonify(
+        {
+            "ok": ok,
+            "returncode": proc.returncode,
+            "command_display": _dcgm_display_cmd(parsed),
+            "stdout": (proc.stdout or "").strip(),
+            "stderr": (proc.stderr or "").strip(),
+            "arch": parsed["arch"],
+            "distro": parsed["distro"],
+            "cuda_major": parsed["cuda_major"],
+        }
+    ), (200 if ok else 502)
+
+
+@app.route("/api/tools/install-dcgm-workspace-stream", methods=["POST"])
+def api_tools_install_dcgm_workspace_stream():
+    """Stream ``install-dcgm-workspace.sh`` (POST JSON: ``workspace``, ``cuda_major``, ``arch``, ``distro``, ``version``)."""
+    if os.environ.get("RACK_TOOLS_INSTALL_DCGM_WORKSPACE_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        return jsonify({"ok": False, "error": "disabled (RACK_TOOLS_INSTALL_DCGM_WORKSPACE_DISABLED)"}), 403
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
+    parsed, err = _parse_dcgm_body(body)
+    if err is not None:
+        return jsonify({"ok": False, "error": err}), 400
+    assert parsed is not None
+    script = SCRIPTS_DIR / "install-dcgm-workspace.sh"
+    if not _script_exists(script):
+        return jsonify({"ok": False, "error": f"script missing: {script}"}), 500
+    timeout = max(300, _env_int("RACK_TOOLS_INSTALL_DCGM_WORKSPACE_TIMEOUT", 7200))
+    cmd = ["bash", str(script), str(parsed["ws"]), parsed["cuda_major"], parsed["arch"]]
+    extra_env = _dcgm_extra_env(parsed)
+    display_cmd = _dcgm_display_cmd(parsed)
+    lock_fh, lock_busy = _tools_try_acquire_exclusive_flock_for_stream("install_dcgm_workspace")
+    if lock_busy is not None:
+
+        def _lock_busy_gen() -> Iterator[bytes]:
+            yield f"ERROR: {lock_busy}\n".encode("utf-8")
+
+        return Response(
+            stream_with_context(_lock_busy_gen()),
+            status=409,
+            mimetype="text/plain; charset=utf-8",
+            headers=dict(_STREAM_NO_CACHE_HEADERS),
+        )
+
+    def _dcgm_stream_gen() -> Iterator[bytes]:
+        try:
+            yield from _merged_stdout_stream_generator(
+                cmd,
+                str(REPO_ROOT),
+                display_cmd,
+                timeout,
+                linebuffer_env_var="RACK_TOOLS_SCRIPT_STREAM_LINEBUFFER",
+                env_extra=extra_env,
+            )
+        finally:
+            _tools_release_exclusive_flock_fh(lock_fh)
+
+    return Response(
+        stream_with_context(_dcgm_stream_gen()),
         mimetype="text/plain; charset=utf-8",
         headers=dict(_STREAM_NO_CACHE_HEADERS),
     )
@@ -11051,13 +15612,13 @@ def api_tools_install_cuda_nccl_workspace():
     if bh_err is not None:
         return jsonify({"ok": False, "error": bh_err}), 400
     assert build_host is not None
-    ws_raw = (body.get("workspace") or "").strip() or "/home/cmsupport/workspace"
+    ws_raw = (body.get("workspace") or "").strip() or _nvis_workspace_dir_effective()
     try:
         ws = _resolve_tools_destination(ws_raw)
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     script = SCRIPTS_DIR / "install-cuda-nccl-workspace.sh"
-    if not script.is_file():
+    if not _script_exists(script):
         return jsonify({"ok": False, "error": f"script missing: {script}"}), 500
     timeout = max(300, _env_int("RACK_TOOLS_INSTALL_CUDA_NCCL_WORKSPACE_TIMEOUT", 28800))
     extra_env = {
@@ -11133,13 +15694,13 @@ def api_tools_install_cuda_nccl_workspace_stream():
     if bh_err is not None:
         return jsonify({"ok": False, "error": bh_err}), 400
     assert build_host is not None
-    ws_raw = (body.get("workspace") or "").strip() or "/home/cmsupport/workspace"
+    ws_raw = (body.get("workspace") or "").strip() or _nvis_workspace_dir_effective()
     try:
         ws = _resolve_tools_destination(ws_raw)
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     script = SCRIPTS_DIR / "install-cuda-nccl-workspace.sh"
-    if not script.is_file():
+    if not _script_exists(script):
         return jsonify({"ok": False, "error": f"script missing: {script}"}), 500
     timeout = max(300, _env_int("RACK_TOOLS_INSTALL_CUDA_NCCL_WORKSPACE_TIMEOUT", 28800))
     extra_env = {
@@ -11177,6 +15738,7 @@ def api_tools_install_cuda_nccl_workspace_stream():
                 timeout,
                 linebuffer_env_var="RACK_TOOLS_SCRIPT_STREAM_LINEBUFFER",
                 env_extra=extra_env,
+                privileged=True,
             )
         finally:
             _tools_release_exclusive_flock_fh(lock_fh)
@@ -11203,13 +15765,13 @@ def api_tools_install_nvloom_workspace():
     if bh_err is not None:
         return jsonify({"ok": False, "error": bh_err}), 400
     assert build_host is not None
-    ws_raw = (body.get("workspace") or "").strip() or "/home/cmsupport/workspace"
+    ws_raw = (body.get("workspace") or "").strip() or _nvis_workspace_dir_effective()
     try:
         ws = _resolve_tools_destination(ws_raw)
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     script = SCRIPTS_DIR / "install-nvloom-workspace.sh"
-    if not script.is_file():
+    if not _script_exists(script):
         return jsonify({"ok": False, "error": f"script missing: {script}"}), 500
     timeout = max(300, _env_int("RACK_TOOLS_INSTALL_NVLOOM_WORKSPACE_TIMEOUT", 28800))
     extra_env = {"NVIS_NVLOOM_BUILD_HOST": build_host}
@@ -11263,13 +15825,13 @@ def api_tools_install_nvloom_workspace_stream():
     if bh_err is not None:
         return jsonify({"ok": False, "error": bh_err}), 400
     assert build_host is not None
-    ws_raw = (body.get("workspace") or "").strip() or "/home/cmsupport/workspace"
+    ws_raw = (body.get("workspace") or "").strip() or _nvis_workspace_dir_effective()
     try:
         ws = _resolve_tools_destination(ws_raw)
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     script = SCRIPTS_DIR / "install-nvloom-workspace.sh"
-    if not script.is_file():
+    if not _script_exists(script):
         return jsonify({"ok": False, "error": f"script missing: {script}"}), 500
     timeout = max(300, _env_int("RACK_TOOLS_INSTALL_NVLOOM_WORKSPACE_TIMEOUT", 28800))
     extra_env = {"NVIS_NVLOOM_BUILD_HOST": build_host}
@@ -11307,6 +15869,207 @@ def api_tools_install_nvloom_workspace_stream():
 
     return Response(
         stream_with_context(_nvloom_stream_gen()),
+        mimetype="text/plain; charset=utf-8",
+        headers=dict(_STREAM_NO_CACHE_HEADERS),
+    )
+
+
+def _validate_exemplar_params(
+    body: dict,
+) -> tuple[dict[str, str] | None, str | None, dict | None]:
+    """Validate an Exemplar (dgxc-benchmarking / llmb) setup request.
+
+    Returns ``(extra_env, error, meta)``: ``extra_env`` is the ``NVIS_EXEMPLAR_*`` set
+    forwarded to ``install-dgxc-benchmarking-workspace.sh`` over SSH; ``meta`` carries
+    resolved values for the response/display line.
+    """
+    mode = str(body.get("mode") or "record").strip().lower()
+    if mode not in ("record", "install"):
+        return None, 'mode must be "record" or "install"', None
+    gpu_type = str(body.get("gpu_type") or "gb200").strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,31}", gpu_type):
+        return None, "gpu_type has invalid characters", None
+    arch = str(body.get("arch") or "aarch64").strip()
+    if arch not in ("aarch64", "x86_64"):
+        return None, 'arch must be "aarch64" or "x86_64"', None
+    # Settings -> job env NVIS_EXEMPLAR_WORKLOADS lets an operator narrow the install without a
+    # frontend field. The stock default also pulls pretrain_nemotron-h, which downloads a NeMo
+    # container via Slurm and is the main reason this action runs for hours — when only the NCCL
+    # microbenchmark is wanted that download is pure cost.
+    workloads = str(
+        body.get("workloads") or _eget("NVIS_EXEMPLAR_WORKLOADS") or "microbenchmark_nccl,pretrain_nemotron-h"
+    ).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.,\- ]+", workloads):
+        return None, "workloads has invalid characters", None
+    extra: dict[str, str] = {
+        "NVIS_EXEMPLAR_MODE": mode,
+        "NVIS_EXEMPLAR_GPU_TYPE": gpu_type,
+        "NVIS_EXEMPLAR_ARCH": arch,
+        "NVIS_EXEMPLAR_WORKLOADS": workloads,
+    }
+    for key, env_name in (
+        ("install_path", "NVIS_EXEMPLAR_INSTALL_PATH"),
+        ("slurm_account", "NVIS_EXEMPLAR_SLURM_ACCOUNT"),
+        ("gpu_partition", "NVIS_EXEMPLAR_GPU_PARTITION"),
+        ("cpu_partition", "NVIS_EXEMPLAR_CPU_PARTITION"),
+        ("image_folder", "NVIS_EXEMPLAR_IMAGE_FOLDER"),
+        ("repo_branch", "NVIS_EXEMPLAR_REPO_BRANCH"),
+    ):
+        # Fall back to Settings -> job env when the form has no field for it. The UI exposes only
+        # workspace/action/gpu_type/image_folder/uv/trust-git, so repo_branch (and the rest) were
+        # unreachable: the body key is absent and nothing read the env, so the installer silently
+        # used its built-in default. Body still wins when the form does provide a value.
+        val = str(body.get(key) or _eget(env_name) or "").strip()
+        if val:
+            if not re.fullmatch(r"[A-Za-z0-9_./:@+\- ]+", val):
+                return None, f"{key} has invalid characters", None
+            extra[env_name] = val
+    gres = str(body.get("gpu_gres") or "").strip()
+    if gres:
+        if not gres.isdigit():
+            return None, "gpu_gres must be an integer", None
+        extra["NVIS_EXEMPLAR_GPU_GRES"] = gres
+    hf = str(body.get("hf_token") or "").strip()
+    if hf:
+        if not re.fullmatch(r"[A-Za-z0-9_\-]+", hf):
+            return None, "hf_token has invalid characters", None
+        extra["NVIS_EXEMPLAR_HF_TOKEN"] = hf
+    # use_uv (default true): let install.sh bootstrap uv (standalone Python 3.12). Required on
+    # nodes whose system Python lacks ensurepip/python3-venv; needs astral.sh egress.
+    use_uv_raw = body.get("use_uv", True)
+    use_uv = use_uv_raw is True or str(use_uv_raw).strip().lower() in ("1", "true", "yes", "on")
+    if use_uv:
+        extra["NVIS_EXEMPLAR_USE_UV"] = "1"
+    # trust_git (default true): auto-fix git "dubious ownership" on the workspace + the installer's
+    # nested dependency clones (…/.cache/git_repos/*.git) so a server-node install doesn't abort
+    # deep in install.sh and force a manual `git config safe.directory` per repo.
+    trust_git_raw = body.get("trust_git", True)
+    trust_git = trust_git_raw is True or str(trust_git_raw).strip().lower() in ("1", "true", "yes", "on")
+    extra["NVIS_EXEMPLAR_TRUST_GIT"] = "1" if trust_git else "0"
+    meta = {"mode": mode, "gpu_type": gpu_type, "arch": arch, "workloads": workloads, "use_uv": use_uv, "trust_git": trust_git}
+    return extra, None, meta
+
+
+def _exemplar_display_cmd(meta: dict, ws: str) -> str:
+    return (
+        f"NVIS_EXEMPLAR_MODE={shlex.quote(meta['mode'])} "
+        f"NVIS_EXEMPLAR_GPU_TYPE={shlex.quote(meta['gpu_type'])} "
+        "bash bin/scripts/install-dgxc-benchmarking-workspace.sh "
+        f"{shlex.quote(str(ws))}"
+    )
+
+
+@app.route("/api/tools/install-dgxc-benchmarking-workspace", methods=["POST"])
+def api_tools_install_dgxc_benchmarking_workspace():
+    """Run ``install-dgxc-benchmarking-workspace.sh``: clone + (record|install) Exemplar/llmb."""
+    if os.environ.get("RACK_TOOLS_INSTALL_DGXC_BENCHMARKING_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        return jsonify({"ok": False, "error": "disabled (RACK_TOOLS_INSTALL_DGXC_BENCHMARKING_DISABLED)"}), 403
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
+    extra_env, err, meta = _validate_exemplar_params(body)
+    if err is not None:
+        return jsonify({"ok": False, "error": err}), 400
+    assert extra_env is not None and meta is not None
+    ws_raw = (body.get("workspace") or "").strip() or _nvis_workspace_dir_effective()
+    try:
+        ws = _resolve_tools_destination(ws_raw)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    script = SCRIPTS_DIR / "install-dgxc-benchmarking-workspace.sh"
+    if not _script_exists(script):
+        return jsonify({"ok": False, "error": f"script missing: {script}"}), 500
+    # install mode downloads the NeMo container via SLURM and can run for hours; record is fast.
+    default_to = 28800 if meta["mode"] == "install" else 1800
+    timeout = max(300, _env_int("RACK_TOOLS_INSTALL_DGXC_BENCHMARKING_TIMEOUT", default_to))
+    cmd = ["bash", str(script), str(ws)]
+    display_cmd = _exemplar_display_cmd(meta, str(ws))
+    try:
+        with _tools_exclusive_lock("install_dgxc_benchmarking_workspace"):
+            proc = subprocess.run(
+                cmd,
+                cwd=str(REPO_ROOT),
+                env=_subprocess_env(extra_env),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+    except _ToolsExclusiveLockBusyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 409
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "error": f"install-dgxc-benchmarking timed out after {timeout}s"}), 504
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    ok = proc.returncode == 0
+    return jsonify(
+        {
+            "ok": ok,
+            "returncode": proc.returncode,
+            "command_display": display_cmd,
+            "stdout": (proc.stdout or "").strip(),
+            "stderr": (proc.stderr or "").strip(),
+            "mode": meta["mode"],
+        }
+    ), (200 if ok else 502)
+
+
+@app.route("/api/tools/install-dgxc-benchmarking-workspace-stream", methods=["POST"])
+def api_tools_install_dgxc_benchmarking_workspace_stream():
+    """Stream ``install-dgxc-benchmarking-workspace.sh`` (POST JSON: ``workspace``, ``mode``, ``gpu_type``, …).
+
+    Routed to the privileged ``script`` SSH plane (like ``run_llmb_nccl.sh``) so the
+    workloads install to the same ``LLMB_INSTALL`` the NCCL/NeMo launchers later read.
+    """
+    if os.environ.get("RACK_TOOLS_INSTALL_DGXC_BENCHMARKING_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        return jsonify({"ok": False, "error": "disabled (RACK_TOOLS_INSTALL_DGXC_BENCHMARKING_DISABLED)"}), 403
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
+    extra_env, err, meta = _validate_exemplar_params(body)
+    if err is not None:
+        return jsonify({"ok": False, "error": err}), 400
+    assert extra_env is not None and meta is not None
+    ws_raw = (body.get("workspace") or "").strip() or _nvis_workspace_dir_effective()
+    try:
+        ws = _resolve_tools_destination(ws_raw)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    script = SCRIPTS_DIR / "install-dgxc-benchmarking-workspace.sh"
+    if not _script_exists(script):
+        return jsonify({"ok": False, "error": f"script missing: {script}"}), 500
+    default_to = 28800 if meta["mode"] == "install" else 1800
+    timeout = max(300, _env_int("RACK_TOOLS_INSTALL_DGXC_BENCHMARKING_TIMEOUT", default_to))
+    cmd = ["bash", str(script), str(ws)]
+    display_cmd = _exemplar_display_cmd(meta, str(ws))
+    lock_fh, lock_busy = _tools_try_acquire_exclusive_flock_for_stream("install_dgxc_benchmarking_workspace")
+    if lock_busy is not None:
+
+        def _lock_busy_gen() -> Iterator[bytes]:
+            yield f"ERROR: {lock_busy}\n".encode("utf-8")
+
+        return Response(
+            stream_with_context(_lock_busy_gen()),
+            status=409,
+            mimetype="text/plain; charset=utf-8",
+            headers=dict(_STREAM_NO_CACHE_HEADERS),
+        )
+
+    def _dgxc_stream_gen() -> Iterator[bytes]:
+        try:
+            yield from _merged_stdout_stream_generator(
+                cmd,
+                str(REPO_ROOT),
+                display_cmd,
+                timeout,
+                linebuffer_env_var="RACK_TOOLS_SCRIPT_STREAM_LINEBUFFER",
+                env_extra=extra_env,
+                privileged=True,
+            )
+        finally:
+            _tools_release_exclusive_flock_fh(lock_fh)
+
+    return Response(
+        stream_with_context(_dgxc_stream_gen()),
         mimetype="text/plain; charset=utf-8",
         headers=dict(_STREAM_NO_CACHE_HEADERS),
     )
@@ -11414,8 +16177,12 @@ def _parse_tail_log_request(body: dict) -> tuple[dict | None, tuple[object, int]
                 ),
                 404,
             )
-    root = log_dir.resolve()
-    lp = log_path.resolve()
+    # ssh mode: the log lives on the head node, so these are PurePosixPath and .resolve() raises
+    # AttributeError -> 500 -> an HTML error page -> "Unexpected token '<'" / "500 Internal Server
+    # Error" in the SPA. Fifth site of this same bug class in this file; branch on EXEC MODE, not
+    # on the object type (_resolve_log_dir always returns a local Path object either way).
+    root = _rpath(log_dir)
+    lp = _rpath(log_path)
     try:
         lp.relative_to(root)
     except ValueError:
@@ -11440,17 +16207,33 @@ def _tail_log_stream_generator(prep: dict) -> object:
     lp = prep["log_path"]
     n_init = max(0, _env_int("RACK_TAIL_INITIAL_LINES", 400))
     cmd = ["tail", "-n", str(n_init), "-f", str(lp)]
-    if (_eget("RACK_TAIL_LINEBUFFER", "1") or "").strip().lower() in ("1", "true", "yes", "on"):
-        stdbuf = shutil.which("stdbuf")
+    # SSH mode: the log lives on the cluster head — tail must run there, not in this
+    # container. Wrap via host_exec (ssh 'cd <log_dir> && tail …'); local stdbuf and
+    # local cwd only apply to local execution. Mirrors _merged_stdout_stream_generator.
+    # See _merged_stdout_stream_generator: hand-built streaming Popen, so the
+    # mechanism matters here in a way it does not for ordinary callers.
+    remote = host_exec.exec_kind() == "ssh"
+    if (_eget("RACK_TAIL_LINEBUFFER", "1") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        # `tail -f` writing to a pipe (no TTY) is block-buffered, so a slow live log
+        # never fills the buffer and the viewer hangs on "connecting". Resolve stdbuf
+        # on the *execution* host — the local path may not exist there.
+        stdbuf = host_exec.which("stdbuf")
         if stdbuf:
             cmd = [stdbuf, "-oL", "-eL", *cmd]
-    env = _subprocess_env()
+    cwd_local = str(prep["log_dir"])
+    remote_cwd = _translate_cwd_for_remote(cwd_local) if remote else None
+    cmd = host_exec.wrap_for_host(cmd, cwd=remote_cwd)
     proc = subprocess.Popen(
         cmd,
-        cwd=str(prep["log_dir"]),
+        cwd=None if remote else cwd_local,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        env=env,
+        env=None if remote else _subprocess_env(),
         bufsize=0,
     )
     outq: queue.Queue[bytes | None] = queue.Queue()
@@ -11675,7 +16458,7 @@ def _cluster_probe_bcm_cmsh_version() -> tuple[str, str]:
     cmsh = (_eget("RACK_CMSH") or "cmsh").strip() or "cmsh"
     cmd = [cmsh, "-c", "main; versioninfo"]
     timeout = max(10, _env_int("RACK_CLUSTER_BCM_CMSH_TIMEOUT", 60))
-    if not host_exec.is_remote() and not shutil.which(cmsh):
+    if not host_exec.which(cmsh):
         return "", "cmsh not in PATH"
     try:
         proc = host_exec.run_on_host(cmd, timeout=timeout)
@@ -11689,9 +16472,13 @@ def _cluster_probe_bcm_cmsh_version() -> tuple[str, str]:
         return "", err_tail or f"exit {proc.returncode}"
     if not out:
         return "", err_tail or "empty stdout"
-    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
-    cap = max(80, _env_int("RACK_CLUSTER_BCM_CMSH_DISPLAY_MAX", 600))
-    snippet = " | ".join(lines[:4]) if lines else out
+    # cmsh versioninfo pads columns with runs of spaces ("Cluster Manager          11.0")
+    # and emits 4+ build lines. Joining them raw produced an unreadable blob in the
+    # Compute overview header. Collapse whitespace and show the Cluster Manager line only.
+    lines = [re.sub(r"\s+", " ", ln.strip()) for ln in out.splitlines() if ln.strip()]
+    cap = max(40, _env_int("RACK_CLUSTER_BCM_CMSH_DISPLAY_MAX", 120))
+    n_lines = max(1, _env_int("RACK_CLUSTER_BCM_CMSH_DISPLAY_LINES", 1))
+    snippet = " | ".join(lines[:n_lines]) if lines else out
     if len(snippet) > cap:
         snippet = snippet[: cap - 3].rstrip() + "…"
     return snippet, ""
@@ -11743,7 +16530,7 @@ _CLUSTER_DM_KEYS: tuple[str, ...] = ("product_line", "hw_vendor", "customer_name
 def _cluster_dashboard_metadata_path() -> Path:
     raw = (os.environ.get("RACK_CLUSTER_DASHBOARD_METADATA_FILE") or "").strip()
     if raw:
-        return _resolve_path(Path(raw))
+        return _rpath(Path(raw))
     return (REPO_ROOT / "var" / "cache" / "cluster_dashboard_metadata.json").resolve()
 
 
@@ -11846,27 +16633,29 @@ def update_cluster_dashboard_metadata(updates: dict[str, object]) -> dict[str, s
     return read_cluster_dashboard_metadata()
 
 
-def build_cluster_overview(log_dir: Path) -> dict[str, object]:
+def build_cluster_overview(
+    log_dir: Path,
+    snapshot: cluster_snapshot.ClusterSnapshot | None = None,
+) -> dict[str, object]:
     """Aggregate cluster facts for the React dashboard (env + head-only Slurm; no node SSH/pdsh)."""
-    base = _cached_rack_status_copy(log_dir)
-    cached: dict | None = dict(base) if isinstance(base, dict) else None
-    if cached is not None:
-        _merge_fresh_comments_into_status_payload(cached)
-        if not _truthy_env("RACK_STATUS_USE_SHELL_TABLE"):
-            _merge_live_native_workers_into_status(cached, log_dir)
-    rows = list(cached.get("rows") or []) if isinstance(cached, dict) else []
+    current = snapshot or get_cluster_snapshot(log_dir)
+    cached = dict(current.payload) if isinstance(current.payload, dict) else None
+    rows = list(cached.get("rows") or []) if cached is not None else []
     rack_ids = sorted({str(r.get("rack") or "").strip() for r in rows if r.get("rack")})
-    rack_count = len(rack_ids)
-    summary = dict(cached.get("summary") or {}) if isinstance(cached, dict) else {}
-    for k in ("done", "fail", "ongoing", "pending"):
-        if k not in summary:
-            summary[k] = 0
-    phys = dict(cached.get("physical_rf0") or {}) if isinstance(cached, dict) else {}
-    tray_hosts = len(phys)
-    gpus_per_tray = max(1, _env_int("RACK_CLUSTER_GPU_PER_TRAY", 8))
-    estimated_gpus = tray_hosts * gpus_per_tray
-    validation_total = int(summary.get("done", 0) or 0) + int(summary.get("fail", 0) or 0)
-    validation_total += int(summary.get("ongoing", 0) or 0) + int(summary.get("pending", 0) or 0)
+    rack_count = len(rack_ids) if cached is not None else None
+    summary = dict(cached.get("summary") or {}) if cached is not None else None
+    if summary is not None:
+        for k in ("done", "fail", "ongoing", "pending"):
+            if k not in summary:
+                summary[k] = 0
+    phys = dict(cached.get("physical_rf0") or {}) if cached is not None else {}
+    tray_hosts = len(phys) if cached is not None else None
+    gpus_per_tray = max(1, _eget_int("RACK_CLUSTER_GPU_PER_TRAY", 8))
+    estimated_gpus = tray_hosts * gpus_per_tray if tray_hosts is not None else None
+    validation_total = None
+    if summary is not None:
+        validation_total = int(summary.get("done", 0) or 0) + int(summary.get("fail", 0) or 0)
+        validation_total += int(summary.get("ongoing", 0) or 0) + int(summary.get("pending", 0) or 0)
 
     cluster_name = _cluster_env_pick("RACK_CLUSTER_NAME", "CLUSTER_NAME")
     if not cluster_name:
@@ -11897,20 +16686,19 @@ def build_cluster_overview(log_dir: Path) -> dict[str, object]:
         "NEMO_SQSH_SRC",
     )
 
+    # Live BCM/Slurm/queue probes run only via ``/api/cluster-overview/live``.
+    # Keep env-configured versions here; queue is a non-live placeholder for FE compat.
+    # Never probe SSH here — cold/stale reachability must not run ``ssh true``.
+    reachable, reach_detail = host_exec.cached_reachability_state()
     probes: dict[str, object] = {}
-    skip_probes = _truthy_env("RACK_CLUSTER_OVERVIEW_DISABLE_PROBES")
-
-    if not skip_probes and not slurm_version:
-        v, err = _cluster_probe_slurm_version()
-        slurm_version = v or "—"
-        probes["slurm"] = {"ok": bool(v) and not err, "detail": err or v}
-
-    if not skip_probes and not (bcm_version or "").strip():
-        v_b, err_b = _cluster_probe_bcm_cmsh_version()
-        bcm_version = v_b or bcm_version
-        probes["bcm_cmsh"] = {"ok": bool(v_b) and not err_b, "detail": (err_b or v_b)[:4000]}
-
-    squeue_block = _cluster_squeue_overview_block()
+    squeue_block: dict[str, object] = {
+        "ok": False,
+        "stdout": "",
+        "stderr": "",
+        "command_display": "",
+        "returncode": -1,
+        "error": "live details load separately",
+    }
 
     if hw_vendor == "":
         hw_vendor = "—"
@@ -11923,7 +16711,7 @@ def build_cluster_overview(log_dir: Path) -> dict[str, object]:
 
     cuda_nccl_build_host_candidates = sorted(phys.keys(), key=str.casefold)
 
-    return {
+    out: dict[str, object] = {
         "ok": True,
         "cluster_name": cluster_name,
         "customer_name": customer,
@@ -11934,17 +16722,30 @@ def build_cluster_overview(log_dir: Path) -> dict[str, object]:
         "nemo_container": nemo_container,
         "cuda_nccl_build_host_candidates": cuda_nccl_build_host_candidates,
         "tools_download_destination_default": _tools_download_destination_default(),
+        "tools_workspace_default": _nvis_workspace_dir_effective(),
         "rack_count": rack_count,
         "tray_hosts": tray_hosts,
         "estimated_gpu_count": estimated_gpus,
         "validation_summary": summary,
         "validation_cells_total": validation_total,
-        "status_updated_at": (cached or {}).get("updated_at") if isinstance(cached, dict) else None,
+        "status_updated_at": cached.get("updated_at") if cached is not None else None,
+        "snapshot": current.metadata(),
         "probes": probes,
         "app_version": _app_version(),
         "squeue": squeue_block,
         "cluster_dashboard_metadata": dash_meta,
+        "cluster_unreachable_detail": "",
+        "exec_mode": host_exec.exec_kind(),
     }
+    # Unknown cached reachability: leave unset/None rather than inventing down/up.
+    if reachable is None:
+        out["cluster_reachable"] = None
+    else:
+        out["cluster_reachable"] = reachable
+        out["cluster_unreachable_detail"] = (
+            "" if reachable else (reach_detail or "head node not reachable over SSH")
+        )
+    return out
 
 
 @app.route("/api/nvftp-sync/status", methods=["GET"])
@@ -12077,6 +16878,28 @@ def _job_environment_settings_payload() -> dict[str, object]:
     }
 
 
+@app.route("/api/grafana/deeplinks")
+def api_grafana_deeplinks():
+    """Config for 'Open in Grafana' deep-links (full dashboards scoped by rack/host, opened in a new tab).
+
+    Unlike the /d-solo/ parser embeds, these need no embedding config — they link to the existing
+    BCM/NMC dashboards. Response: ``enabled``, ``base`` (may be empty -> resolve to same host),
+    ``port``, ``var_rack`` / ``var_host`` (template var names), ``timezone`` and ``dashboards``.
+    """
+    return jsonify(
+        {
+            "ok": True,
+            "enabled": _grafana_deeplinks_enabled(),
+            "base": _rack_web_grafana_uri(),
+            "port": _rack_web_grafana_port(),
+            "var_rack": _grafana_var_rack(),
+            "var_host": _grafana_var_host(),
+            "timezone": _grafana_url_timezone_param(),
+            "dashboards": _grafana_deeplink_dashboards(),
+        }
+    )
+
+
 @app.route("/api/settings/job-environment", methods=["GET", "PUT"])
 def api_settings_job_environment():
     """GET effective job/validation env (with dashboard overrides); PUT merges ``overrides`` (empty value clears)."""
@@ -12162,9 +16985,33 @@ def api_settings_job_environment():
     return jsonify(payload)
 
 
+@app.route("/api/ds-diag", methods=["GET"])
+def api_ds_diag():
+    """Diagnostic: what did `cmsh -c ds` actually return on the last worker pass?"""
+    import native_status as _ns
+    states = {}
+    try:
+        reg = getattr(_ns, "_states", None) or {}
+        for k, st in list(reg.items()):
+            with st.lock:
+                states[str(k)] = {
+                    "racks": len(st.racks),
+                    "rack_sample": list(st.racks)[:3],
+                    "ct_by_rack_len": len(st.ct_by_rack),
+                    "ct_keys_sample": list(st.ct_by_rack)[:3],
+                    "ds_done": st.ds_done,
+                    "errors": list(st.last_errors)[-3:],
+                }
+    except Exception as e:
+        states["_error"] = str(e)
+    return jsonify({"ok": True, "diag": dict(getattr(_ns, "DS_LAST_DIAG", {}) or {}),
+                    "states": states})
+
+
 @app.route("/api/cluster-overview", methods=["GET"])
 def api_cluster_overview():
-    """Cluster-wide facts for the dashboard tab (env + head Slurm; uses cached /api/status rows)."""
+    """Cluster-wide facts whose inventory fields use the canonical shared snapshot."""
+    _ensure_rack_status_background_thread()
     nvftp_cache_sync.ensure_background_thread()
     try:
         log_dir = _resolve_log_dir(request.args.get("log_dir"))
@@ -12173,9 +17020,116 @@ def api_cluster_overview():
     client_id = (request.args.get("client_id") or "").strip()
     connected_users = _touch_app_client(client_id)
     try:
-        payload = build_cluster_overview(log_dir)
+        force_refresh = (request.args.get("refresh") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        # Demo inventory is instant — wait so clients never see an initializing flash.
+        # Real clusters return immediately and refresh in the background.
+        snapshot = get_cluster_snapshot(
+            log_dir,
+            force_refresh=force_refresh,
+            wait=_truthy_env("RACK_STATUS_DEMO"),
+        )
+        payload = build_cluster_overview(log_dir, snapshot)
         payload["connected_users"] = connected_users
         return jsonify(payload)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/cluster-overview/live", methods=["GET"])
+def api_cluster_overview_live():
+    """Non-blocking BCM / Slurm / queue live probes with per-section cache state."""
+    force_refresh = (request.args.get("refresh") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    try:
+        reachable, reach_detail = host_exec.reachability_state()
+        cluster_id = _cluster_snapshot_identity()
+        snapshot = _get_cluster_overview_live_service().get_snapshot(
+            cluster_id,
+            force_refresh=force_refresh,
+            allow_refresh=reachable,
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "cluster_id": cluster_id,
+                "reachable": reachable,
+                "unreachable_detail": (
+                    "" if reachable else (reach_detail or "head node not reachable over SSH")
+                ),
+                "sections": snapshot.get("sections") or {},
+            }
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": cluster_overview_live.safe_error(e)}), 500
+
+
+@app.route("/api/cluster-health", methods=["GET"])
+def api_cluster_health():
+    """Cheap, cached cluster-link reachability for the SPA connection banner.
+
+    ``?force=1`` re-probes immediately (used by the "Reconnect now" action).
+    """
+    force = (request.args.get("force") or "").strip().lower() in ("1", "true", "yes")
+    try:
+        info = host_exec.reachability_info(force=force)
+        return jsonify({"ok": True, **info})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/cluster-health/reconnect", methods=["POST"])
+def api_cluster_health_reconnect():
+    """Force an immediate reachability re-probe (drops the cached result first)."""
+    try:
+        host_exec.invalidate_reachability()
+        info = host_exec.reachability_info(force=True)
+        return jsonify({"ok": True, **info})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/fabric-probe", methods=["GET"])
+def api_fabric_probe():
+    """Classify a compute node's RDMA fabric (compute rails vs storage/NS plane).
+
+    Runs ``bin/scripts/fabric_probe.sh`` against a representative compute node and
+    returns the detected plane (link tech, per-rail rate, compute rails, the NCCL
+    ``NCCL_IB_HCA`` / ``NCCL_SOCKET_IFNAME`` it would use) plus any detected-vs-expected
+    discrepancies. Expected values come from the active platform's fabric profile
+    (forwarded as ``NVIS_FABRIC_EXPECT_*``). ``?node=`` targets a specific host;
+    otherwise the first Slurm node is used (homogeneous cluster assumption).
+    """
+    node = (request.args.get("node") or "").strip()
+    try:
+        if not node:
+            proc = _run_bash_slurm_prefix("sinfo -N -h -o '%N' | head -1", timeout=30)
+            lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+            node = lines[0] if lines else ""
+        if not node:
+            return jsonify({"ok": False, "error": "no compute node found; pass ?node=<hostname>"}), 400
+        script = str(SCRIPTS_DIR / "fabric_probe.sh")
+        proc = host_exec.run_on_host(
+            ["bash", script, node],
+            timeout=max(30, _env_int("RACK_FABRIC_PROBE_TIMEOUT", 60)),
+        )
+        out = (proc.stdout or "").strip()
+        json_lines = [ln for ln in out.splitlines() if ln.lstrip().startswith("{")]
+        if not json_lines:
+            return jsonify({
+                "ok": False,
+                "error": "fabric probe returned no JSON",
+                "node": node,
+                "stderr": (proc.stderr or "")[-500:],
+            }), 502
+        data = json.loads(json_lines[-1])
+        return jsonify({"ok": True, "node": node, "fabric": data})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -12197,17 +17151,71 @@ def api_app_stats():
 
 
 def _merge_project_name_into_status_payload(payload: dict) -> None:
-    """SPA sidebar / titles: ``RACK_WEB_PROJECT_NAME`` (and shell ``PROJECT_NAME``) via ``_project_name()``."""
+    """SPA payload: optional ``RACK_WEB_PROJECT_NAME`` / ``PROJECT_NAME`` label."""
     payload["project_name"] = _project_name()
 
 
 def _merge_naming_into_status_payload(payload: dict) -> None:
-    """Expose ``NVIS_*`` naming hints for the SPA (validation targets, node id parsing)."""
-    payload["naming"] = _nvis_naming().schema_dict()
+    """Expose ``NVIS_*`` naming hints for the SPA (validation targets, node id parsing).
+
+    Also emits a backend-authoritative ``hierarchy`` (section -> row -> rack) built
+    from the same naming module that parses/sorts rack ids, so the SPA floor view
+    and any other hierarchy-aware surface consume one source of truth instead of
+    re-parsing rack ids client-side.
+    """
+    naming = _nvis_naming()
+    payload["naming"] = naming.schema_dict()
+    try:
+        rows = payload.get("rows") or []
+        rack_ids = [r.get("rack", "") for r in rows if isinstance(r, dict) and r.get("rack")]
+        payload["hierarchy"] = naming.build_hierarchy(rack_ids)
+    except Exception:  # pragma: no cover - hierarchy is additive, never break status
+        _logger.exception("failed to build rack hierarchy for status payload")
+
+
+def _merge_cluster_reachable_into_status_payload(out: dict, reachable: bool, detail: str = "") -> None:
+    """Tag a /api/status payload with cluster link state for the SPA connection banner."""
+    out["cluster_reachable"] = reachable
+    out["cluster_unreachable_detail"] = "" if reachable else (detail or "head node not reachable over SSH")
+    out["exec_mode"] = host_exec.exec_kind()
+
+
+def _degraded_status_payload(log_dir: Path, detail: str) -> dict:
+    """Minimal payload returned when the cluster link is down and no cache exists yet.
+
+    Keeps the request fast (no blocking SSH) and lets the SPA show its last-known UI
+    plus a reconnecting banner instead of spinning on a dead connection.
+    """
+    out: dict = {
+        "ok": True,
+        "degraded": True,
+        "served_from_cache": False,
+        "rows": [],
+        "summary": {"done": 0, "fail": 0, "ongoing": 0, "pending": 0},
+        "footnotes": [],
+        "legend": "",
+        "stderr": "",
+        "updated_at": None,
+        "log_dir": str(log_dir),
+        "rack_status_background_interval_sec": _rack_status_background_interval_sec(),
+    }
+    try:
+        out["comments"] = read_comments()
+    except Exception:
+        out["comments"] = {}
+    _merge_project_name_into_status_payload(out)
+    _merge_naming_into_status_payload(out)
+    _merge_cluster_reachable_into_status_payload(out, False, detail)
+    return out
 
 
 @app.route("/api/status")
 def api_status():
+    """Rack status from the canonical snapshot.
+
+    ``raw=1`` remains a diagnostic collector bypass. It is never persisted and
+    therefore can never become the source of Overview inventory counts.
+    """
     _start_cmsh_rack_list_warm_thread()
     _ensure_rack_status_background_thread()
     nvftp_cache_sync.ensure_background_thread()
@@ -12217,62 +17225,64 @@ def api_status():
         return jsonify({"ok": False, "error": str(e)}), 400
     want_raw = request.args.get("raw") == "1"
     interval = _rack_status_background_interval_sec()
-    if _rack_status_background_enabled() and not want_raw:
-        cache_key = _register_rack_status_log_dir(log_dir)
-        with _rack_status_cache_lock:
-            cached = _rack_status_cache.get(cache_key)
-        if cached is not None:
-            out = dict(cached)
-            out["served_from_cache"] = True
-            out["rack_status_background_interval_sec"] = interval
-            _merge_fresh_comments_into_status_payload(out)
-            _merge_live_native_workers_into_status(out, log_dir)
-            _merge_project_name_into_status_payload(out)
-            _merge_naming_into_status_payload(out)
-            return jsonify(out)
+    reachable, reach_detail = host_exec.reachability_state()
+    if want_raw:
         try:
-            with _rack_status_exec_lock:
-                with _rack_status_cache_lock:
-                    cached = _rack_status_cache.get(cache_key)
-                if cached is not None:
-                    out = dict(cached)
-                    out["served_from_cache"] = True
-                    out["rack_status_background_interval_sec"] = interval
-                    _merge_fresh_comments_into_status_payload(out)
-                    _merge_live_native_workers_into_status(out, log_dir)
-                    _merge_project_name_into_status_payload(out)
-                    _merge_naming_into_status_payload(out)
-                    return jsonify(out)
-                data = run_rack_status(log_dir, include_raw=False)
+            data = run_rack_status(log_dir, include_raw=True)
         except subprocess.TimeoutExpired:
             return jsonify({"ok": False, "error": "rack_status.sh timed out"}), 504
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
-        with _rack_status_cache_lock:
-            _rack_status_cache[cache_key] = data
-        out = dict(data)
-        out["served_from_cache"] = False
-        out["rack_status_background_interval_sec"] = interval
-        _merge_fresh_comments_into_status_payload(out)
-        _merge_live_native_workers_into_status(out, log_dir)
-        _merge_project_name_into_status_payload(out)
-        _merge_naming_into_status_payload(out)
-        return jsonify(out)
+        _merge_live_native_workers_into_status(data, log_dir)
+        data["snapshot_bypass"] = True
+        _merge_fresh_comments_into_status_payload(data)
+        _merge_project_name_into_status_payload(data)
+        _merge_naming_into_status_payload(data)
+        _merge_cluster_reachable_into_status_payload(data, reachable, reach_detail)
+        return jsonify(data)
+
     try:
-        if _rack_status_background_enabled():
-            with _rack_status_exec_lock:
-                data = run_rack_status(log_dir, include_raw=want_raw)
-        else:
-            data = run_rack_status(log_dir, include_raw=want_raw)
-    except subprocess.TimeoutExpired:
-        return jsonify({"ok": False, "error": "rack_status.sh timed out"}), 504
+        force_refresh = (request.args.get("refresh") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        # Demo inventory is instant — wait so clients never see an initializing flash.
+        # Real clusters return immediately and refresh in the background.
+        snapshot = get_cluster_snapshot(
+            log_dir,
+            force_refresh=force_refresh,
+            wait=_truthy_env("RACK_STATUS_DEMO"),
+        )
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
-    _merge_fresh_comments_into_status_payload(data)
-    _merge_live_native_workers_into_status(data, log_dir)
-    _merge_project_name_into_status_payload(data)
-    _merge_naming_into_status_payload(data)
-    return jsonify(data)
+
+    if snapshot.payload is not None:
+        out = dict(snapshot.payload)
+    else:
+        out = {
+            "ok": True,
+            "returncode": 0,
+            "updated_at": None,
+            "log_dir": str(log_dir),
+            "script": "",
+            "stderr": "",
+            "legend": "",
+            "rows": [],
+            "summary": {"done": 0, "fail": 0, "ongoing": 0, "pending": 0},
+            "footnotes": [],
+            "comments": {},
+            "physical_rf0": {},
+            "native_workers": {"mode": "snapshot_unavailable"},
+        }
+    out["snapshot"] = snapshot.metadata()
+    out["served_from_cache"] = snapshot.payload is not None
+    out["rack_status_background_interval_sec"] = interval
+    _merge_fresh_comments_into_status_payload(out)
+    _merge_project_name_into_status_payload(out)
+    _merge_naming_into_status_payload(out)
+    _merge_cluster_reachable_into_status_payload(out, reachable, reach_detail)
+    return jsonify(out)
 
 
 _SPA_DIR = REPO_ROOT / "static" / "spa"
@@ -12280,11 +17290,32 @@ _SPA_DIR = REPO_ROOT / "static" / "spa"
 
 
 
+# A client route ("/compute/nodes") must fall back to index.html, but a *build artifact*
+# must not: returning HTML for a missing .js makes the browser report a MIME-type error
+# ("Expected a JavaScript-or-Wasm module script … responded with text/html") and renders a
+# blank page, pointing at the SPA instead of at the deploy that dropped the file. These are
+# requests for a hashed filename nobody types, so a miss is always a broken deploy.
+# Both the `/<path>` and `/spa/<path>` routes arrive here with a leading "assets/".
+_SPA_ARTIFACT_PREFIX = "assets/"
+# An /api/ path that reached the catch-all has no route: the endpoint does not exist in THIS
+# build. Answering it with index.html gives the caller HTML at status 200, so a half-deployed
+# backend looks like a feature returning no data instead of a missing endpoint. Verified
+# 2026-08-03: the Validation activities panel read "0 tracked" for exactly this reason, with
+# the frontend deployed and its backend not.
+_SPA_API_PREFIX = "api/"
+
+
 def _serve_spa_asset(path: str = "index.html"):
-    """Serve a built SPA asset, fallback to index.html for client routes."""
+    """Serve a built SPA asset; fall back to index.html for client routes only."""
     spa_file = _SPA_DIR / path
     if spa_file.is_file():
         return send_file(spa_file)
+    if path.startswith(_SPA_ARTIFACT_PREFIX):
+        _logger.error("SPA artifact missing: %s — index.html and assets/ are out of sync", path)
+        return jsonify({"ok": False, "error": f"SPA asset not found: {path}"}), 404
+    if path.startswith(_SPA_API_PREFIX):
+        _logger.error("no such API endpoint: /%s — frontend and backend are out of step", path)
+        return jsonify({"ok": False, "error": f"no such API endpoint: /{path}"}), 404
     return send_file(_SPA_DIR / "index.html")
 
 
@@ -12420,6 +17451,7 @@ _WORKFLOW_TOOL_KEYS = {
     "RACK_MNUBERGEMM_STRESS_SCRIPT": ("MNU Bergemm stress", "Validation"),
     "RACK_NVLOOM_SINGLERACK_SCRIPT": ("NVLoom singlerack", "Validation"),
     "RACK_CLUSTERKIT_SCRIPT": ("ClusterKit singlerack", "Validation"),
+    "RACK_LLMB_NCCL_SCRIPT": ("NCCL Microbenchmark (LLMB)", "Validation"),
     "RACK_SYSINFO_SCRIPT": ("sysinfo / Precheck", "Cluster Tools"),
     "RACK_HW_CHECK_SCRIPT": ("Hardware check (pdsh)", "Cluster Tools"),
     "RACK_GPU_RESET_SCRIPT": ("GPU reset", "Cluster Tools"),
@@ -12569,6 +17601,8 @@ def api_workflow_save():
     try:
         wf = workflow_engine.save_workflow(body)
         return jsonify({"ok": True, "workflow": wf})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
@@ -12787,8 +17821,21 @@ class _WebSocketTerminalMiddleware:
 
     def __call__(self, environ, start_response):  # type: ignore[no-untyped-def]
         path = environ.get("PATH_INFO", "")
-        if path == "/ws/terminal" and "werkzeug.socket" in environ and _TERMINAL_ENABLED:
-            self._handle_terminal(environ)
+        upgrade = (environ.get("HTTP_UPGRADE") or "").strip().lower()
+        has_socket = "werkzeug.socket" in environ or "gunicorn.socket" in environ
+        # Werkzeug injects werkzeug.socket for *every* request, so require Upgrade:
+        # websocket before claiming this path. simple_websocket writes the HTTP 101
+        # response on the raw socket and never calls start_response; Werkzeug still
+        # finalizes with write(b""), so we must call start_response before returning.
+        if path == "/ws/terminal" and upgrade == "websocket" and has_socket and _TERMINAL_ENABLED:
+            try:
+                self._handle_terminal(environ)
+            finally:
+                try:
+                    start_response("200 OK", [])
+                except Exception:
+                    # Headers may already be set, or the peer already closed the socket.
+                    pass
             return []
         return self.wsgi_app(environ, start_response)
 
@@ -12857,15 +17904,20 @@ class _WebSocketTerminalMiddleware:
         from simple_websocket import Server as _WSServer, ConnectionClosed as _WSClosed
         from urllib.parse import parse_qs
 
-        ws = _WSServer(environ)
+        ws = None
         outq = None
         sess = None
         try:
+            ws = _WSServer(environ)
             qs = parse_qs(environ.get("QUERY_STRING", ""))
             sess = self._get_or_create_session(qs)
 
             if sess is None:
-                reason = "Demo mode — terminal connections are disabled" if _truthy_env("RACK_STATUS_DEMO") else "Missing target node"
+                reason = (
+                    "Demo mode — terminal connections are disabled"
+                    if _truthy_env("RACK_STATUS_DEMO")
+                    else "Missing target node"
+                )
                 ws.send(json.dumps({"type": "error", "error": reason}))
                 return
 
@@ -12898,8 +17950,11 @@ class _WebSocketTerminalMiddleware:
                 try:
                     msg = ws.receive(timeout=0.05)
                 except _WSClosed:
-                    _logger.info("WebSocket terminal: client disconnected from %s (session %s)",
-                                 sess.target, sess.session_id)
+                    _logger.info(
+                        "WebSocket terminal: client disconnected from %s (session %s)",
+                        sess.target,
+                        sess.session_id,
+                    )
                     return
                 except OSError:
                     return
@@ -12939,19 +17994,204 @@ class _WebSocketTerminalMiddleware:
                         args=(sess.session_id,),
                         daemon=True,
                     ).start()
-            try:
-                ws.close()
-            except Exception:
-                pass
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
 
 
 if _TERMINAL_ENABLED:
     app.wsgi_app = _WebSocketTerminalMiddleware(app.wsgi_app)  # type: ignore[assignment]
 
 # After all routes and middleware are registered (avoid circular import via nvftp_cache_sync._eget → app).
+_bootstrap_catalog_at_startup()
 _bootstrap_nvftp_sync_at_startup()
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG") == "1", threaded=True)
+
+# ---------------------------------------------------------------------------------------------
+# Job-attempt capture — a run that never produces a log MUST still be recorded.
+#
+# Job 63850 (MNUBERGEMM, h01) was CANCELLED in the Slurm prolog: RunTime 00:00:00, no stdout file
+# ever created. It therefore left NO trace in the log dir, in results_history, or in the lake — the
+# attempt was invisible even though it consumed an 18-node allocation and drained a tray. Capturing
+# only successful runs is the same blank-read-as-success failure this platform exists to catch.
+# ---------------------------------------------------------------------------------------------
+_SCONTROL_FIELDS = (
+    "JobId", "JobName", "UserId", "JobState", "Reason", "ExitCode", "DerivedExitCode",
+    "RunTime", "SubmitTime", "StartTime", "EndTime", "NodeList", "ReqNodeList",
+    "NumNodes", "NumCPUs", "Partition", "StdOut", "StdErr", "WorkDir", "Command",
+)
+
+
+def _parse_scontrol_job(text: str) -> dict:
+    """scontrol emits `Key=Value` pairs, space-separated, values may contain `/` and `:` but not ` `."""
+    out: dict[str, str] = {}
+    for m in re.finditer(r"([A-Za-z][A-Za-z0-9_]*)=(\S*)", text or ""):
+        k, v = m.group(1), m.group(2)
+        if k in _SCONTROL_FIELDS and k not in out:
+            out[k] = v
+    return out
+
+
+def _rack_and_nodes_from_nodelist(nodelist: str) -> tuple[str, list[str]]:
+    """Attribute a Slurm ``NodeList`` to ``(rack id, node hostnames)``.
+
+    Two things make this less trivial than it looks:
+      * Slurm reports a *compact* list (``<rack>-[01-18]``), so it has to be expanded before
+        the hostnames mean anything, and ``(null)`` / ``None assigned`` for a job that never
+        got an allocation.
+      * Rack attribution goes through the naming engine (``NVIS_RACK_ID`` / ``NVIS_CT_ID``),
+        so every site's convention works. This used to hardcode one cluster's ``ink50``
+        prefix, which silently produced an empty rack and no nodes everywhere else.
+    """
+    spec = (nodelist or "").strip()
+    if not spec or spec.lower() in ("(null)", "none assigned"):
+        return "", []
+    if _uparse is not None:
+        hosts = _uparse.expand_nodelist(spec)
+    else:  # no normaliser: bracket ranges stay unexpanded, but do not lose the plain names
+        hosts = [h for h in re.split(r"[,\s]+", spec) if h]
+    naming = _nvis_naming()
+    # Prefer recognised trays, but never drop everything: an unrecognised convention should
+    # still surface its nodes rather than report the job as having run nowhere.
+    nodes = [h for h in hosts if naming.is_tray_hostname(h)] or hosts
+    for h in nodes:
+        hit = naming.sinfo_rack_from_host(h)
+        if hit:
+            return (naming.canonical_rack_id(hit[0]) or hit[0]), nodes
+    return "", nodes
+
+
+def capture_job_attempt(job_id: str) -> dict:
+    """Record one Slurm job attempt (state, reason, exit code, nodes) to history + the lake.
+
+    Works whether or not the job produced output — that is the entire point.
+    """
+    res: dict[str, object] = {"ok": False, "job_id": job_id, "error": None}
+    try:
+        raw = _run_scontrol_show_job(job_id)
+        text = raw.get("stdout") if isinstance(raw, dict) else str(raw)
+    except Exception as e:  # noqa: BLE001
+        res["error"] = f"scontrol failed: {e}"
+        return res
+
+    f = _parse_scontrol_job(text or "")
+    if not f.get("JobId"):
+        # scontrol only remembers a job for MinJobAge after it ends. A 40-minute soak checked an
+        # hour later is simply GONE — which silently missed three completed MNUBERGEMM runs.
+        # sacct reads the accounting DB and retains them, so fall back to it.
+        try:
+            sa = host_exec.run_on_host(
+                # Explicit SLURM_CONF + absolute sacct: this runs in a NON-LOGIN ssh shell with
+                # no PATH and no SLURM_CONF, exactly like every other Slurm call in this file.
+                f"export SLURM_CONF={shlex.quote(os.environ.get('RACK_SLURM_CONF','/cm/shared-ubuntu2404-x86_64/apps/slurm/etc/slurm/slurm.conf'))}; "
+                f"$(ls -1 /cm/local/apps/slurm/*/bin/sacct /cm/local/apps/slurm/current/bin/sacct 2>/dev/null | tail -1) "
+                f"-j {shlex.quote(job_id)} -X -P -n "
+                "-o JobID,JobName,State,Elapsed,ExitCode,Start,End,NodeList,User"
+            )
+            line = (sa.stdout or "").strip().splitlines()
+            if line:
+                c = line[0].split("|")
+                if len(c) >= 8:
+                    f = {
+                        "JobId": c[0], "JobName": c[1], "JobState": c[2].split()[0],
+                        "RunTime": c[3], "ExitCode": c[4], "StartTime": c[5],
+                        "EndTime": c[6], "NodeList": c[7],
+                        "Reason": "(from sacct — not in scontrol)",
+                    }
+                    res["source"] = "sacct"
+        except Exception as e:  # noqa: BLE001
+            res["error"] = f"sacct fallback failed: {e}"
+            return res
+    if not f.get("JobId"):
+        res["error"] = "job not found in scontrol or sacct"
+        return res
+
+    state = f.get("JobState", "UNKNOWN")
+    reason = f.get("Reason", "")
+    nodelist = f.get("NodeList", "")
+    rack, nodes = _rack_and_nodes_from_nodelist(nodelist)
+    # A job cancelled by the prolog reports ExitCode 0:<sig> and RunTime 00:00:00 — treat it as a
+    # FAILED attempt, never as a pass, even though Slurm's own ExitCode field starts with 0.
+    rt = f.get("RunTime", "00:00:00")
+    ran = rt not in ("00:00:00", "")
+    # A soak workload (MNUBERGEMM) is EXPECTED to hit the walltime — the soak deliberately outruns
+    # it. TIMEOUT after substantial runtime is a PASS on MOP 7.2 criteria; only a TIMEOUT with no
+    # runtime is a real failure. Mislabelling it cost h03's successful 75.7 kW run a "fail" record.
+    status = {"COMPLETED": "pass", "RUNNING": "running", "PENDING": "pending"}.get(state)
+    if status is None:
+        if state == "TIMEOUT":
+            status = "timeout" if ran else "fail"
+        elif not ran or state in ("CANCELLED", "FAILED", "NODE_FAIL", "BOOT_FAIL", "DEADLINE"):
+            status = "fail"
+        else:
+            status = "unknown"
+
+    record = {
+        "kind": "job_attempt",
+        "status": status,
+        "job_id": job_id,
+        "rack": rack,
+        "nodes": nodes,
+        "scontrol": f,
+        "state": state,
+        "reason": reason,
+        "exit_code": f.get("ExitCode", ""),
+        "run_time": f.get("RunTime", ""),
+        "produced_log": False,
+        "tail": text[:4000],
+    }
+    res["state"], res["reason"], res["status"] = state, reason, status
+
+    try:
+        rid = results_history.ingest_run({
+            "run_id": f"attempt-{job_id}",
+            # sacct does NOT return StdOut, so a job recovered from the accounting DB has no
+            # log path. results_history requires one, and without a fallback every sacct-sourced
+            # run landed in Parquet but silently failed the SQLite ingest ("source_log_path is
+            # required") — i.e. half-captured, which is worse than not captured because the lake
+            # looks complete. Synthesise a stable identifier instead.
+            "source_log_path": f.get("StdOut") or f"sacct:{job_id}",
+            "log_basename": (f.get("StdOut", "") or "").rsplit("/", 1)[-1] or f"job-{job_id}",
+            "workload_kind": "job_attempt",
+            "rack": rack,
+            "nodes": record["nodes"],
+            "job_id": job_id,
+            "started_at": f.get("StartTime", ""),
+            "ended_at": f.get("EndTime", ""),
+            "status": status,
+            "metrics": [],
+            "extra": record,
+        })
+        res["history_run_id"] = rid
+    except Exception as e:  # noqa: BLE001
+        res["error"] = f"history: {e}"
+
+    if lake_sink is not None and not lake_sink.is_disabled():
+        out = lake_sink.push_run(
+            run_id=lake_sink.make_run_id("jobattempt", rack, job_id),
+            workload="job_attempt", rack=rack, job_id=job_id,
+            nodes=record["nodes"], status=status, parsed=record,
+            log_path=f.get("StdOut", ""), log_text=text or "",
+        )
+        res["lake"] = out
+        if not out.get("ok"):
+            _logger.warning("lake job-attempt push failed for %s: %s", job_id, out.get("error"))
+
+    res["ok"] = True
+    return res
+
+
+@app.route("/api/history/capture-job", methods=["GET", "POST"])
+def api_capture_job_attempt():
+    """``?job_id=`` — record a Slurm attempt (even one that produced no log) to history + lake."""
+    jid = (request.args.get("job_id") or (request.get_json(silent=True) or {}).get("job_id") or "").strip()
+    if not jid or not _SLURM_SCANCEL_JOB_ID_RE.fullmatch(jid):
+        return jsonify({"ok": False, "error": "valid job_id required"}), 400
+    return jsonify(capture_job_attempt(jid))
+
